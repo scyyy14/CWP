@@ -1,0 +1,704 @@
+[
+  {
+    "case": "current",
+    "input": {
+      "W": [
+        9,
+        7,
+        4,
+        4,
+        9,
+        0,
+        4,
+        6,
+        2,
+        7,
+        4,
+        4,
+        3,
+        8,
+        3,
+        4,
+        2,
+        0
+      ],
+      "M": 5,
+      "S": [
+        5,
+        10,
+        12
+      ]
+    },
+    "seed": 42,
+    "version": "before",
+    "budget": 12.0,
+    "wall_seconds": 12.000372,
+    "makespan": 20,
+    "lower_bound": 19,
+    "proven": false,
+    "restarts": 519
+  },
+  {
+    "case": "current",
+    "input": {
+      "W": [
+        9,
+        7,
+        4,
+        4,
+        9,
+        0,
+        4,
+        6,
+        2,
+        7,
+        4,
+        4,
+        3,
+        8,
+        3,
+        4,
+        2,
+        0
+      ],
+      "M": 5,
+      "S": [
+        5,
+        10,
+        12
+      ]
+    },
+    "seed": 42,
+    "version": "after",
+    "budget": 12.0,
+    "wall_seconds": 12.027345,
+    "makespan": 20,
+    "lower_bound": 19,
+    "proven": false,
+    "restarts": 1215
+  },
+  {
+    "case": "current",
+    "input": {
+      "W": [
+        9,
+        7,
+        4,
+        4,
+        9,
+        0,
+        4,
+        6,
+        2,
+        7,
+        4,
+        4,
+        3,
+        8,
+        3,
+        4,
+        2,
+        0
+      ],
+      "M": 5,
+      "S": [
+        5,
+        10,
+        12
+      ]
+    },
+    "seed": 7,
+    "version": "before",
+    "budget": 12.0,
+    "wall_seconds": 12.000514,
+    "makespan": 20,
+    "lower_bound": 19,
+    "proven": false,
+    "restarts": 760
+  },
+  {
+    "case": "current",
+    "input": {
+      "W": [
+        9,
+        7,
+        4,
+        4,
+        9,
+        0,
+        4,
+        6,
+        2,
+        7,
+        4,
+        4,
+        3,
+        8,
+        3,
+        4,
+        2,
+        0
+      ],
+      "M": 5,
+      "S": [
+        5,
+        10,
+        12
+      ]
+    },
+    "seed": 7,
+    "version": "after",
+    "budget": 12.0,
+    "wall_seconds": 8.071326,
+    "makespan": 19,
+    "lower_bound": 19,
+    "proven": true,
+    "restarts": 1831
+  },
+  {
+    "case": "current",
+    "input": {
+      "W": [
+        9,
+        7,
+        4,
+        4,
+        9,
+        0,
+        4,
+        6,
+        2,
+        7,
+        4,
+        4,
+        3,
+        8,
+        3,
+        4,
+        2,
+        0
+      ],
+      "M": 5,
+      "S": [
+        5,
+        10,
+        12
+      ]
+    },
+    "seed": 20260910,
+    "version": "before",
+    "budget": 12.0,
+    "wall_seconds": 12.000565,
+    "makespan": 20,
+    "lower_bound": 19,
+    "proven": false,
+    "restarts": 708
+  },
+  {
+    "case": "current",
+    "input": {
+      "W": [
+        9,
+        7,
+        4,
+        4,
+        9,
+        0,
+        4,
+        6,
+        2,
+        7,
+        4,
+        4,
+        3,
+        8,
+        3,
+        4,
+        2,
+        0
+      ],
+      "M": 5,
+      "S": [
+        5,
+        10,
+        12
+      ]
+    },
+    "seed": 20260910,
+    "version": "after",
+    "budget": 12.0,
+    "wall_seconds": 5.02545,
+    "makespan": 19,
+    "lower_bound": 19,
+    "proven": true,
+    "restarts": 1776
+  },
+  {
+    "case": "three_cranes",
+    "input": {
+      "W": [
+        2,
+        3,
+        7,
+        5,
+        5,
+        2,
+        2,
+        9,
+        9,
+        6,
+        7,
+        3,
+        3,
+        0,
+        5,
+        1,
+        3,
+        6
+      ],
+      "M": 3,
+      "S": [
+        2
+      ]
+    },
+    "seed": 42,
+    "version": "before",
+    "budget": 12.0,
+    "wall_seconds": 10.820727,
+    "makespan": 31,
+    "lower_bound": 31,
+    "proven": true,
+    "restarts": 2048
+  },
+  {
+    "case": "three_cranes",
+    "input": {
+      "W": [
+        2,
+        3,
+        7,
+        5,
+        5,
+        2,
+        2,
+        9,
+        9,
+        6,
+        7,
+        3,
+        3,
+        0,
+        5,
+        1,
+        3,
+        6
+      ],
+      "M": 3,
+      "S": [
+        2
+      ]
+    },
+    "seed": 42,
+    "version": "after",
+    "budget": 12.0,
+    "wall_seconds": 1.445426,
+    "makespan": 31,
+    "lower_bound": 31,
+    "proven": true,
+    "restarts": 267
+  },
+  {
+    "case": "three_cranes",
+    "input": {
+      "W": [
+        2,
+        3,
+        7,
+        5,
+        5,
+        2,
+        2,
+        9,
+        9,
+        6,
+        7,
+        3,
+        3,
+        0,
+        5,
+        1,
+        3,
+        6
+      ],
+      "M": 3,
+      "S": [
+        2
+      ]
+    },
+    "seed": 7,
+    "version": "before",
+    "budget": 12.0,
+    "wall_seconds": 12.000242,
+    "makespan": 31,
+    "lower_bound": 31,
+    "proven": true,
+    "restarts": 2340
+  },
+  {
+    "case": "three_cranes",
+    "input": {
+      "W": [
+        2,
+        3,
+        7,
+        5,
+        5,
+        2,
+        2,
+        9,
+        9,
+        6,
+        7,
+        3,
+        3,
+        0,
+        5,
+        1,
+        3,
+        6
+      ],
+      "M": 3,
+      "S": [
+        2
+      ]
+    },
+    "seed": 7,
+    "version": "after",
+    "budget": 12.0,
+    "wall_seconds": 12.005808,
+    "makespan": 32,
+    "lower_bound": 31,
+    "proven": false,
+    "restarts": 925
+  },
+  {
+    "case": "three_cranes",
+    "input": {
+      "W": [
+        2,
+        3,
+        7,
+        5,
+        5,
+        2,
+        2,
+        9,
+        9,
+        6,
+        7,
+        3,
+        3,
+        0,
+        5,
+        1,
+        3,
+        6
+      ],
+      "M": 3,
+      "S": [
+        2
+      ]
+    },
+    "seed": 20260910,
+    "version": "before",
+    "budget": 12.0,
+    "wall_seconds": 12.000208,
+    "makespan": 32,
+    "lower_bound": 31,
+    "proven": false,
+    "restarts": 2045
+  },
+  {
+    "case": "three_cranes",
+    "input": {
+      "W": [
+        2,
+        3,
+        7,
+        5,
+        5,
+        2,
+        2,
+        9,
+        9,
+        6,
+        7,
+        3,
+        3,
+        0,
+        5,
+        1,
+        3,
+        6
+      ],
+      "M": 3,
+      "S": [
+        2
+      ]
+    },
+    "seed": 20260910,
+    "version": "after",
+    "budget": 12.0,
+    "wall_seconds": 12.004094,
+    "makespan": 32,
+    "lower_bound": 31,
+    "proven": false,
+    "restarts": 919
+  },
+  {
+    "case": "large_work",
+    "input": {
+      "W": [
+        4,
+        13,
+        0,
+        8,
+        5,
+        16,
+        3,
+        11,
+        0,
+        6,
+        0,
+        18,
+        5,
+        0,
+        14,
+        7,
+        2,
+        12,
+        4,
+        0,
+        9
+      ],
+      "M": 3,
+      "S": [
+        2,
+        6
+      ]
+    },
+    "seed": 42,
+    "version": "before",
+    "budget": 12.0,
+    "wall_seconds": 12.000295,
+    "makespan": 50,
+    "lower_bound": 50,
+    "proven": true,
+    "restarts": 1353
+  },
+  {
+    "case": "large_work",
+    "input": {
+      "W": [
+        4,
+        13,
+        0,
+        8,
+        5,
+        16,
+        3,
+        11,
+        0,
+        6,
+        0,
+        18,
+        5,
+        0,
+        14,
+        7,
+        2,
+        12,
+        4,
+        0,
+        9
+      ],
+      "M": 3,
+      "S": [
+        2,
+        6
+      ]
+    },
+    "seed": 42,
+    "version": "after",
+    "budget": 12.0,
+    "wall_seconds": 12.020876,
+    "makespan": 51,
+    "lower_bound": 50,
+    "proven": false,
+    "restarts": 546
+  },
+  {
+    "case": "large_work",
+    "input": {
+      "W": [
+        4,
+        13,
+        0,
+        8,
+        5,
+        16,
+        3,
+        11,
+        0,
+        6,
+        0,
+        18,
+        5,
+        0,
+        14,
+        7,
+        2,
+        12,
+        4,
+        0,
+        9
+      ],
+      "M": 3,
+      "S": [
+        2,
+        6
+      ]
+    },
+    "seed": 7,
+    "version": "before",
+    "budget": 12.0,
+    "wall_seconds": 12.000287,
+    "makespan": 50,
+    "lower_bound": 50,
+    "proven": true,
+    "restarts": 1376
+  },
+  {
+    "case": "large_work",
+    "input": {
+      "W": [
+        4,
+        13,
+        0,
+        8,
+        5,
+        16,
+        3,
+        11,
+        0,
+        6,
+        0,
+        18,
+        5,
+        0,
+        14,
+        7,
+        2,
+        12,
+        4,
+        0,
+        9
+      ],
+      "M": 3,
+      "S": [
+        2,
+        6
+      ]
+    },
+    "seed": 7,
+    "version": "after",
+    "budget": 12.0,
+    "wall_seconds": 4.032719,
+    "makespan": 50,
+    "lower_bound": 50,
+    "proven": true,
+    "restarts": 463
+  },
+  {
+    "case": "large_work",
+    "input": {
+      "W": [
+        4,
+        13,
+        0,
+        8,
+        5,
+        16,
+        3,
+        11,
+        0,
+        6,
+        0,
+        18,
+        5,
+        0,
+        14,
+        7,
+        2,
+        12,
+        4,
+        0,
+        9
+      ],
+      "M": 3,
+      "S": [
+        2,
+        6
+      ]
+    },
+    "seed": 20260910,
+    "version": "before",
+    "budget": 12.0,
+    "wall_seconds": 12.000314,
+    "makespan": 50,
+    "lower_bound": 50,
+    "proven": true,
+    "restarts": 1338
+  },
+  {
+    "case": "large_work",
+    "input": {
+      "W": [
+        4,
+        13,
+        0,
+        8,
+        5,
+        16,
+        3,
+        11,
+        0,
+        6,
+        0,
+        18,
+        5,
+        0,
+        14,
+        7,
+        2,
+        12,
+        4,
+        0,
+        9
+      ],
+      "M": 3,
+      "S": [
+        2,
+        6
+      ]
+    },
+    "seed": 20260910,
+    "version": "after",
+    "budget": 12.0,
+    "wall_seconds": 3.642325,
+    "makespan": 50,
+    "lower_bound": 50,
+    "proven": true,
+    "restarts": 421
+  }
+]

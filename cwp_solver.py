@@ -16,10 +16,11 @@ import math
 import multiprocessing
 import os
 import random
+import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,8 @@ class Solution:
     exact_search_proved_optimal: bool
     search_seconds: float
     max_steps: int
+    trajectory_repair_iterations: int = 0
+    trajectory_repair_improvements: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
@@ -626,7 +629,7 @@ def _focused_next_configurations(
     return list(result) if result else list(configurations)
 
 
-def _construct_schedule(
+def _construct_schedule_legacy(
     W: Sequence[int],
     M: int,
     starts: Sequence[int],
@@ -808,6 +811,188 @@ def _construct_schedule(
     )
 
 
+def _best_safe_dispatch(cells):
+    """Exact additive dispatch DP; flags idle=0, ready=1, working=2.
+
+    Prefix maxima impose gap >= 2 in O(M N) states. This optimizes
+    one dispatch score, not the complete scheduling objective.
+    """
+    previous = None
+    for row in cells:
+        current = [[None] * 3 for _ in row]
+        prefix = [None] * 3
+        for i, cell in enumerate(row):
+            if previous is not None and i >= 2:
+                for flag, item in enumerate(previous[i - 2]):
+                    if item is not None and (prefix[flag] is None or item[0] > prefix[flag][0]):
+                        prefix[flag] = item
+            if cell is None:
+                continue
+            score, flag = cell
+            if previous is None:
+                current[i][flag] = (score, (i + 1,))
+                continue
+            for old_flag, item in enumerate(prefix):
+                if item is None:
+                    continue
+                new_flag = max(flag, old_flag)
+                proposal = (item[0] + score, item[1] + (i + 1,))
+                incumbent = current[i][new_flag]
+                if incumbent is None or proposal[0] > incumbent[0]:
+                    current[i][new_flag] = proposal
+        previous = current
+    normal = progress = None
+    for row in previous or []:
+        for flag in (1, 2):
+            item = row[flag]
+            if item is not None:
+                if normal is None or item[0] > normal[0]:
+                    normal = item
+                if flag == 2 and (progress is None or item[0] > progress[0]):
+                    progress = item
+    return normal, progress
+
+
+def _construct_schedule(
+    W: Sequence[int],
+    M: int,
+    starts: Sequence[int],
+    configurations: Sequence[tuple[int, ...]],
+    initial: tuple[int, ...],
+    strategy: _Strategy,
+    rng: random.Random,
+    max_steps: int,
+    bay_criticality: Sequence[float],
+    eligibility: Sequence[set[int]],
+    fixed_owner: Sequence[int | None] | None = None,
+    preferred_owner: Sequence[int | None] | None = None,
+    deadline: float | None = None,
+) -> _CandidateSchedule:
+    remaining = list(W)
+    remaining_total = sum(remaining)
+    total_work = remaining_total
+    positions = initial
+    owners: list[set[int]] = [set() for _ in W]
+    loads = [0] * M
+    target_weights = [min(q + 1, M - q) for q in range(M)]
+    weight_sum = sum(target_weights)
+    if strategy.equal_load_target:
+        target_loads = [total_work / M] * M
+    else:
+        target_loads = [total_work * weight / weight_sum for weight in target_weights]
+    required = set(starts)
+    mandatory_cranes = {q for q, bay in enumerate(initial) if bay in required}
+    slots: list[Slot] = []
+    last_move_direction = [0] * M
+    no_progress_slots = 0
+
+    for t in range(max_steps):
+        if deadline is not None and time.perf_counter() >= deadline:
+            raise RuntimeError("构造搜索达到本阶段时间上限。")
+        if remaining_total == 0:
+            break
+
+        best_normal: tuple[float, tuple[int, ...], tuple[int, ...]] | None = None
+        best_progress: tuple[float, tuple[int, ...], tuple[int, ...]] | None = None
+
+        cells = []
+        for q in range(M):
+            row = []
+            for bay in range(1, len(W) + 1):
+                i = bay - 1
+                if q not in eligibility[i] or (
+                    t == 0 and q in mandatory_cranes and bay != positions[q]
+                ):
+                    row.append(None)
+                    continue
+                allowed = (
+                    (fixed_owner is None or fixed_owner[i] in (None, q))
+                    and (not strategy.strict_owner or not owners[i] or q in owners[i])
+                )
+                work = bay == positions[q] and remaining[i] > 0 and allowed
+                left = remaining[i] - int(work)
+                ready = left > 0 and allowed
+                move = bay != positions[q]
+                direction = 1 if bay > positions[q] else -1
+                reversal = move and last_move_direction[q] not in (0, direction)
+                hint = (
+                    (int(work) + 0.6 * int(ready))
+                    if preferred_owner is not None and preferred_owner[i] == q else 0.0
+                )
+                score = (
+                    strategy.work_weight * work
+                    + strategy.ready_weight * ready
+                    + 0.12 * min(left, 6) * ready
+                    + strategy.balance_weight * max(0.0, target_loads[q] - loads[q]) * ready
+                    + strategy.priority_weight * bay_criticality[i] * (int(work) + int(ready))
+                    + 1.25 * hint
+                    - strategy.split_penalty * bool(work and owners[i] and q not in owners[i])
+                    - strategy.move_penalty * move
+                    - strategy.reversal_penalty * reversal
+                    + strategy.noise * rng.random() / M
+                )
+                row.append((score, 2 if work else 1 if ready else 0))
+            cells.append(row)
+        normal, progress = _best_safe_dispatch(cells)
+        for result, is_progress in ((normal, False), (progress, True)):
+            if result is None:
+                continue
+            score, next_positions = result
+            working = tuple(
+                q for q, bay in enumerate(next_positions)
+                if cells[q][bay - 1][1] == 2
+            )
+            item = (score, next_positions, working)
+            if is_progress:
+                best_progress = item
+            else:
+                best_normal = item
+        chosen = best_progress if no_progress_slots >= 1 and best_progress is not None else best_normal
+        if chosen is None:
+            raise RuntimeError("自定义搜索无法继续构造排程；请检查输入。")
+
+        _, next_positions, working_tuple = chosen
+        working_set = set(working_tuple)
+        for q in range(M):
+            start_bay = positions[q]
+            end_bay = next_positions[q]
+            if q in working_set:
+                bay_index = start_bay - 1
+                remaining[bay_index] -= 1
+                remaining_total -= 1
+                owners[bay_index].add(q)
+                loads[q] += 1
+                slots.append(Slot(t, q + 1, "work", start_bay, end_bay, start_bay))
+            elif start_bay != end_bay:
+                slots.append(Slot(t, q + 1, "move", start_bay, end_bay, None))
+                last_move_direction[q] = 1 if end_bay > start_bay else -1
+            else:
+                slots.append(Slot(t, q + 1, "idle", start_bay, end_bay, None))
+
+        no_progress_slots = 0 if working_set else no_progress_slots + 1
+        positions = next_positions
+
+    if remaining_total > 0:
+        raise RuntimeError(f"在安全构造上界 max_steps={max_steps} 内未完成全部作业。")
+
+    makespan = len(slots) // M
+    assignment_count = sum(len(bay_owners) for bay_owners in owners)
+    split_bay_count = sum(len(bay_owners) > 1 for bay_owners in owners)
+    movement_count = sum(slot.state == "move" for slot in slots)
+    reversal_count = _count_reversals(slots, M)
+    return _CandidateSchedule(
+        slots=slots,
+        makespan=makespan,
+        assignment_count=assignment_count,
+        split_bay_count=split_bay_count,
+        load_deviation=_load_deviation(loads, target_weights, total_work),
+        reversal_count=reversal_count,
+        movement_count=movement_count,
+        loads=loads,
+        owners=owners,
+    )
+
+
 def _focused_exact_neighbors(
     positions: tuple[int, ...],
     remaining: Sequence[int],
@@ -909,6 +1094,104 @@ def _focused_exact_neighbors(
         return (-working, -ready, -pressure, -guide_matches, *config)
 
     return sorted(neighbors, key=priority)
+
+
+def _trajectory_repair(W, M, starts, incumbent, deadline, seed):
+    """Annealed interval repair of a shortened complete position trajectory.
+
+    Infeasible states may lack work, but every rail position remains safe.
+    Capacity counts stationary edges; excess capacity decodes as idle.
+    Only a zero-deficit trajectory is returned. No optimality claim.
+    """
+    horizon = incumbent.makespan - 1
+    if horizon < 1 or horizon > 2000:
+        return None, 0
+    rng = random.Random(seed)
+    rows = [[0] * M for _ in range(incumbent.makespan + 1)]
+    for slot in incumbent.slots:
+        rows[slot.time][slot.crane - 1] = slot.start_bay
+        rows[slot.time + 1][slot.crane - 1] = slot.end_bay
+    required = set(starts)
+    pinned = {q for q, bay in enumerate(rows[0]) if bay in required}
+    best_paths = None
+    best_loss = float('inf')
+    iterations = 0
+    while time.perf_counter() < deadline:
+        # Delete a boundary, not a job. The resulting missing work is measured
+        # explicitly. Keep both endpoints of the mandatory first work slot.
+        if best_paths is not None and rng.random() < 0.75:
+            paths = [path[:] for path in best_paths]
+        else:
+            removed = rng.randrange(2, len(rows))
+            shortened = rows[:removed] + rows[removed + 1:]
+            paths = [[row[q] for row in shortened] for q in range(M)]
+        counts = [0] * len(W)
+        for path in paths:
+            for a, b in zip(path, path[1:]):
+                if a == b:
+                    counts[a - 1] += 1
+
+        def penalty(i, count):
+            deficit = max(0, W[i] - count)
+            return deficit + 0.015 * deficit * deficit
+
+        loss = sum(penalty(i, count) for i, count in enumerate(counts))
+        for attempt in range(4000):
+            iterations += 1
+            if iterations % 128 == 0 and time.perf_counter() >= deadline:
+                return None, iterations
+            if loss < 1e-8:
+                history = list(zip(*paths))
+                return _candidate_from_history(W, M, history), iterations
+            if loss < best_loss - 1e-8:
+                best_loss = loss
+                best_paths = [path[:] for path in paths]
+            q = rng.randrange(M)
+            path = paths[q]
+            if q in pinned and horizon < 2:
+                continue
+            a = rng.randrange(2 if q in pinned else 0, horizon + 1)
+            if rng.random() < 0.65:
+                # Shift an existing work block boundary, including the case
+                # where two blocks must merge to remove a movement slot.
+                b = a
+                while b < horizon and path[b + 1] == path[a]:
+                    b += 1
+                if rng.random() < 0.5:
+                    b = min(b, a + rng.randrange(1, 4))
+            else:
+                b = min(horizon, a + rng.randrange(1, max(2, horizon // 3)))
+            low = max(paths[q - 1][a:b + 1]) + 2 if q else 1
+            high = min(paths[q + 1][a:b + 1]) - 2 if q + 1 < M else len(W)
+            if low > high:
+                continue
+            choices = []
+            if a:
+                choices.append(path[a - 1])
+            if b < horizon:
+                choices.append(path[b + 1])
+            choices.extend(i + 1 for i in range(low - 1, high) if counts[i] < W[i])
+            choices.append(rng.randint(low, high))
+            bay = rng.choice(choices)
+            if not low <= bay <= high or all(p == bay for p in path[a:b + 1]):
+                continue
+            delta = {}
+            for t in range(max(0, a - 1), min(horizon, b + 1)):
+                old_a, old_b = path[t], path[t + 1]
+                new_a = bay if a <= t <= b else old_a
+                new_b = bay if a <= t + 1 <= b else old_b
+                if old_a == old_b:
+                    delta[old_a - 1] = delta.get(old_a - 1, 0) - 1
+                if new_a == new_b:
+                    delta[new_a - 1] = delta.get(new_a - 1, 0) + 1
+            change = sum(penalty(i, counts[i] + d) - penalty(i, counts[i]) for i, d in delta.items())
+            temperature = 0.08 + 0.65 * (1.0 - attempt / 4000) ** 2
+            if change <= 0 or rng.random() < math.exp(-change / temperature):
+                path[a:b + 1] = [bay] * (b - a + 1)
+                for i, d in delta.items():
+                    counts[i] += d
+                loss += change
+    return None, iterations
 
 
 def _candidate_from_history(
@@ -1470,12 +1753,13 @@ def solve_cwp(
     time_limit: float = 270.0,
     seed: int = 20260910,
     patience: int = 2_000,
+    on_incumbent: Callable[[Solution], None] | None = None,
 ) -> Solution:
     """Construct a safe schedule without calling an optimization solver."""
     search_start = time.perf_counter()
     if isinstance(restarts, bool) or not isinstance(restarts, int) or restarts <= 0:
         raise ValueError("restarts 必须是正整数。")
-    if time_limit <= 0:
+    if not math.isfinite(time_limit) or time_limit <= 0:
         raise ValueError("time_limit 必须大于 0。")
     if isinstance(patience, bool) or not isinstance(patience, int) or patience <= 0:
         raise ValueError("patience 必须是正整数。")
@@ -1493,9 +1777,12 @@ def solve_cwp(
     )
     bay_criticality = _bay_criticality(W, M, eligibility)
     rng = random.Random(seed)
-    use_exact_search = effective_time_limit >= 30.0
+    use_exact_search = effective_time_limit >= 2.0
     heuristic_deadline = (
-        search_start + 0.55 * effective_time_limit
+        search_start + (
+            min(15.0, 0.90 * effective_time_limit) if M <= 3
+            else min(5.0, 0.40 * effective_time_limit)
+        )
         if use_exact_search else deadline
     )
     layered_deadline = (
@@ -1505,6 +1792,37 @@ def solve_cwp(
     best: _CandidateSchedule | None = None
     completed = 0
     last_improvement = 0
+    published_key = None
+
+    def publish(candidate):
+        nonlocal published_key
+        if on_incumbent is None:
+            return
+        if published_key is not None and candidate.objective_key >= published_key:
+            return
+        optimal = candidate.makespan == lower_bound
+        snapshot = Solution(
+            status="MAKESPAN_OPTIMAL_BY_LOWER_BOUND" if optimal else "HEURISTIC_FEASIBLE",
+            method="dp_dispatch_priority_evolution_trajectory_repair_mcts_exact_no_solver",
+            makespan=candidate.makespan, makespan_lower_bound=lower_bound,
+            lower_bound_components=lower_bound_components,
+            makespan_proven_optimal=optimal, proven_lexicographic_optimal=False,
+            assignment_count=candidate.assignment_count, split_bay_count=candidate.split_bay_count,
+            load_deviation=candidate.load_deviation, reversal_count=candidate.reversal_count,
+            movement_count=candidate.movement_count, crane_loads=candidate.loads,
+            target_weights=target_weights,
+            bay_cranes={i + 1: [q + 1 for q in sorted(owners)]
+                        for i, owners in enumerate(candidate.owners) if owners},
+            slots=candidate.slots, restarts_completed=completed,
+            strategy_evaluations=list(evaluation_totals),
+            layered_search_states=0, layered_search_improvements=0,
+            mcts_iterations=0, mcts_improvements=0, exact_search_nodes=0,
+            exact_search_improvements=0, exact_search_proved_optimal=False,
+            search_seconds=round(time.perf_counter() - search_start, 6), max_steps=max_steps,
+        )
+        verify_solution(W, M, starts, snapshot)
+        on_incumbent(snapshot)
+        published_key = candidate.objective_key
 
     # The first five rules preserve the original decoder; the second five add
     # congestion-window priority. An online UCB selector allocates more trials
@@ -1534,20 +1852,38 @@ def solve_cwp(
     ]
     strategies = base_strategies + priority_strategies + reversal_strategies
     strategy_counts = [0] * len(strategies)
+    evaluation_totals = [0] * len(strategies)
     strategy_rewards = [0.0] * len(strategies)
     top_pool_size = min(len(initial_configs), max(20, min(200, restarts)))
     top_pool = initial_configs[:top_pool_size]
     warmup_initial_count = min(8, len(top_pool))
     warmup_trials = warmup_initial_count * len(strategies)
     partition_plan_cache: dict[tuple[int, ...], list[int | None] | None] = {}
+    elite_priorities = list(bay_criticality)
+    dp_incumbent = None
+    decoder_offset = 0
 
-    for restart in range(restarts):
-        if restart > 0 and time.perf_counter() >= heuristic_deadline:
+    for round_index in range(restarts):
+        if M <= 3 and round_index == 300:
+            if best is not None and best.makespan == lower_bound:
+                break
+            # Restart the original random stream and rule portfolio too.
+            # Merely swapping decoders midway lets the first decoder's UCB
+            # rewards starve rules that are effective in the second decoder.
+            dp_incumbent = best
+            best = None
+            rng = random.Random(seed)
+            strategy_counts = [0] * len(strategies)
+            strategy_rewards = [0.0] * len(strategies)
+            last_improvement = 0
+            decoder_offset = 300
+        restart = round_index - decoder_offset
+        if round_index > 0 and time.perf_counter() >= heuristic_deadline:
             break
         if (
             best is not None
             and best.makespan == lower_bound
-            and restart - last_improvement >= patience
+            and restart - last_improvement >= min(patience, 64)
         ):
             break
         if restart < warmup_trials:
@@ -1620,14 +1956,34 @@ def solve_cwp(
                 rng.shuffle(alternatives)
                 preferred_owner[bay_index] = alternatives[0]
         strategy_counts[strategy_index] += 1
+        evaluation_totals[strategy_index] += 1
+        # Search the priority representation, retaining successful ordering
+        # hints instead of repeating the same fixed dispatch rules forever.
+        trial_priorities = list(bay_criticality)
+        if M > 3 and restart >= warmup_trials and restart % 4:
+            trial_priorities = list(elite_priorities)
+            for i in range(len(W)):
+                if W[i] and rng.random() < (0.2 if restart % 4 == 1 else 0.5):
+                    trial_priorities[i] = max(0.0, trial_priorities[i] + rng.uniform(-3.0, 3.0))
+            if restart % 4 == 3:
+                trial_priorities = [rng.uniform(0.0, 8.0) for _ in W]
         previous_best_makespan = best.makespan if best is not None else max_steps
+        # With <= 3 cranes the old focused product is already small and its
+        # joint random noise supplies useful diversity. Retain that decoder;
+        # DP removes the expensive product for larger crane fleets.
+        use_legacy = decoder_offset > 0
+        constructor = _construct_schedule_legacy if use_legacy else _construct_schedule
+        decoder_options = (
+            {'focused_width': None if restart == 0 or restart % 75 == 0 else 2}
+            if use_legacy else {}
+        )
         try:
-            candidate = _construct_schedule(
+            candidate = constructor(
                 W, M, starts, configurations, initial, strategy, rng,
                 min(max_steps, 2 * total_work + 1) if fixed_owner is not None else max_steps,
-                bay_criticality, eligibility, fixed_owner, preferred_owner,
-                None if restart == 0 or restart % 75 == 0 else 2,
-                None if best is None else heuristic_deadline,
+                trial_priorities, eligibility, fixed_owner, preferred_owner,
+                deadline=None if best is None else heuristic_deadline,
+                **decoder_options,
             )
         except RuntimeError:
             # Some randomized fixed-owner plans can trap the greedy decoder.
@@ -1645,9 +2001,27 @@ def solve_cwp(
         strategy_rewards[strategy_index] += reward
         if best is None or candidate.objective_key < best.objective_key:
             best = candidate
+            elite_priorities = trial_priorities
             last_improvement = restart
+            publish(best)
 
+    if dp_incumbent is not None and (best is None or dp_incumbent.objective_key < best.objective_key):
+        best = dp_incumbent
     assert best is not None
+    repair_iterations = repair_improvements = 0
+    repair_deadline = time.perf_counter() + max(
+        0.0, search_start + 0.95 * effective_time_limit - time.perf_counter()
+    ) * 0.65
+    while best.makespan > lower_bound and time.perf_counter() < repair_deadline:
+        improved, evaluated = _trajectory_repair(
+            W, M, starts, best, repair_deadline, seed + 211 + repair_improvements,
+        )
+        repair_iterations += evaluated
+        if improved is None:
+            break
+        best = improved
+        repair_improvements += 1
+        publish(best)
     improvement_deadline = search_start + 0.95 * effective_time_limit
     improvement_remaining = max(0.0, improvement_deadline - time.perf_counter())
     gap_after_construction = best.makespan - lower_bound
@@ -1671,6 +2045,7 @@ def solve_cwp(
         if improved is not None and improved.objective_key < best.objective_key:
             best = improved
             mcts_improvements += 1
+            publish(best)
 
     layered_search_states = 0
     layered_search_improvements = 0
@@ -1699,6 +2074,7 @@ def solve_cwp(
         if improved is not None and improved.objective_key < best.objective_key:
             best = improved
             layered_search_improvements += 1
+            publish(best)
 
     exact_search_nodes = 0
     exact_search_improvements = 0
@@ -1724,6 +2100,7 @@ def solve_cwp(
         if improved is not None and improved.objective_key < best.objective_key:
             best = improved
             exact_search_improvements += 1
+            publish(best)
             continue
         if exact_status == "INFEASIBLE":
             exact_search_proved_optimal = True
@@ -1744,7 +2121,7 @@ def solve_cwp(
             if exact_search_proved_optimal
             else "HEURISTIC_FEASIBLE"
         ),
-        method="adaptive_search_plus_partial_mcts_blocking_repair_and_selective_exact_bb_no_solver",
+        method="dp_dispatch_priority_evolution_trajectory_repair_mcts_exact_no_solver",
         makespan=best.makespan,
         makespan_lower_bound=lower_bound,
         lower_bound_components=lower_bound_components,
@@ -1760,7 +2137,7 @@ def solve_cwp(
         bay_cranes=bay_cranes,
         slots=best.slots,
         restarts_completed=completed,
-        strategy_evaluations=strategy_counts,
+        strategy_evaluations=evaluation_totals,
         layered_search_states=layered_search_states,
         layered_search_improvements=layered_search_improvements,
         mcts_iterations=mcts_iterations,
@@ -1770,6 +2147,8 @@ def solve_cwp(
         exact_search_proved_optimal=exact_search_proved_optimal,
         search_seconds=round(elapsed, 6),
         max_steps=max_steps,
+        trajectory_repair_iterations=repair_iterations,
+        trajectory_repair_improvements=repair_improvements,
     )
 
 
@@ -1980,10 +2359,69 @@ def _print_summary(solution: Solution) -> None:
         f"工期改进次数: {solution.mcts_improvements}"
     )
     print(
+        f"完整轨迹修复迭代数: {solution.trajectory_repair_iterations}；"
+        f"工期改进次数: {solution.trajectory_repair_improvements}"
+    )
+    print(
         f"精确搜索节点数: {solution.exact_search_nodes}；"
         f"工期改进次数: {solution.exact_search_improvements}；"
         f"是否由精确搜索证明: {solution.exact_search_proved_optimal}"
     )
+
+
+def _solve_worker(payload, options, checkpoint, error_path):
+    """Private worker: publish validated incumbents with atomic replacement."""
+    def save(solution):
+        temporary = Path(str(checkpoint) + '.tmp')
+        temporary.write_text(json.dumps(solution.to_dict()), encoding='utf-8')
+        os.replace(temporary, checkpoint)
+
+    try:
+        result = solve_cwp(**payload, **options, on_incumbent=save)
+        verify_solution(payload['W'], payload['M'], payload['S'], result)
+        save(result)
+    except Exception as exc:
+        Path(error_path).write_text(f'{type(exc).__name__}: {exc}', encoding='utf-8')
+
+
+def solve_cwp_bounded(W, M, S, *, time_limit=270.0, **options):
+    """Process-enforced search budget, including preprocessing.
+
+    Direct solve_cwp remains cooperative; this entry point is used by the CLI.
+    If interrupted, return only a previously validated complete incumbent.
+    """
+    if not math.isfinite(time_limit) or time_limit <= 0:
+        raise ValueError('time_limit 必须是有限正数。')
+    budget = min(float(time_limit), 270.0)
+    started = time.perf_counter()
+    with tempfile.TemporaryDirectory(prefix='cwp-search-') as folder:
+        checkpoint = Path(folder) / 'incumbent.json'
+        error_path = Path(folder) / 'error.txt'
+        process = multiprocessing.get_context('spawn').Process(
+            target=_solve_worker,
+            args=({'W': W, 'M': M, 'S': list(S)},
+                  dict(options, time_limit=max(0.001, budget - 0.15)), checkpoint, error_path),
+        )
+        process.start()
+        try:
+            process.join(max(0.0, budget - (time.perf_counter() - started)))
+        finally:
+            if process.is_alive():
+                process.terminate()
+                process.join(0.5)
+            if process.is_alive():
+                process.kill()
+                process.join(0.5)
+        if error_path.exists():
+            raise RuntimeError(error_path.read_text(encoding='utf-8'))
+        if not checkpoint.exists():
+            raise TimeoutError('时限内未产生完整可行排程；请增加预算或缩小输入。')
+        data = json.loads(checkpoint.read_text(encoding='utf-8'))
+        data['slots'] = [Slot(**slot) for slot in data['slots']]
+        data['bay_cranes'] = {int(bay): cranes for bay, cranes in data['bay_cranes'].items()}
+        solution = Solution(**data)
+        solution.search_seconds = round(time.perf_counter() - started, 6)
+        return solution
 
 
 def main() -> None:
@@ -2014,7 +2452,7 @@ def main() -> None:
         args.time_limit,
         max(1.0, overall_deadline - time.perf_counter() - 30.0),
     )
-    solution = solve_cwp(
+    solution = solve_cwp_bounded(
         W, M, S,
         restarts=args.restarts,
         time_limit=solve_budget,
