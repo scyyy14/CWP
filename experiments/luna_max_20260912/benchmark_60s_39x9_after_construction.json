@@ -1,0 +1,152 @@
+{
+  "baseline_commit": "6229e27dc432f1cc7bc53dff4a21aa87840c91f1",
+  "budget_seconds": 60.0,
+  "seeds": [
+    42,
+    7,
+    20260910
+  ],
+  "cases": [
+    "current_39x9"
+  ],
+  "records": [
+    {
+      "version": "baseline",
+      "case": "current_39x9",
+      "seed": 42,
+      "budget_seconds": 60.0,
+      "wall_seconds": 52.239163,
+      "makespan": 44,
+      "lower_bound": 41,
+      "proven": false,
+      "search_seconds": 52.238851,
+      "trajectory_repair_improvements": 6,
+      "critical_repair_improvements": 0,
+      "critical_repair_iterations": 868125,
+      "phase_seconds": {},
+      "operator_calls": {}
+    },
+    {
+      "version": "current",
+      "case": "current_39x9",
+      "seed": 42,
+      "budget_seconds": 60.0,
+      "wall_seconds": 9.610923,
+      "makespan": 41,
+      "lower_bound": 41,
+      "proven": true,
+      "search_seconds": 9.610829,
+      "trajectory_repair_improvements": 0,
+      "critical_repair_improvements": 0,
+      "critical_repair_iterations": 0,
+      "phase_seconds": {
+        "construction": 9.610727,
+        "general_repair": 1e-06,
+        "critical_repair": 0.0,
+        "mcts": 0.0,
+        "layered": 1e-06,
+        "exact": 0.0
+      },
+      "operator_calls": {
+        "construction": 362,
+        "trajectory": 0,
+        "critical_beam": 0,
+        "mcts": 0,
+        "layered": 0,
+        "exact": 0
+      }
+    },
+    {
+      "version": "baseline",
+      "case": "current_39x9",
+      "seed": 7,
+      "budget_seconds": 60.0,
+      "wall_seconds": 51.100625,
+      "makespan": 44,
+      "lower_bound": 41,
+      "proven": false,
+      "search_seconds": 51.100226,
+      "trajectory_repair_improvements": 4,
+      "critical_repair_improvements": 0,
+      "critical_repair_iterations": 883379,
+      "phase_seconds": {},
+      "operator_calls": {}
+    },
+    {
+      "version": "current",
+      "case": "current_39x9",
+      "seed": 7,
+      "budget_seconds": 60.0,
+      "wall_seconds": 9.608464,
+      "makespan": 41,
+      "lower_bound": 41,
+      "proven": true,
+      "search_seconds": 9.608322,
+      "trajectory_repair_improvements": 0,
+      "critical_repair_improvements": 0,
+      "critical_repair_iterations": 0,
+      "phase_seconds": {
+        "construction": 9.608231,
+        "general_repair": 1e-06,
+        "critical_repair": 0.0,
+        "mcts": 1e-06,
+        "layered": 1e-06,
+        "exact": 0.0
+      },
+      "operator_calls": {
+        "construction": 371,
+        "trajectory": 0,
+        "critical_beam": 0,
+        "mcts": 0,
+        "layered": 0,
+        "exact": 0
+      }
+    },
+    {
+      "version": "baseline",
+      "case": "current_39x9",
+      "seed": 20260910,
+      "budget_seconds": 60.0,
+      "wall_seconds": 51.259275,
+      "makespan": 44,
+      "lower_bound": 41,
+      "proven": false,
+      "search_seconds": 51.258934,
+      "trajectory_repair_improvements": 4,
+      "critical_repair_improvements": 0,
+      "critical_repair_iterations": 775449,
+      "phase_seconds": {},
+      "operator_calls": {}
+    },
+    {
+      "version": "current",
+      "case": "current_39x9",
+      "seed": 20260910,
+      "budget_seconds": 60.0,
+      "wall_seconds": 13.530065,
+      "makespan": 41,
+      "lower_bound": 41,
+      "proven": true,
+      "search_seconds": 13.529991,
+      "trajectory_repair_improvements": 1,
+      "critical_repair_improvements": 0,
+      "critical_repair_iterations": 0,
+      "phase_seconds": {
+        "construction": 12.00032,
+        "general_repair": 1.52959,
+        "critical_repair": 0.0,
+        "mcts": 0.0,
+        "layered": 0.0,
+        "exact": 0.0
+      },
+      "operator_calls": {
+        "construction": 465,
+        "trajectory": 1,
+        "critical_beam": 0,
+        "mcts": 0,
+        "layered": 0,
+        "exact": 0
+      }
+    }
+  ]
+}

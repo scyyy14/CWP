@@ -94,43 +94,75 @@ class SolverImprovementTests(unittest.TestCase):
         for a, b in zip(repaired.slots, repaired.slots[1:]):
             self.assertEqual(a.end_bay, b.start_bay)
 
-    def test_critical_window_repair_returns_only_valid_schedules(self):
+    def test_critical_window_repair_finds_known_improvement(self):
         incumbent = cwp_solver._candidate_from_history(
             [1, 0, 1], 1, [(1,), (1,), (1,), (3,), (3,), (3,)]
         )
         repaired, _ = cwp_solver._critical_window_beam_repair(
-            [1, 0, 1], 1, [1], incumbent, (0,), time.perf_counter() + 0.1, 17
+            [1, 0, 1], 1, [1], incumbent, (0,), time.perf_counter() + 0.5, 17,
+            window=(1, 3),
         )
-        if repaired is not None:
-            cwp_solver.verify_solution([1, 0, 1], 1, [1],
-                                        cwp_solver.Solution(
-                                            status="HEURISTIC_FEASIBLE", method="test",
-                                            makespan=repaired.makespan,
-                                            makespan_lower_bound=1,
-                                            lower_bound_components={},
-                                            makespan_proven_optimal=False,
-                                            proven_lexicographic_optimal=False,
-                                            assignment_count=repaired.assignment_count,
-                                            split_bay_count=repaired.split_bay_count,
-                                            load_deviation=repaired.load_deviation,
-                                            reversal_count=repaired.reversal_count,
-                                            movement_count=repaired.movement_count,
-                                            crane_loads=repaired.loads,
-                                            target_weights=[1],
-                                            bay_cranes={1: [1], 3: [1]},
-                                            slots=repaired.slots,
-                                            restarts_completed=0,
-                                            strategy_evaluations=[],
-                                            layered_search_states=0,
-                                            layered_search_improvements=0,
-                                            mcts_iterations=0,
-                                            mcts_improvements=0,
-                                            exact_search_nodes=0,
-                                            exact_search_improvements=0,
-                                            exact_search_proved_optimal=False,
-                                            search_seconds=0,
-                                            max_steps=10,
-                                        ))
+        self.assertIsNotNone(repaired)
+        self.assertEqual(repaired.makespan, 4)
+        self.assertLess(repaired.makespan, incumbent.makespan)
+        cwp_solver.verify_solution(
+            [1, 0, 1], 1, [1],
+            cwp_solver.Solution(
+                status="HEURISTIC_FEASIBLE", method="test",
+                makespan=repaired.makespan, makespan_lower_bound=1,
+                lower_bound_components={}, makespan_proven_optimal=False,
+                proven_lexicographic_optimal=False,
+                assignment_count=repaired.assignment_count,
+                split_bay_count=repaired.split_bay_count,
+                load_deviation=repaired.load_deviation,
+                reversal_count=repaired.reversal_count,
+                movement_count=repaired.movement_count,
+                crane_loads=repaired.loads, target_weights=[1],
+                bay_cranes={1: [1], 3: [1]}, slots=repaired.slots,
+                restarts_completed=0, strategy_evaluations=[],
+                layered_search_states=0, layered_search_improvements=0,
+                mcts_iterations=0, mcts_improvements=0,
+                exact_search_nodes=0, exact_search_improvements=0,
+                exact_search_proved_optimal=False, search_seconds=0,
+                max_steps=10,
+            ),
+        )
+
+    def test_critical_windows_are_in_bounds_for_small_fleets(self):
+        for m in (1, 2, 3):
+            n = 2 * m + 1
+            work = [2] + [0] * (n - 2) + [2]
+            initial = tuple(1 + 2 * q for q in range(m))
+            final = tuple(3 + 2 * q for q in range(m))
+            history = [initial] * 3 + [final] * 3
+            incumbent = cwp_solver._candidate_from_history(work, m, history)
+            windows = cwp_solver._critical_repair_windows(incumbent, m)
+            self.assertTrue(windows)
+            for chain, (start, end) in windows:
+                self.assertTrue(chain)
+                self.assertTrue(all(0 <= q < m for q in chain))
+                self.assertGreaterEqual(start, 1)
+                self.assertGreater(end, start)
+
+    def test_trajectory_repair_can_resume_after_deadline(self):
+        work = [5, 0, 5]
+        incumbent = cwp_solver._candidate_from_history(
+            work, 1, [(1,)] * 6 + [(3,)] * 6
+        )
+        first, first_count, state = cwp_solver._trajectory_repair(
+            work, 1, [1], incumbent, time.perf_counter() + 0.001, 9,
+            return_state=True,
+        )
+        self.assertIsNone(first)
+        self.assertIsNotNone(state)
+        self.assertGreater(first_count, 0)
+        second, second_count, state_again = cwp_solver._trajectory_repair(
+            work, 1, [1], incumbent, time.perf_counter() + 0.01, 9,
+            repair_state=state, return_state=True,
+        )
+        self.assertIsNone(second)
+        self.assertGreaterEqual(second_count, first_count)
+        self.assertIsNotNone(state_again)
 
     def test_process_timeout_returns_validated_checkpoint(self):
         start = time.perf_counter()
