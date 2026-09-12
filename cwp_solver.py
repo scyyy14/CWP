@@ -64,6 +64,10 @@ class Solution:
     max_steps: int
     trajectory_repair_iterations: int = 0
     trajectory_repair_improvements: int = 0
+    elite_pool_size: int = 0
+    elite_repairs: int = 0
+    critical_repair_iterations: int = 0
+    critical_repair_improvements: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
@@ -139,6 +143,29 @@ def _legal_configurations(N: int, M: int) -> list[tuple[int, ...]]:
     ]
 
 
+def _weighted_initial_positions(weights, M, starts):
+    """Maximum-weight size-M independent set on a path, containing S.
+
+    dp[b][k] selects k separated positions from bays 1..b. Required bays
+    cannot be skipped. No joint crane configurations are enumerated.
+    """
+    required = set(starts)
+    n = len(weights)
+    dp = [[None] * (M + 1) for _ in range(n + 1)]
+    dp[0][0] = (0.0, ())
+    for b in range(1, n + 1):
+        for k in range(M + 1):
+            best = dp[b - 1][k] if b not in required else None
+            if k and b - 1 not in required:
+                previous = dp[max(0, b - 2)][k - 1]
+                if previous is not None:
+                    candidate = (previous[0] + weights[b - 1], previous[1] + (b,))
+                    if best is None or candidate[0] > best[0]:
+                        best = candidate
+            dp[b][k] = best
+    return dp[n][M]
+
+
 def _validate_input(
     W: list[int], M: int, S: Iterable[int]
 ) -> tuple[int, list[int], list[tuple[int, ...]]]:
@@ -165,12 +192,27 @@ def _validate_input(
     if any(W[bay - 1] == 0 for bay in starts):
         raise ValueError("S 中贝位必须具有正作业量，否则 t=0 无法开工作业。")
 
-    configurations = _legal_configurations(N, M)
+    if math.comb(N - M + 1, M) <= 20_000:
+        configurations = _legal_configurations(N, M)
+    else:
+        # A bounded pool is used ONLY for heuristic initial seeds. Lower
+        # bounds optimize initial coverage independently over the full domain.
+        pool = set()
+        sample_rng = random.Random(193)
+        for trial in range(128):
+            weights = [min(w, 8) if trial == 0 else sample_rng.random()
+                       * (1 + min(w, 8) * (trial % 3 == 0)) for w in W]
+            result = _weighted_initial_positions(weights, M, starts)
+            if result is None:
+                break
+            pool.add(result[1])
+        configurations = sorted(pool)
     required = set(starts)
     if not any(required.issubset(config) for config in configurations):
         raise ValueError("S 无法扩充为 M 台桥吊的合法初始停位组合。")
 
-    coverable = {bay for config in configurations for bay in config}
+    coverable = {bay for q in range(M)
+                 for bay in range(1 + 2 * q, N - 2 * (M - q - 1) + 1)}
     unreachable = [i + 1 for i, amount in enumerate(W) if amount > 0 and i + 1 not in coverable]
     if unreachable:
         raise ValueError(
@@ -233,14 +275,19 @@ def _makespan_lower_bound(
     M: int,
     initial_configs: Sequence[tuple[int, ...]],
     eligibility: Sequence[set[int]],
+    starts: Sequence[int] | None = None,
 ) -> tuple[int, dict[str, int]]:
     """Return valid workload, movement, and congestion-window lower bounds."""
     total_work = sum(W)
     positive_bays = sum(amount > 0 for amount in W)
-    initial_positive_capacity = max(
-        (sum(W[bay - 1] > 0 for bay in config) for config in initial_configs),
-        default=0,
-    )
+    def coverage(bays):
+        if starts is not None:
+            result = _weighted_initial_positions(
+                [int(b + 1 in bays) for b in range(len(W))], M, starts)
+            return int(result[0])
+        return max((sum(b in bays for b in config) for config in initial_configs), default=0)
+
+    initial_positive_capacity = coverage({i + 1 for i, w in enumerate(W) if w})
     minimum_crane_moves = max(0, positive_bays - initial_positive_capacity)
     workload_bound = math.ceil(total_work / M)
     active_time_bound = math.ceil((total_work + minimum_crane_moves) / M)
@@ -264,13 +311,7 @@ def _makespan_lower_bound(
             # At most parallel_capacity cranes can end a slot inside this
             # interval. Every work slot and every first arrival at a positive
             # bay consumes one such endpoint, giving a stronger valid bound.
-            initial_window_coverage = max(
-                (
-                    sum(bay in positive_in_window for bay in config)
-                    for config in initial_configs
-                ),
-                default=0,
-            )
+            initial_window_coverage = coverage(positive_in_window)
             minimum_window_arrivals = max(
                 0, len(positive_in_window) - initial_window_coverage
             )
@@ -298,16 +339,7 @@ def _makespan_lower_bound(
             if not mandatory_bays:
                 continue
             mandatory_set = {bay_index + 1 for bay_index in mandatory_bays}
-            initial_coverage = max(
-                (
-                    sum(
-                        first_q <= q <= last_q and bay in mandatory_set
-                        for q, bay in enumerate(config)
-                    )
-                    for config in initial_configs
-                ),
-                default=0,
-            )
+            initial_coverage = coverage(mandatory_set)
             minimum_subset_moves = max(0, len(mandatory_bays) - initial_coverage)
             mandatory_work = sum(W[bay_index] for bay_index in mandatory_bays)
             eligibility_bound = max(
@@ -1096,7 +1128,16 @@ def _focused_exact_neighbors(
     return sorted(neighbors, key=priority)
 
 
-def _trajectory_repair(W, M, starts, incumbent, deadline, seed):
+def _trajectory_repair(
+    W,
+    M,
+    starts,
+    incumbent,
+    deadline,
+    seed,
+    active_cranes: Sequence[int] | None = None,
+    window: tuple[int, int] | None = None,
+):
     """Annealed interval repair of a shortened complete position trajectory.
 
     Infeasible states may lack work, but every rail position remains safe.
@@ -1113,6 +1154,13 @@ def _trajectory_repair(W, M, starts, incumbent, deadline, seed):
         rows[slot.time + 1][slot.crane - 1] = slot.end_bay
     required = set(starts)
     pinned = {q for q, bay in enumerate(rows[0]) if bay in required}
+    active = set(range(M)) if active_cranes is None else set(active_cranes)
+    active &= set(range(M))
+    if not active:
+        return None, 0
+    window_start, window_end = window or (0, horizon)
+    window_start = max(0, min(horizon, window_start))
+    window_end = max(window_start, min(horizon, window_end))
     best_paths = None
     best_loss = float('inf')
     iterations = 0
@@ -1146,11 +1194,14 @@ def _trajectory_repair(W, M, starts, incumbent, deadline, seed):
             if loss < best_loss - 1e-8:
                 best_loss = loss
                 best_paths = [path[:] for path in paths]
-            q = rng.randrange(M)
+            q = rng.choice(tuple(active))
             path = paths[q]
             if q in pinned and horizon < 2:
                 continue
-            a = rng.randrange(2 if q in pinned else 0, horizon + 1)
+            lower_a = max(window_start, 2 if q in pinned else 0)
+            if lower_a > window_end:
+                continue
+            a = rng.randrange(lower_a, window_end + 1)
             if rng.random() < 0.65:
                 # Shift an existing work block boundary, including the case
                 # where two blocks must merge to remove a movement slot.
@@ -1161,8 +1212,10 @@ def _trajectory_repair(W, M, starts, incumbent, deadline, seed):
                     b = min(b, a + rng.randrange(1, 4))
             else:
                 b = min(horizon, a + rng.randrange(1, max(2, horizon // 3)))
-            low = max(paths[q - 1][a:b + 1]) + 2 if q else 1
-            high = min(paths[q + 1][a:b + 1]) - 2 if q + 1 < M else len(W)
+            b = min(b, window_end)
+            coordinated = M >= 4 and len(active) >= 2 and rng.random() < 0.25
+            low = 1 + 2 * q if coordinated else (max(paths[q - 1][a:b + 1]) + 2 if q else 1)
+            high = len(W) - 2 * (M - q - 1) if coordinated else (min(paths[q + 1][a:b + 1]) - 2 if q + 1 < M else len(W))
             if low > high:
                 continue
             choices = []
@@ -1175,19 +1228,58 @@ def _trajectory_repair(W, M, starts, incumbent, deadline, seed):
             bay = rng.choice(choices)
             if not low <= bay <= high or all(p == bay for p in path[a:b + 1]):
                 continue
+            replacements = {q: [bay] * (b - a + 1)}
+            if coordinated:
+                # Propagate only the minimum necessary displacement to
+                # neighboring cranes. Every boundary remains safe; this
+                # permits escaping blocks that no single crane can leave.
+                for other in range(q + 1, M):
+                    if other not in active:
+                        continue
+                    previous = replacements.get(other - 1, paths[other - 1][a:b + 1])
+                    replacements[other] = [max(p, left + 2) for p, left in
+                                           zip(paths[other][a:b + 1], previous)]
+                for other in range(q - 1, -1, -1):
+                    if other not in active:
+                        continue
+                    following = replacements.get(other + 1, paths[other + 1][a:b + 1])
+                    replacements[other] = [min(p, right - 2) for p, right in
+                                           zip(paths[other][a:b + 1], following)]
+                if any(p < 1 or p > len(W) for row in replacements.values() for p in row):
+                    continue
+                if a < 2 and any(
+                    k in replacements
+                    and replacements[k][:2-a] != paths[k][a:min(b+1, 2)]
+                    for k in pinned
+                ):
+                    continue
+            for t in range(a, b + 1):
+                row = [
+                    replacements.get(k, paths[k][t])[t - a]
+                    if k in replacements else paths[k][t]
+                    for k in range(M)
+                ]
+                if any(right - left < 2 for left, right in zip(row, row[1:])):
+                    replacements = {}
+                    break
+            if not replacements:
+                continue
             delta = {}
-            for t in range(max(0, a - 1), min(horizon, b + 1)):
-                old_a, old_b = path[t], path[t + 1]
-                new_a = bay if a <= t <= b else old_a
-                new_b = bay if a <= t + 1 <= b else old_b
-                if old_a == old_b:
-                    delta[old_a - 1] = delta.get(old_a - 1, 0) - 1
-                if new_a == new_b:
-                    delta[new_a - 1] = delta.get(new_a - 1, 0) + 1
+            for k, replacement in replacements.items():
+                trajectory = paths[k]
+                for t in range(max(0, a - 1), min(horizon, b + 1)):
+                    old_a, old_b = trajectory[t], trajectory[t + 1]
+                    new_a = replacement[t-a] if a <= t <= b else old_a
+                    new_b = replacement[t+1-a] if a <= t + 1 <= b else old_b
+                    if old_a == old_b:
+                        delta[old_a - 1] = delta.get(old_a - 1, 0) - 1
+                    if new_a == new_b:
+                        delta[new_a - 1] = delta.get(new_a - 1, 0) + 1
             change = sum(penalty(i, counts[i] + d) - penalty(i, counts[i]) for i, d in delta.items())
             temperature = 0.08 + 0.65 * (1.0 - attempt / 4000) ** 2
             if change <= 0 or rng.random() < math.exp(-change / temperature):
-                path[a:b + 1] = [bay] * (b - a + 1)
+                for k, replacement in replacements.items():
+                    paths[k][a:b + 1] = replacement
                 for i, d in delta.items():
                     counts[i] += d
                 loss += change
@@ -1468,6 +1560,200 @@ def _blocking_repair_cutoffs(
         candidates.extend((max(1, events[0] - 1), max(1, events[len(events) // 2] - 1)))
     candidates.extend((incumbent.makespan * 55 // 100, incumbent.makespan * 70 // 100))
     return list(dict.fromkeys(candidates))[:3]
+
+
+def _critical_repair_windows(
+    incumbent: _CandidateSchedule,
+    M: int,
+) -> list[tuple[tuple[int, ...], tuple[int, int]]]:
+    """Return small crane chains and late windows for ruin-and-recreate.
+
+    The finishing crane alone is often blocked by a neighbor.  Keep a
+    contiguous chain of at most four cranes and repair only a late window so
+    the rest of the incumbent remains a stable boundary condition.
+    """
+    last_work = [-1] * M
+    by_time: dict[int, list[Slot]] = {}
+    for slot in incumbent.slots:
+        by_time.setdefault(slot.time, []).append(slot)
+        if slot.state == "work":
+            last_work[slot.crane - 1] = max(last_work[slot.crane - 1], slot.time)
+    bottleneck = max(range(M), key=last_work.__getitem__)
+    chains: list[tuple[int, ...]] = []
+    for width in (2, 3, 4):
+        left = max(0, min(bottleneck, M - width))
+        chains.append(tuple(range(left, left + width)))
+    chains = list(dict.fromkeys(chains))
+    events = [
+        t for t in range(max(2, incumbent.makespan // 3), incumbent.makespan)
+        if any(
+            slot.crane - 1 in set(chains[-1]) and slot.state != "work"
+            for slot in by_time.get(t, [])
+        )
+    ]
+    starts = [
+        max(1, incumbent.makespan * fraction // 100)
+        for fraction in (35, 50, 65)
+    ]
+    if events:
+        starts[:2] = [max(1, events[0] - 1), max(1, events[len(events) // 2] - 1)]
+    windows = []
+    for start in starts:
+        windows.append((start, min(incumbent.makespan - 1, start + max(3, incumbent.makespan // 4))))
+    return [
+        (chain, window)
+        for chain in chains
+        for window in windows
+    ]
+
+
+def _critical_window_beam_repair(
+    W: Sequence[int],
+    M: int,
+    starts: Sequence[int],
+    incumbent: _CandidateSchedule,
+    chain: Sequence[int],
+    deadline: float,
+    seed: int,
+) -> tuple[_CandidateSchedule | None, int]:
+    """Rebuild a short late window for 2--4 neighboring cranes.
+
+    Cranes outside ``chain`` keep their incumbent trajectory.  Inside the
+    window a small beam searches actual position rows, so it can change the
+    order of visits rather than only moving one existing block.  This is an
+    incomplete improvement neighborhood and never proves infeasibility.
+    """
+    target = incumbent.makespan - 1
+    if target < 2:
+        return None, 0
+    active = tuple(sorted(set(chain)))
+    if not active:
+        return None, 0
+    rng = random.Random(seed)
+    eligible_by_bay = _bay_eligibility(len(W), M, [])
+    base_rows = [[0] * M for _ in range(incumbent.makespan + 1)]
+    for slot in incumbent.slots:
+        base_rows[slot.time][slot.crane - 1] = slot.start_bay
+        base_rows[slot.time + 1][slot.crane - 1] = slot.end_bay
+    required = set(starts)
+    evaluated = 0
+    attempts = 0
+    while time.perf_counter() < deadline and attempts < 12:
+        attempts += 1
+        remove_low = max(2, target // 3)
+        remove_at = rng.randint(remove_low, max(remove_low, target - 1))
+        rows = base_rows[:remove_at] + base_rows[remove_at + 1:]
+        window_start = rng.randint(max(1, target // 3), max(1, target // 2))
+        window_end = min(target, window_start + max(5, min(12, target // 3)))
+        if window_end <= window_start:
+            continue
+
+        remaining = list(W)
+
+        def consume(current, following):
+            for start_bay, end_bay in zip(current, following):
+                if start_bay == end_bay and remaining[start_bay - 1] > 0:
+                    remaining[start_bay - 1] -= 1
+
+        for t in range(window_start):
+            consume(rows[t], rows[t + 1])
+        initial_active = tuple(rows[window_start][q] for q in active)
+        states = {(tuple(remaining), initial_active): (initial_active,)}
+        beam_width = 700 if len(active) <= 3 else 350
+
+        for t in range(window_start, window_end):
+            if time.perf_counter() >= deadline:
+                return None, evaluated
+            next_states = {}
+            for (state_remaining, current_active), active_history in states.items():
+                evaluated += 1
+                choices = []
+                local_remaining = list(state_remaining)
+                for q_index, q in enumerate(active):
+                    allowed = [
+                        bay for bay in range(1, len(W) + 1)
+                        if q in eligible_by_bay[bay - 1]
+                    ]
+                    ranked = sorted(
+                        allowed,
+                        key=lambda bay: (
+                            local_remaining[bay - 1],
+                            W[bay - 1],
+                            -abs(bay - current_active[q_index]),
+                        ),
+                        reverse=True,
+                    )
+                    values = [current_active[q_index], rows[t + 1][q]]
+                    values.extend(ranked[:4])
+                    values.extend(rng.sample(allowed, min(2, len(allowed))))
+                    choices.append(list(dict.fromkeys(values)))
+                for next_active in itertools.product(*choices):
+                    full_next = list(rows[t + 1])
+                    for q, bay in zip(active, next_active):
+                        full_next[q] = bay
+                    full_current = list(rows[t])
+                    for q, bay in zip(active, current_active):
+                        full_current[q] = bay
+                    if any(
+                        right - left < 2
+                        for left, right in zip(full_next, full_next[1:])
+                    ):
+                        continue
+                    new_remaining = list(state_remaining)
+                    for start_bay, end_bay in zip(full_current, full_next):
+                        if start_bay == end_bay and new_remaining[start_bay - 1] > 0:
+                            new_remaining[start_bay - 1] -= 1
+                    slots_left = target - (t + 1)
+                    if sum(new_remaining) > slots_left * M:
+                        continue
+                    if max(new_remaining, default=0) > slots_left:
+                        continue
+                    key = (tuple(new_remaining), tuple(next_active))
+                    if key not in next_states:
+                        next_states[key] = active_history + (tuple(next_active),)
+            if not next_states:
+                break
+
+            def state_key(item):
+                (remaining_state, positions), _ = item
+                ready = sum(remaining_state[bay - 1] > 0 for bay in positions)
+                return sum(remaining_state), max(remaining_state, default=0), -ready
+
+            states = dict(sorted(next_states.items(), key=state_key)[:beam_width])
+
+        for (state_remaining, final_active), active_history in sorted(
+            states.items(), key=lambda item: sum(item[0][0])
+        ):
+            candidate_rows = [row[:] for row in rows]
+            for offset, active_row in enumerate(active_history):
+                t = window_start + offset
+                if t > window_end:
+                    break
+                for q, bay in zip(active, active_row):
+                    candidate_rows[t][q] = bay
+            rem = list(state_remaining)
+            for t in range(window_end, target):
+                consume_rows = candidate_rows[t], candidate_rows[t + 1]
+                for start_bay, end_bay in zip(*consume_rows):
+                    if start_bay == end_bay and rem[start_bay - 1] > 0:
+                        rem[start_bay - 1] -= 1
+            if any(rem):
+                continue
+            if any(
+                any(right - left < 2 for left, right in zip(row, row[1:]))
+                for row in candidate_rows
+            ):
+                continue
+            if not required.issubset(set(candidate_rows[0])):
+                continue
+            history = [tuple(row) for row in candidate_rows]
+            try:
+                candidate = _candidate_from_history(W, M, history)
+            except RuntimeError:
+                continue
+            if candidate.makespan == target:
+                return candidate, evaluated
+    return None, evaluated
 
 
 def _mcts_horizon_search(
@@ -1773,7 +2059,7 @@ def solve_cwp(
     initial_configs = _initial_configurations(W, starts, configurations)
     eligibility = _bay_eligibility(len(W), M, configurations)
     lower_bound, lower_bound_components = _makespan_lower_bound(
-        W, M, initial_configs, eligibility
+        W, M, initial_configs, eligibility, starts
     )
     bay_criticality = _bay_criticality(W, M, eligibility)
     rng = random.Random(seed)
@@ -1793,6 +2079,39 @@ def solve_cwp(
     completed = 0
     last_improvement = 0
     published_key = None
+    elite_pool: list[_CandidateSchedule] = []
+    elite_signatures: set[tuple[Any, ...]] = set()
+    elite_repairs = 0
+    critical_repair_iterations = 0
+    critical_repair_improvements = 0
+
+    def schedule_signature(candidate: _CandidateSchedule) -> tuple[Any, ...]:
+        owner_signature = tuple(
+            tuple(sorted(owner_set)) for owner_set in candidate.owners
+        )
+        move_signature = tuple(
+            tuple(
+                (slot.start_bay, slot.end_bay)
+                for slot in candidate.slots
+                if slot.crane == q + 1 and slot.state == "move"
+            )
+            for q in range(M)
+        )
+        return owner_signature, move_signature
+
+    def remember_elite(candidate: _CandidateSchedule) -> None:
+        """Keep a bounded set of structurally different complete schedules."""
+        if best is not None and candidate.makespan > best.makespan + 2:
+            return
+        signature = schedule_signature(candidate)
+        if signature in elite_signatures:
+            return
+        elite_signatures.add(signature)
+        elite_pool.append(candidate)
+        elite_pool.sort(key=lambda item: item.objective_key)
+        if len(elite_pool) > 16:
+            removed = elite_pool.pop()
+            elite_signatures.discard(schedule_signature(removed))
 
     def publish(candidate):
         nonlocal published_key
@@ -1819,6 +2138,9 @@ def solve_cwp(
             mcts_iterations=0, mcts_improvements=0, exact_search_nodes=0,
             exact_search_improvements=0, exact_search_proved_optimal=False,
             search_seconds=round(time.perf_counter() - search_start, 6), max_steps=max_steps,
+            elite_pool_size=len(elite_pool), elite_repairs=elite_repairs,
+            critical_repair_iterations=critical_repair_iterations,
+            critical_repair_improvements=critical_repair_improvements,
         )
         verify_solution(W, M, starts, snapshot)
         on_incumbent(snapshot)
@@ -1990,6 +2312,7 @@ def solve_cwp(
             # They are discarded; unrestricted decoders remain in the portfolio.
             continue
         completed += 1
+        remember_elite(candidate)
         gap = max(0, candidate.makespan - lower_bound)
         reward = (
             1.0 / (1 + gap)
@@ -2001,6 +2324,7 @@ def solve_cwp(
         strategy_rewards[strategy_index] += reward
         if best is None or candidate.objective_key < best.objective_key:
             best = candidate
+            remember_elite(candidate)
             elite_priorities = trial_priorities
             last_improvement = restart
             publish(best)
@@ -2009,19 +2333,74 @@ def solve_cwp(
         best = dp_incumbent
     assert best is not None
     repair_iterations = repair_improvements = 0
-    repair_deadline = time.perf_counter() + max(
+    repair_phase_deadline = time.perf_counter() + max(
         0.0, search_start + 0.95 * effective_time_limit - time.perf_counter()
     ) * 0.65
-    while best.makespan > lower_bound and time.perf_counter() < repair_deadline:
+    general_fraction = 1.0 if effective_time_limit <= 15.0 else 0.55
+    general_repair_deadline = time.perf_counter() + max(
+        0.0, repair_phase_deadline - time.perf_counter()
+    ) * general_fraction
+    repair_round = 0
+    while best.makespan > lower_bound and time.perf_counter() < general_repair_deadline:
+        if not elite_pool:
+            elite_pool.append(best)
+        source = elite_pool[repair_round % len(elite_pool)]
+        remaining_budget = general_repair_deadline - time.perf_counter()
+        slice_deadline = min(
+            general_repair_deadline,
+            time.perf_counter() + max(0.20, min(8.0, remaining_budget / 3.0)),
+        )
         improved, evaluated = _trajectory_repair(
-            W, M, starts, best, repair_deadline, seed + 211 + repair_improvements,
+            W, M, starts, source, slice_deadline, seed + 211 + repair_round,
         )
         repair_iterations += evaluated
-        if improved is None:
-            break
-        best = improved
-        repair_improvements += 1
-        publish(best)
+        if improved is not None:
+            elite_repairs += 1
+            remember_elite(improved)
+            if improved.objective_key < best.objective_key:
+                best = improved
+                repair_improvements += 1
+                publish(best)
+        repair_round += 1
+
+    # A second neighborhood focuses on the crane that finishes last and a
+    # contiguous chain of neighbors.  Unlike the general repair, all cranes
+    # outside the selected chain are fixed throughout the window.
+    critical_windows = _critical_repair_windows(best, M)
+    critical_index = 0
+    while (
+        best.makespan > lower_bound
+        and critical_index < max(1, len(critical_windows) * 3)
+        and time.perf_counter() < repair_phase_deadline
+    ):
+        chain, window = critical_windows[critical_index % len(critical_windows)]
+        source = elite_pool[critical_index % len(elite_pool)] if elite_pool else best
+        remaining_budget = repair_phase_deadline - time.perf_counter()
+        slice_deadline = min(
+            repair_phase_deadline,
+            time.perf_counter() + max(0.20, min(7.0, remaining_budget / 3.0)),
+        )
+        if critical_index % 2 == 0:
+            improved, evaluated = _critical_window_beam_repair(
+                W, M, starts, source, chain, slice_deadline,
+                seed + 1009 + critical_index,
+            )
+        else:
+            improved, evaluated = _trajectory_repair(
+                W, M, starts, source, slice_deadline,
+                seed + 1009 + critical_index,
+                active_cranes=chain,
+                window=window,
+            )
+        critical_repair_iterations += evaluated
+        if improved is not None:
+            elite_repairs += 1
+            remember_elite(improved)
+            if improved.objective_key < best.objective_key:
+                best = improved
+                critical_repair_improvements += 1
+                publish(best)
+        critical_index += 1
     improvement_deadline = search_start + 0.95 * effective_time_limit
     improvement_remaining = max(0.0, improvement_deadline - time.perf_counter())
     gap_after_construction = best.makespan - lower_bound
@@ -2085,6 +2464,7 @@ def solve_cwp(
     exact_is_promising = (
         best.makespan - lower_bound <= 1
         and len(configurations) <= 20_000
+        and math.comb(len(W) - M + 1, M) <= 20_000
     )
     while (
         use_exact_search
@@ -2149,6 +2529,10 @@ def solve_cwp(
         max_steps=max_steps,
         trajectory_repair_iterations=repair_iterations,
         trajectory_repair_improvements=repair_improvements,
+        elite_pool_size=len(elite_pool),
+        elite_repairs=elite_repairs,
+        critical_repair_iterations=critical_repair_iterations,
+        critical_repair_improvements=critical_repair_improvements,
     )
 
 
@@ -2361,6 +2745,12 @@ def _print_summary(solution: Solution) -> None:
     print(
         f"完整轨迹修复迭代数: {solution.trajectory_repair_iterations}；"
         f"工期改进次数: {solution.trajectory_repair_improvements}"
+    )
+    print(
+        f"精英方案池: {solution.elite_pool_size}；"
+        f"精英修复次数: {solution.elite_repairs}；"
+        f"关键桥吊修复迭代数: {solution.critical_repair_iterations}；"
+        f"关键桥吊工期改进次数: {solution.critical_repair_improvements}"
     )
     print(
         f"精确搜索节点数: {solution.exact_search_nodes}；"

@@ -17,6 +17,46 @@ def slow_worker(payload, options, checkpoint, error_path):
 
 
 class SolverImprovementTests(unittest.TestCase):
+    def test_initial_dp_matches_complete_domain(self):
+        self.assertIsNone(cwp_solver._weighted_initial_positions([1]*5, 3, [2]))
+        rng = random.Random(73)
+        for n in range(3, 10):
+            for m in range(1, (n + 1) // 2 + 1):
+                configs = cwp_solver._legal_configurations(n, m)
+                for _ in range(8):
+                    starts = list(rng.choice(configs)[::2])
+                    weights = [rng.randrange(-4, 6) for _ in range(n)]
+                    valid = [c for c in configs if set(starts) <= set(c)]
+                    expected = max(sum(weights[b-1] for b in c) for c in valid)
+                    result = cwp_solver._weighted_initial_positions(weights, m, starts)
+                    self.assertEqual(result[0], expected)
+                    self.assertIn(result[1], valid)
+                    work = [rng.randrange(5) for _ in range(n)]
+                    eligibility = cwp_solver._bay_eligibility(n, m, configs)
+                    self.assertEqual(
+                        cwp_solver._makespan_lower_bound(work, m, valid, eligibility),
+                        cwp_solver._makespan_lower_bound(work, m, valid[:1], eligibility, starts))
+
+    def test_large_initial_pool_is_bounded_and_safe(self):
+        work = [1] * 60
+        _, starts, configs = cwp_solver._validate_input(work, 12, [1, 9, 21, 45])
+        self.assertLessEqual(len(configs), 128)
+        self.assertTrue(configs)
+        for config in configs:
+            self.assertTrue(set(starts) <= set(config))
+            self.assertTrue(all(b-a >= 2 for a, b in zip(config, config[1:])))
+        # Coverage must account for all legal initial positions, including
+        # ones absent from a one-element heuristic pool.
+        n, m = 27, 6
+        configs = cwp_solver._legal_configurations(n, m)
+        starts = [1, 9]
+        valid = [c for c in configs if set(starts) <= set(c)]
+        work = [i % 4 for i in range(n)]
+        eligible = cwp_solver._bay_eligibility(n, m, [])
+        self.assertEqual(
+            cwp_solver._makespan_lower_bound(work, m, valid, eligible),
+            cwp_solver._makespan_lower_bound(work, m, valid[:1], eligible, starts))
+
     def test_dispatch_dp_matches_exhaustive_scores_and_progress(self):
         rng = random.Random(91)
         for n in range(3, 9):
@@ -53,6 +93,44 @@ class SolverImprovementTests(unittest.TestCase):
         self.assertEqual(sum(slot.state == 'work' for slot in repaired.slots), 2)
         for a, b in zip(repaired.slots, repaired.slots[1:]):
             self.assertEqual(a.end_bay, b.start_bay)
+
+    def test_critical_window_repair_returns_only_valid_schedules(self):
+        incumbent = cwp_solver._candidate_from_history(
+            [1, 0, 1], 1, [(1,), (1,), (1,), (3,), (3,), (3,)]
+        )
+        repaired, _ = cwp_solver._critical_window_beam_repair(
+            [1, 0, 1], 1, [1], incumbent, (0,), time.perf_counter() + 0.1, 17
+        )
+        if repaired is not None:
+            cwp_solver.verify_solution([1, 0, 1], 1, [1],
+                                        cwp_solver.Solution(
+                                            status="HEURISTIC_FEASIBLE", method="test",
+                                            makespan=repaired.makespan,
+                                            makespan_lower_bound=1,
+                                            lower_bound_components={},
+                                            makespan_proven_optimal=False,
+                                            proven_lexicographic_optimal=False,
+                                            assignment_count=repaired.assignment_count,
+                                            split_bay_count=repaired.split_bay_count,
+                                            load_deviation=repaired.load_deviation,
+                                            reversal_count=repaired.reversal_count,
+                                            movement_count=repaired.movement_count,
+                                            crane_loads=repaired.loads,
+                                            target_weights=[1],
+                                            bay_cranes={1: [1], 3: [1]},
+                                            slots=repaired.slots,
+                                            restarts_completed=0,
+                                            strategy_evaluations=[],
+                                            layered_search_states=0,
+                                            layered_search_improvements=0,
+                                            mcts_iterations=0,
+                                            mcts_improvements=0,
+                                            exact_search_nodes=0,
+                                            exact_search_improvements=0,
+                                            exact_search_proved_optimal=False,
+                                            search_seconds=0,
+                                            max_steps=10,
+                                        ))
 
     def test_process_timeout_returns_validated_checkpoint(self):
         start = time.perf_counter()
