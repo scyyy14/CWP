@@ -28,9 +28,12 @@ class Slot:
     time: int
     crane: int
     state: str
-    start_bay: int
-    end_bay: int
+    start_bay: int | float
+    end_bay: int | float
     work_bay: int | None
+    move_id: int | None = None
+    move_step: int | None = None
+    move_steps: int | None = None
 
 
 @dataclass
@@ -70,6 +73,7 @@ class Solution:
     critical_repair_improvements: int = 0
     phase_seconds: dict[str, float] = field(default_factory=dict)
     operator_calls: dict[str, int] = field(default_factory=dict)
+    move_time: int = 1
 
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
@@ -104,16 +108,16 @@ class _CandidateSchedule:
     movement_count: int
     loads: list[int]
     owners: list[set[int]]
+    move_time: int = 1
 
     @property
-    def objective_key(self) -> tuple[int, int, int, int, int, int]:
+    def objective_key(self) -> tuple[int, int, int, int]:
+        """User priorities: duration, single-crane bays, central load, moves."""
         return (
             self.makespan,
             self.split_bay_count,
-            self.assignment_count,
-            self.reversal_count,
-            self.movement_count,
             self.load_deviation,
+            self.movement_count,
         )
 
 
@@ -207,7 +211,7 @@ def _weighted_initial_positions(weights, M, starts):
 
 
 def _validate_input(
-    W: list[int], M: int, S: Iterable[int]
+    W: list[int], M: int, S: Iterable[int], move_time: int = 1,
 ) -> tuple[int, list[int], list[tuple[int, ...]]]:
     if not isinstance(W, list) or not W:
         raise ValueError("W 必须是非空整数列表。")
@@ -215,6 +219,8 @@ def _validate_input(
         raise ValueError("W 中每个作业量必须是非负整数。")
     if isinstance(M, bool) or not isinstance(M, int) or M <= 0:
         raise ValueError("M 必须是正整数。")
+    if isinstance(move_time, bool) or not isinstance(move_time, int) or move_time < 0:
+        raise ValueError("move_time 必须是非负整数。")
 
     N = len(W)
     if M > (N + 1) // 2:
@@ -316,6 +322,7 @@ def _makespan_lower_bound(
     initial_configs: Sequence[tuple[int, ...]],
     eligibility: Sequence[set[int]],
     starts: Sequence[int] | None = None,
+    move_time: int = 1,
 ) -> tuple[int, dict[str, int]]:
     """Return valid workload, movement, and congestion-window lower bounds."""
     total_work = sum(W)
@@ -330,7 +337,9 @@ def _makespan_lower_bound(
     initial_positive_capacity = coverage({i + 1 for i, w in enumerate(W) if w})
     minimum_crane_moves = max(0, positive_bays - initial_positive_capacity)
     workload_bound = math.ceil(total_work / M)
-    active_time_bound = math.ceil((total_work + minimum_crane_moves) / M)
+    active_time_bound = math.ceil(
+        (total_work + move_time * minimum_crane_moves) / M
+    )
 
     congestion_bound = 0
     window_active_bound = 0
@@ -358,7 +367,8 @@ def _makespan_lower_bound(
             window_active_bound = max(
                 window_active_bound,
                 math.ceil(
-                    (window_work + minimum_window_arrivals) / parallel_capacity
+                    (window_work + move_time * minimum_window_arrivals)
+                    / parallel_capacity
                 ),
             )
 
@@ -384,7 +394,10 @@ def _makespan_lower_bound(
             mandatory_work = sum(W[bay_index] for bay_index in mandatory_bays)
             eligibility_bound = max(
                 eligibility_bound,
-                math.ceil((mandatory_work + minimum_subset_moves) / crane_count),
+                math.ceil(
+                    (mandatory_work + move_time * minimum_subset_moves)
+                    / crane_count
+                ),
             )
 
     components = {
@@ -1179,6 +1192,9 @@ def _trajectory_repair(
     window: tuple[int, int] | None = None,
     repair_state: RepairState | None = None,
     return_state: bool = False,
+    attempt_trace: list[dict[str, Any]] | None = None,
+    move_time: int = 1,
+    preserve_horizon: bool = False,
 ):
     """Annealed interval repair of a shortened complete position trajectory.
 
@@ -1186,7 +1202,7 @@ def _trajectory_repair(
     Capacity counts stationary edges; excess capacity decodes as idle.
     Only a zero-deficit trajectory is returned. No optimality claim.
     """
-    horizon = incumbent.makespan - 1
+    horizon = incumbent.makespan if preserve_horizon else incumbent.makespan - 1
     if horizon < 1 or horizon > 2000:
         result = (None, 0, None) if return_state else (None, 0)
         return result
@@ -1205,7 +1221,8 @@ def _trajectory_repair(
     window_start = max(0, min(horizon, window_start))
     window_end = max(window_start, min(horizon, window_end))
     context_key = (
-        tuple(W), M, horizon, tuple(sorted(active)), window_start, window_end,
+        tuple(W), M, horizon, move_time, preserve_horizon,
+        tuple(sorted(active)), window_start, window_end,
         hash(tuple(tuple(row) for row in rows)),
     )
     continuation = repair_state if (
@@ -1245,6 +1262,18 @@ def _trajectory_repair(
             iterations=iterations,
             rng_state=rng.getstate(),
         )
+
+    def capacity_counts(paths_to_count):
+        counts_to_return = [0] * len(W)
+        for path in paths_to_count:
+            if move_time == 0:
+                for bay in path[:-1]:
+                    counts_to_return[bay - 1] += 1
+            else:
+                for left, right in zip(path, path[1:]):
+                    if left == right:
+                        counts_to_return[left - 1] += 1
+        return counts_to_return
     while time.perf_counter() < deadline:
         # Delete a boundary, not a job. The resulting missing work is measured
         # explicitly. Keep both endpoints of the mandatory first work slot.
@@ -1256,11 +1285,7 @@ def _trajectory_repair(
             continued_counts = None
         elif best_paths is not None and rng.random() < 0.75:
             paths = [path[:] for path in best_paths]
-            counts = [0] * len(W)
-            for path in paths:
-                for a, b in zip(path, path[1:]):
-                    if a == b:
-                        counts[a - 1] += 1
+            counts = capacity_counts(paths)
             loss = sum(
                 max(0, W[i] - count) + 0.015 * max(0, W[i] - count) ** 2
                 for i, count in enumerate(counts)
@@ -1270,21 +1295,23 @@ def _trajectory_repair(
             # inside that same window.  Deleting an unrelated row creates a
             # work deficit that the supposedly frozen neighbourhood cannot
             # repair.  General repair keeps the original broad range.
-            remove_low = 2
-            remove_high = len(rows) - 1
-            if window is not None:
-                remove_low = max(remove_low, int(window[0]) + 1)
-                remove_high = min(remove_high, int(window[1]))
-            if remove_low > remove_high:
-                return result(None, None)
-            removed = rng.randrange(remove_low, remove_high + 1)
-            shortened = rows[:removed] + rows[removed + 1:]
+            if preserve_horizon:
+                removed = None
+                shortened = rows[:]
+            else:
+                remove_low = 2
+                remove_high = len(rows) - 1
+                if window is not None:
+                    remove_low = max(remove_low, int(window[0]) + 1)
+                    remove_high = min(remove_high, int(window[1]))
+                if remove_low > remove_high:
+                    return result(None, None)
+                removed = rng.randrange(remove_low, remove_high + 1)
+            if attempt_trace is not None:
+                attempt_trace.append({"remove_at": removed, "window": (window_start, window_end)})
+            shortened = rows if preserve_horizon else rows[:removed] + rows[removed + 1:]
             paths = [[row[q] for row in shortened] for q in range(M)]
-            counts = [0] * len(W)
-            for path in paths:
-                for a, b in zip(path, path[1:]):
-                    if a == b:
-                        counts[a - 1] += 1
+            counts = capacity_counts(paths)
             loss = sum(
                 max(0, W[i] - count) + 0.015 * max(0, W[i] - count) ** 2
                 for i, count in enumerate(counts)
@@ -1300,7 +1327,13 @@ def _trajectory_repair(
                 return result(None, save_state(paths, counts, loss))
             if loss < 1e-8:
                 history = list(zip(*paths))
-                return result(_candidate_from_history(W, M, history), None)
+                candidate = _candidate_from_history(W, M, history, move_time)
+                if (
+                    not preserve_horizon
+                    or candidate.makespan == incumbent.makespan
+                    and candidate.objective_key < incumbent.objective_key
+                ):
+                    return result(candidate, None)
             if loss < best_loss - 1e-8:
                 best_loss = loss
                 best_paths = [path[:] for path in paths]
@@ -1375,7 +1408,20 @@ def _trajectory_repair(
             if not replacements:
                 continue
             delta = {}
+            proposed_counts = None
+            if move_time == 0:
+                proposed_paths = [path[:] for path in paths]
+                for k, replacement in replacements.items():
+                    proposed_paths[k][a:b + 1] = replacement
+                proposed_counts = capacity_counts(proposed_paths)
+                delta = {
+                    i: proposed_counts[i] - counts[i]
+                    for i in range(len(W))
+                    if proposed_counts[i] != counts[i]
+                }
             for k, replacement in replacements.items():
+                if move_time == 0:
+                    continue
                 trajectory = paths[k]
                 for t in range(max(0, a - 1), min(horizon, b + 1)):
                     old_a, old_b = trajectory[t], trajectory[t + 1]
@@ -1390,8 +1436,11 @@ def _trajectory_repair(
             if change <= 0 or rng.random() < math.exp(-change / temperature):
                 for k, replacement in replacements.items():
                     paths[k][a:b + 1] = replacement
-                for i, d in delta.items():
-                    counts[i] += d
+                if proposed_counts is not None:
+                    counts = proposed_counts
+                else:
+                    for i, d in delta.items():
+                        counts[i] += d
                 loss += change
     saved = save_state(paths, counts, loss) if "paths" in locals() else None
     return result(None, saved)
@@ -1401,39 +1450,144 @@ def _candidate_from_history(
     W: Sequence[int],
     M: int,
     history: Sequence[tuple[int, ...]],
+    move_time: int = 1,
 ) -> _CandidateSchedule:
-    """Decode a layered/DFS configuration path into the normal result type."""
+    """Decode a configuration path using the configured relocation duration.
+
+    ``move_time == 0`` means a relocation occurs at the boundary between two
+    work periods.  It therefore creates no ``move`` slot.  Positive durations
+    are expanded into that many unit slots; positions during a simultaneous
+    move are linearly interpolated, which preserves crane order and the
+    two-bay separation whenever both endpoint configurations are safe.
+    """
+    if isinstance(move_time, bool) or not isinstance(move_time, int) or move_time < 0:
+        raise ValueError("move_time 必须是非负整数。")
     remaining = list(W)
     owners: list[set[int]] = [set() for _ in W]
     loads = [0] * M
     slots: list[Slot] = []
-    for t, (positions, next_positions) in enumerate(zip(history, history[1:])):
-        for q, (start_bay, end_bay) in enumerate(zip(positions, next_positions)):
-            bay_index = start_bay - 1
-            if start_bay == end_bay and remaining[bay_index] > 0:
-                remaining[bay_index] -= 1
-                owners[bay_index].add(q)
-                loads[q] += 1
-                slots.append(Slot(t, q + 1, "work", start_bay, end_bay, start_bay))
-            elif start_bay != end_bay:
-                slots.append(Slot(t, q + 1, "move", start_bay, end_bay, None))
-            else:
-                slots.append(Slot(t, q + 1, "idle", start_bay, end_bay, None))
+    movement_count = 0
+    movement_directions: list[list[int]] = [[] for _ in range(M)]
+    output_time = 0
+    move_id = 0
+    for positions, next_positions in zip(history, history[1:]):
+        moving = [a != b for a, b in zip(positions, next_positions)]
+        movement_count += sum(moving)
+        for q, (a, b) in enumerate(zip(positions, next_positions)):
+            if a != b:
+                movement_directions[q].append(1 if b > a else -1)
+
+        if move_time == 0:
+            # Work is performed at the current configuration; relocation to
+            # next_positions then happens instantaneously at the period edge.
+            work_here = [remaining[bay - 1] > 0 for bay in positions]
+            if not any(work_here):
+                continue
+            for q, bay in enumerate(positions):
+                if work_here[q]:
+                    remaining[bay - 1] -= 1
+                    owners[bay - 1].add(q)
+                    loads[q] += 1
+                    slots.append(Slot(output_time, q + 1, "work", bay, bay, bay))
+                else:
+                    slots.append(Slot(output_time, q + 1, "idle", bay, bay, None))
+            output_time += 1
+            continue
+
+        duration = move_time if any(moving) else 1
+        current_move_id = move_id if any(moving) and move_time > 1 else None
+        if current_move_id is not None:
+            move_id += 1
+        for step in range(duration):
+            for q, (start_bay, end_bay) in enumerate(zip(positions, next_positions)):
+                if moving[q]:
+                    left = start_bay + (end_bay - start_bay) * step / duration
+                    right = start_bay + (end_bay - start_bay) * (step + 1) / duration
+                    slots.append(Slot(
+                        output_time, q + 1, "move", left, right, None,
+                        current_move_id, step + 1 if current_move_id is not None else None,
+                        duration if current_move_id is not None else None,
+                    ))
+                else:
+                    bay_index = start_bay - 1
+                    if step == 0 and remaining[bay_index] > 0:
+                        remaining[bay_index] -= 1
+                        owners[bay_index].add(q)
+                        loads[q] += 1
+                        slots.append(Slot(
+                            output_time, q + 1, "work",
+                            start_bay, start_bay, start_bay,
+                        ))
+                    else:
+                        slots.append(Slot(
+                            output_time, q + 1, "idle",
+                            start_bay, start_bay, None,
+                        ))
+            output_time += 1
     if any(remaining):
         raise RuntimeError("精确搜索路径没有完成全部作业。")
     target_weights = [min(q + 1, M - q) for q in range(M)]
-    movement_count = sum(slot.state == "move" for slot in slots)
+    if move_time == 0:
+        visible = [
+            tuple(
+                int(slot.start_bay)
+                for slot in sorted(
+                    (item for item in slots if item.time == t),
+                    key=lambda item: item.crane,
+                )
+            )
+            for t in range(output_time)
+        ]
+        visible_directions: list[list[int]] = [[] for _ in range(M)]
+        movement_count = 0
+        for before, after in zip(visible, visible[1:]):
+            for q, (a, b) in enumerate(zip(before, after)):
+                if a != b:
+                    movement_count += 1
+                    visible_directions[q].append(1 if b > a else -1)
+        reversal_count = sum(
+            previous != current
+            for directions in visible_directions
+            for previous, current in zip(directions, directions[1:])
+        )
+    else:
+        reversal_count = sum(
+            previous != current
+            for directions in movement_directions
+            for previous, current in zip(directions, directions[1:])
+        )
     return _CandidateSchedule(
         slots=slots,
-        makespan=len(history) - 1,
+        makespan=output_time,
         assignment_count=sum(len(item) for item in owners),
         split_bay_count=sum(len(item) > 1 for item in owners),
         load_deviation=_load_deviation(loads, target_weights, sum(W)),
-        reversal_count=_count_reversals(slots, M),
+        reversal_count=reversal_count,
         movement_count=movement_count,
         loads=loads,
         owners=owners,
+        move_time=move_time,
     )
+
+
+def _unit_history(candidate: _CandidateSchedule, M: int) -> list[tuple[int, ...]]:
+    """Recover the old unit-transition path from a legacy/core candidate."""
+    rows = [[0] * M for _ in range(candidate.makespan + 1)]
+    for slot in candidate.slots:
+        rows[slot.time][slot.crane - 1] = int(slot.start_bay)
+        rows[slot.time + 1][slot.crane - 1] = int(slot.end_bay)
+    if any(any(bay == 0 for bay in row) for row in rows):
+        raise ValueError("无法从非单位移动排程恢复核心轨迹。")
+    return [tuple(row) for row in rows]
+
+
+def _retime_candidate(
+    W: Sequence[int], M: int, candidate: _CandidateSchedule, move_time: int,
+) -> _CandidateSchedule:
+    """Apply movement timing to a candidate produced by the legacy core."""
+    if move_time == candidate.move_time:
+        return candidate
+    return _candidate_from_history(W, M, _unit_history(candidate, M), move_time)
 
 
 def _bounded_layered_search(
@@ -1740,6 +1894,9 @@ def _critical_window_beam_repair(
     deadline: float,
     seed: int,
     window: tuple[int, int] | None = None,
+    attempt_trace: list[dict[str, Any]] | None = None,
+    move_time: int = 1,
+    preserve_horizon: bool = False,
 ) -> tuple[_CandidateSchedule | None, int]:
     """Rebuild one explicit ``[start,end)`` window for a valid crane chain.
 
@@ -1750,7 +1907,7 @@ def _critical_window_beam_repair(
     available.  This prevents the old implementation from joining an
     incomplete beam layer to a suffix and claiming a candidate.
     """
-    target = incumbent.makespan - 1
+    target = incumbent.makespan if preserve_horizon else incumbent.makespan - 1
     if target < 3:
         return None, 0
     active = tuple(sorted({q for q in chain if 0 <= q < M}))
@@ -1779,18 +1936,21 @@ def _critical_window_beam_repair(
 
     def consume(remaining: list[int], current: Sequence[int], following: Sequence[int]) -> None:
         for start_bay, end_bay in zip(current, following):
-            if start_bay == end_bay and remaining[start_bay - 1] > 0:
+            if (move_time == 0 or start_bay == end_bay) and remaining[start_bay - 1] > 0:
                 remaining[start_bay - 1] -= 1
 
     while time.perf_counter() < deadline and attempts < 24:
         attempts += 1
-        # The source has target+2 rows; delete exactly one row inside [a,b].
+        # Shortening deletes one boundary. Multi-objective refinement keeps
+        # the full horizon and rebuilds the selected window in place.
         remove_low = spec.start + 1
         remove_high = min(spec.end, target)
         if remove_low > remove_high:
             return None, evaluated
-        remove_at = rng.randint(remove_low, remove_high)
-        rows = base_rows[:remove_at] + base_rows[remove_at + 1:]
+        remove_at = None if preserve_horizon else rng.randint(remove_low, remove_high)
+        if attempt_trace is not None:
+            attempt_trace.append({"remove_at": remove_at, "window": tuple(window)})
+        rows = base_rows[:] if preserve_horizon else base_rows[:remove_at] + base_rows[remove_at + 1:]
         if any(not safe(row) for row in rows):
             continue
 
@@ -1888,10 +2048,16 @@ def _critical_window_beam_repair(
             if not required.issubset(set(candidate_rows[0])):
                 continue
             try:
-                candidate = _candidate_from_history(W, M, [tuple(row) for row in candidate_rows])
+                candidate = _candidate_from_history(
+                    W, M, [tuple(row) for row in candidate_rows], move_time
+                )
             except RuntimeError:
                 continue
-            if candidate.makespan == target:
+            if candidate.makespan <= target and (
+                not preserve_horizon
+                or candidate.makespan == incumbent.makespan
+                and candidate.objective_key < incumbent.objective_key
+            ):
                 return candidate, evaluated
     return None, evaluated
 
@@ -2179,6 +2345,11 @@ def solve_cwp(
     time_limit: float = 270.0,
     seed: int = 20260910,
     patience: int = 2_000,
+    critical_mode: str = "both",
+    checkpoint: _CandidateSchedule | None = None,
+    skip_general_repair: bool = False,
+    stop_before_critical: bool = False,
+    move_time: int = 1,
     on_incumbent: Callable[[Solution], None] | None = None,
 ) -> Solution:
     """Construct a safe schedule without calling an optimization solver."""
@@ -2189,9 +2360,11 @@ def solve_cwp(
         raise ValueError("time_limit 必须大于 0。")
     if isinstance(patience, bool) or not isinstance(patience, int) or patience <= 0:
         raise ValueError("patience 必须是正整数。")
+    if critical_mode not in {"off_reallocate", "off_reserved", "beam", "trajectory", "both"}:
+        raise ValueError("critical_mode 必须是 off_reallocate、off_reserved、beam、trajectory 或 both。")
     effective_time_limit = min(float(time_limit), 270.0)
     deadline = search_start + effective_time_limit
-    _, starts, configurations = _validate_input(W, M, S)
+    _, starts, configurations = _validate_input(W, M, S, move_time)
 
     total_work = sum(W)
     max_steps = max(1, 3 * total_work + len(W) + 1)
@@ -2199,11 +2372,13 @@ def solve_cwp(
     initial_configs = _initial_configurations(W, starts, configurations)
     eligibility = _bay_eligibility(len(W), M, configurations)
     lower_bound, lower_bound_components = _makespan_lower_bound(
-        W, M, initial_configs, eligibility, starts
+        W, M, initial_configs, eligibility, starts, move_time
     )
     bay_criticality = _bay_criticality(W, M, eligibility)
     rng = random.Random(seed)
-    use_exact_search = effective_time_limit >= 2.0
+    # Exact pruning is written for one-slot transitions.  It remains a useful
+    # heuristic source for other durations, but cannot certify optimality.
+    use_exact_search = effective_time_limit >= 2.0 and move_time == 1
     heuristic_deadline = (
         search_start + (
             min(15.0, 0.90 * effective_time_limit) if M <= 3
@@ -2302,20 +2477,21 @@ def solve_cwp(
             return
         if published_key is not None and candidate.objective_key >= published_key:
             return
-        optimal = candidate.makespan == lower_bound
+        timed_candidate = _retime_candidate(W, M, candidate, move_time)
+        optimal = move_time == 1 and timed_candidate.makespan == lower_bound
         snapshot = Solution(
             status="MAKESPAN_OPTIMAL_BY_LOWER_BOUND" if optimal else "HEURISTIC_FEASIBLE",
             method="dp_dispatch_priority_evolution_trajectory_repair_mcts_exact_no_solver",
-            makespan=candidate.makespan, makespan_lower_bound=lower_bound,
+            makespan=timed_candidate.makespan, makespan_lower_bound=lower_bound,
             lower_bound_components=lower_bound_components,
             makespan_proven_optimal=optimal, proven_lexicographic_optimal=False,
-            assignment_count=candidate.assignment_count, split_bay_count=candidate.split_bay_count,
-            load_deviation=candidate.load_deviation, reversal_count=candidate.reversal_count,
-            movement_count=candidate.movement_count, crane_loads=candidate.loads,
+            assignment_count=timed_candidate.assignment_count, split_bay_count=timed_candidate.split_bay_count,
+            load_deviation=timed_candidate.load_deviation, reversal_count=timed_candidate.reversal_count,
+            movement_count=timed_candidate.movement_count, crane_loads=timed_candidate.loads,
             target_weights=target_weights,
             bay_cranes={i + 1: [q + 1 for q in sorted(owners)]
-                        for i, owners in enumerate(candidate.owners) if owners},
-            slots=candidate.slots, restarts_completed=completed,
+                        for i, owners in enumerate(timed_candidate.owners) if owners},
+            slots=timed_candidate.slots, restarts_completed=completed,
             strategy_evaluations=list(evaluation_totals),
             layered_search_states=0, layered_search_improvements=0,
             mcts_iterations=0, mcts_improvements=0, exact_search_nodes=0,
@@ -2326,10 +2502,20 @@ def solve_cwp(
             critical_repair_improvements=critical_repair_improvements,
             phase_seconds=dict(phase_seconds),
             operator_calls=dict(operator_calls),
+            move_time=move_time,
         )
         verify_solution(W, M, starts, snapshot)
         on_incumbent(snapshot)
         published_key = candidate.objective_key
+
+    # Experimental checkpoint entry: resume exactly at the boundary before
+    # the critical-window phase.  The checkpoint is an already validated
+    # complete candidate and is intentionally kept private to the ablation
+    # harness; normal construction remains unchanged when it is absent.
+    if checkpoint is not None:
+        best = checkpoint
+        remember_elite(checkpoint)
+        published_key = checkpoint.objective_key
 
     # The first five rules preserve the original decoder; the second five add
     # congestion-window priority. An online UCB selector allocates more trials
@@ -2370,7 +2556,7 @@ def solve_cwp(
     dp_incumbent = None
     decoder_offset = 0
 
-    for round_index in range(restarts):
+    for round_index in range(0 if checkpoint is not None else restarts):
         if M <= 3 and round_index == 300:
             if best is not None and best.makespan == lower_bound:
                 break
@@ -2504,8 +2690,8 @@ def solve_cwp(
             1.0 / (1 + gap)
             + 0.25 * max(0, previous_best_makespan - candidate.makespan)
             + 0.05 / (1 + candidate.split_bay_count)
-            + 0.01 / (1 + candidate.assignment_count)
-            + 0.002 / (1 + candidate.reversal_count)
+            + 0.01 / (1 + candidate.load_deviation)
+            + 0.002 / (1 + candidate.movement_count)
         )
         strategy_rewards[strategy_index] += reward
         if best is None or candidate.objective_key < best.objective_key:
@@ -2525,9 +2711,13 @@ def solve_cwp(
         0.0, search_start + 0.95 * effective_time_limit - time.perf_counter()
     ) * 0.65
     general_fraction = 1.0 if effective_time_limit <= 15.0 else 0.55
-    general_repair_deadline = time.perf_counter() + max(
-        0.0, repair_phase_deadline - time.perf_counter()
-    ) * general_fraction
+    general_repair_deadline = (
+        time.perf_counter()
+        if checkpoint is not None or skip_general_repair
+        else time.perf_counter() + max(
+            0.0, repair_phase_deadline - time.perf_counter()
+        ) * general_fraction
+    )
     repair_round = 0
     general_repair_started = time.perf_counter()
     while best.makespan > lower_bound and time.perf_counter() < general_repair_deadline:
@@ -2571,8 +2761,16 @@ def solve_cwp(
     # elite schedule with another horizon.
     critical_index = 0
     critical_limit = max(1, min(48, max(1, len(elite_pool)) * 6))
+    critical_reserve = min(
+        max(0.0, repair_phase_deadline - time.perf_counter()),
+        7.0 * critical_limit,
+    )
+    reserved_deadline = max(search_start, repair_phase_deadline - critical_reserve)
     critical_started = time.perf_counter()
     while (
+        not stop_before_critical
+        and critical_mode in {"beam", "trajectory", "both"}
+        and
         best.makespan > lower_bound
         and critical_index < critical_limit
         and time.perf_counter() < repair_phase_deadline
@@ -2589,12 +2787,15 @@ def solve_cwp(
             repair_phase_deadline,
             time.perf_counter() + max(0.20, min(7.0, remaining_budget / 3.0)),
         )
-        if critical_index % 2 == 0:
+        if critical_mode == "beam" or (
+            critical_mode == "both" and critical_index % 2 == 0
+        ):
             operator_calls["critical_beam"] += 1
             improved, evaluated = _critical_window_beam_repair(
                 W, M, starts, source, chain, slice_deadline,
                 seed + 1009 + critical_index,
                 window=window,
+                move_time=move_time,
             )
         else:
             operator_calls["trajectory"] += 1
@@ -2608,6 +2809,7 @@ def solve_cwp(
                 active_cranes=chain,
                 window=window,
                 repair_state=repair_states.get(source_key), return_state=True,
+                move_time=move_time,
             )
             if continuation is None:
                 repair_states.pop(source_key, None)
@@ -2626,7 +2828,15 @@ def solve_cwp(
     phase_seconds["critical_repair"] = round(
         time.perf_counter() - critical_started, 6
     )
-    improvement_deadline = search_start + 0.95 * effective_time_limit
+    improvement_deadline = (
+        time.perf_counter()
+        if stop_before_critical
+        else reserved_deadline
+        if critical_mode == "off_reserved"
+        else search_start + 0.95 * effective_time_limit
+    )
+    if critical_mode == "off_reserved" or stop_before_critical:
+        layered_deadline = min(layered_deadline, improvement_deadline)
     improvement_remaining = max(0.0, improvement_deadline - time.perf_counter())
     gap_after_construction = best.makespan - lower_bound
     mcts_share = (
@@ -2702,12 +2912,12 @@ def solve_cwp(
         use_exact_search
         and exact_is_promising
         and best.makespan > lower_bound
-        and time.perf_counter() < deadline
+        and time.perf_counter() < improvement_deadline
     ):
         operator_calls["exact"] += 1
         improved, exact_status, evaluated = _exact_horizon_search(
             W, M, starts, configurations, initial_configs, eligibility,
-            bay_criticality, best, deadline,
+            bay_criticality, best, improvement_deadline,
         )
         exact_search_nodes += evaluated
         if improved is not None and improved.objective_key < best.objective_key:
@@ -2721,7 +2931,10 @@ def solve_cwp(
     phase_seconds["exact"] = round(time.perf_counter() - exact_started, 6)
 
     elapsed = time.perf_counter() - search_start
-    makespan_optimal = best.makespan == lower_bound or exact_search_proved_optimal
+    best = _retime_candidate(W, M, best, move_time)
+    makespan_optimal = move_time == 1 and (
+        best.makespan == lower_bound or exact_search_proved_optimal
+    )
     bay_cranes = {
         i + 1: [q + 1 for q in sorted(bay_owners)]
         for i, bay_owners in enumerate(best.owners)
@@ -2730,12 +2943,16 @@ def solve_cwp(
     return Solution(
         status=(
             "MAKESPAN_OPTIMAL_BY_LOWER_BOUND"
-            if best.makespan == lower_bound
+            if makespan_optimal and best.makespan == lower_bound
             else "MAKESPAN_OPTIMAL_BY_EXACT_SEARCH"
             if exact_search_proved_optimal
             else "HEURISTIC_FEASIBLE"
         ),
-        method="dp_dispatch_priority_evolution_trajectory_repair_mcts_exact_no_solver",
+        method=(
+            "dp_dispatch_priority_construction_only_no_solver"
+            if stop_before_critical
+            else "dp_dispatch_priority_evolution_trajectory_repair_mcts_exact_no_solver"
+        ),
         makespan=best.makespan,
         makespan_lower_bound=lower_bound,
         lower_bound_components=lower_bound_components,
@@ -2769,11 +2986,15 @@ def solve_cwp(
         critical_repair_improvements=critical_repair_improvements,
         phase_seconds=dict(phase_seconds),
         operator_calls=dict(operator_calls),
+        move_time=move_time,
     )
 
 
 def verify_solution(W: Sequence[int], M: int, S: Iterable[int], solution: Solution) -> None:
     """Independently verify workload, state, collision, and start constraints."""
+    move_time = getattr(solution, "move_time", 1)
+    if isinstance(move_time, bool) or not isinstance(move_time, int) or move_time < 0:
+        raise AssertionError("move_time 必须是非负整数。")
     by_time: dict[int, list[Slot]] = {}
     work_done = [0] * len(W)
     load_done = [0] * M
@@ -2788,6 +3009,8 @@ def verify_solution(W: Sequence[int], M: int, S: Iterable[int], solution: Soluti
             work_done[slot.work_bay - 1] += 1
             load_done[slot.crane - 1] += 1
         elif slot.state == "move":
+            if move_time == 0:
+                raise AssertionError("move_time=0 时不应占用移动时间槽。")
             if slot.start_bay == slot.end_bay or slot.work_bay is not None:
                 raise AssertionError("移动槽定义错误。")
         elif slot.state == "idle":
@@ -2800,8 +3023,6 @@ def verify_solution(W: Sequence[int], M: int, S: Iterable[int], solution: Soluti
         raise AssertionError(f"作业量不守恒：得到 {work_done}，要求 {list(W)}。")
     if load_done != solution.crane_loads:
         raise AssertionError("桥吊负荷汇总不一致。")
-    if _count_reversals(solution.slots, M) != solution.reversal_count:
-        raise AssertionError("桥吊折返次数汇总不一致。")
     if len(by_time) != solution.makespan:
         raise AssertionError("时间槽数量与完工时间不一致。")
 
@@ -2816,7 +3037,7 @@ def verify_solution(W: Sequence[int], M: int, S: Iterable[int], solution: Soluti
         working_bays = [row.work_bay for row in rows if row.state == "work"]
         if len(working_bays) != len(set(working_bays)):
             raise AssertionError(f"t={t} 同一贝位有多台桥吊作业。")
-        if t > 0:
+        if t > 0 and move_time > 0:
             previous = sorted(by_time[t - 1], key=lambda row: row.crane)
             for before, current in zip(previous, rows):
                 if before.end_bay != current.start_bay:
@@ -2824,6 +3045,47 @@ def verify_solution(W: Sequence[int], M: int, S: Iterable[int], solution: Soluti
                         f"t={t} Q{current.crane} 位置不连续："
                         f"上一槽结束于 {before.end_bay}，本槽开始于 {current.start_bay}。"
                     )
+
+    if move_time == 0:
+        directions: list[list[int]] = [[] for _ in range(M)]
+        visible_moves = 0
+        for t in range(1, solution.makespan):
+            previous = sorted(by_time[t - 1], key=lambda row: row.crane)
+            current = sorted(by_time[t], key=lambda row: row.crane)
+            for q, (before, after) in enumerate(zip(previous, current)):
+                if before.end_bay != after.start_bay:
+                    visible_moves += 1
+                    directions[q].append(1 if after.start_bay > before.end_bay else -1)
+        reversals = sum(
+            a != b
+            for crane_directions in directions
+            for a, b in zip(crane_directions, crane_directions[1:])
+        )
+        if visible_moves != solution.movement_count:
+            raise AssertionError("瞬时移动次数汇总不一致。")
+    else:
+        reversals = _count_reversals(solution.slots, M)
+        if move_time == 1:
+            movement_count = sum(slot.state == "move" for slot in solution.slots)
+        else:
+            groups: dict[tuple[int, int], list[Slot]] = {}
+            for slot in solution.slots:
+                if slot.state != "move":
+                    continue
+                if slot.move_id is None:
+                    raise AssertionError("多时段移动缺少 move_id。")
+                groups.setdefault((slot.crane, slot.move_id), []).append(slot)
+            for group in groups.values():
+                steps = sorted(slot.move_step for slot in group)
+                if len(group) != move_time or steps != list(range(1, move_time + 1)):
+                    raise AssertionError("移动持续时间与 move_time 不一致。")
+                if any(slot.move_steps != move_time for slot in group):
+                    raise AssertionError("move_steps 与 move_time 不一致。")
+            movement_count = len(groups)
+        if movement_count != solution.movement_count:
+            raise AssertionError("移动次数汇总不一致。")
+    if reversals != solution.reversal_count:
+        raise AssertionError("桥吊折返次数汇总不一致。")
 
     first_slot_work = {
         row.work_bay for row in by_time.get(0, []) if row.state == "work"
@@ -2837,6 +3099,8 @@ def plot_schedule(
     N: int,
     output_path: Path,
     show: bool = False,
+    diagnostic_title: str | None = None,
+    highlight_window: tuple[int, int] | None = None,
 ) -> None:
     """Draw the schedule, save it as PNG, and optionally show a GUI window."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2874,6 +3138,18 @@ def plot_schedule(
     height = min(30.0, max(6.0, 0.42 * max(1, solution.makespan)))
     fig, ax = plt.subplots(figsize=(max(10.0, 0.65 * N), height))
 
+    if highlight_window is not None:
+        window_start, window_end = highlight_window
+        ax.axhspan(
+            window_start,
+            window_end,
+            facecolor="#ffd54f",
+            edgecolor="#f9a825",
+            linewidth=1.2,
+            alpha=0.18,
+            zorder=0,
+        )
+
     for slot in solution.slots:
         color = colors[slot.crane - 1]
         y0 = slot.time
@@ -2894,6 +3170,28 @@ def plot_schedule(
         else:
             ax.plot(slot.start_bay, y0 + 0.5, marker="o", markersize=5, color=color, fillstyle="none")
 
+    if getattr(solution, "move_time", 1) == 0:
+        # Instantaneous relocations live between periods and therefore have
+        # no Slot of their own.  Draw them at the shared time boundary.
+        for q in range(1, crane_count + 1):
+            crane_slots = sorted(
+                (slot for slot in solution.slots if slot.crane == q),
+                key=lambda slot: slot.time,
+            )
+            for previous, current in zip(crane_slots, crane_slots[1:]):
+                if previous.end_bay == current.start_bay:
+                    continue
+                boundary = current.time
+                ax.annotate(
+                    "",
+                    xy=(current.start_bay, boundary + 0.06),
+                    xytext=(previous.end_bay, boundary - 0.06),
+                    arrowprops=dict(
+                        arrowstyle="->", color=colors[q - 1],
+                        lw=1.6, linestyle="--",
+                    ),
+                )
+
     ax.set_xlim(0.5, N + 0.5)
     ax.set_ylim(solution.makespan if solution.makespan else 1, 0)
     ax.set_xticks(range(1, N + 1))
@@ -2906,11 +3204,14 @@ def plot_schedule(
     ax.set_xlabel("贝位序号 / Bay index (1-based)")
     ax.set_ylabel("Time")
     proof_text = "makespan optimal" if solution.makespan_proven_optimal else "heuristic"
-    ax.set_title(
+    title = (
         f"CWP schedule — {proof_text}, makespan {solution.makespan}, "
         f"reversals {solution.reversal_count}, moves {solution.movement_count}, "
         f"split bays {solution.split_bay_count}"
     )
+    if diagnostic_title:
+        title += f"\n{diagnostic_title}"
+    ax.set_title(title)
     ax.grid(True, which="major", color="0.88", linewidth=0.6)
     ax.set_axisbelow(True)
 
@@ -2962,11 +3263,13 @@ def _print_summary(solution: Solution) -> None:
     print(f"方法: {solution.method}")
     print(f"完工时间: {solution.makespan}；理论下界: {solution.makespan_lower_bound}")
     print(f"下界组成: {solution.lower_bound_components}")
-    print(f"桥吊-贝位分配数: {solution.assignment_count}")
+    print("目标优先级: 完工时间 → 拆分贝位数 → 中间重载偏差 → 移动次数")
+    print(f"桥吊-贝位分配数（统计）: {solution.assignment_count}")
     print(f"被多吊拆分的贝位数: {solution.split_bay_count}")
     print(f"各桥吊作业负荷: {solution.crane_loads}")
     print(f"中间重载目标权重: {solution.target_weights}")
-    print(f"折返次数: {solution.reversal_count}")
+    print(f"中间重载偏差: {solution.load_deviation}")
+    print(f"折返次数（统计）: {solution.reversal_count}")
     print(f"移动次数: {solution.movement_count}")
     print(f"完成搜索轮数: {solution.restarts_completed}；耗时: {solution.search_seconds:.3f}s")
     print(f"各优先规则评估次数: {solution.strategy_evaluations}")
@@ -3064,6 +3367,12 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=20260910, help="Random seed for reproducible schedules")
     parser.add_argument("--patience", type=int, default=2_000, help="Stop after this many non-improving trials once the makespan lower bound is reached")
     parser.add_argument(
+        "--critical-mode",
+        choices=("off_reallocate", "off_reserved", "beam", "trajectory", "both"),
+        default="both",
+        help="Critical-window ablation mode",
+    )
+    parser.add_argument(
         "--show",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -3073,6 +3382,7 @@ def main() -> None:
 
     payload = json.loads(args.input.read_text(encoding="utf-8"))
     W, M, S = payload["W"], payload["M"], payload.get("S", [])
+    move_time = payload.get("move_time", 1)
     # Reserve 30 seconds for validation, JSON output and bounded PNG creation.
     solve_budget = min(
         args.time_limit,
@@ -3084,6 +3394,8 @@ def main() -> None:
         time_limit=solve_budget,
         seed=args.seed,
         patience=args.patience,
+        critical_mode=args.critical_mode,
+        move_time=move_time,
     )
     verify_solution(W, M, S, solution)
 

@@ -17,6 +17,143 @@ def slow_worker(payload, options, checkpoint, error_path):
 
 
 class SolverImprovementTests(unittest.TestCase):
+    def test_move_time_is_configurable_and_default_is_legacy_one(self):
+        work = [1, 0, 1]
+        results = {
+            duration: cwp_solver.solve_cwp(
+                work, 1, [1], restarts=20, time_limit=0.1,
+                critical_mode="off_reallocate", move_time=duration,
+            )
+            for duration in (0, 1, 2)
+        }
+        legacy = cwp_solver.solve_cwp(
+            work, 1, [1], restarts=20, time_limit=0.1,
+            critical_mode="off_reallocate",
+        )
+        self.assertEqual([results[d].makespan for d in (0, 1, 2)], [2, 3, 4])
+        self.assertEqual(legacy.makespan, results[1].makespan)
+        self.assertFalse(any(slot.state == "move" for slot in results[0].slots))
+        self.assertEqual(sum(slot.state == "move" for slot in results[2].slots), 2)
+        self.assertEqual(results[2].movement_count, 1)
+        for duration, solution in results.items():
+            self.assertEqual(solution.move_time, duration)
+            cwp_solver.verify_solution(work, 1, [1], solution)
+
+    def test_invalid_move_time_is_rejected(self):
+        for value in (-1, 1.5, True):
+            with self.assertRaisesRegex(ValueError, "move_time"):
+                cwp_solver.solve_cwp(
+                    [1], 1, [1], restarts=1, time_limit=0.1,
+                    move_time=value,
+                )
+
+    def test_step8_trajectory_uses_zero_time_movement_capacity(self):
+        source = cwp_solver._CandidateSchedule(
+            slots=[
+                cwp_solver.Slot(0, 1, "work", 1, 1, 1),
+                cwp_solver.Slot(1, 1, "idle", 1, 1, None),
+                cwp_solver.Slot(2, 1, "work", 3, 3, 3),
+                cwp_solver.Slot(3, 1, "idle", 3, 3, None),
+            ],
+            makespan=4, assignment_count=2, split_bay_count=0,
+            load_deviation=0, reversal_count=0, movement_count=1,
+            loads=[2], owners=[{0}, set(), {0}], move_time=0,
+        )
+        repaired, _ = cwp_solver._trajectory_repair(
+            [1, 0, 1], 1, [1], source, time.perf_counter() + 0.2, 17,
+            active_cranes=(0,), window=(1, 3), move_time=0,
+        )
+        self.assertIsNotNone(repaired)
+        self.assertEqual(repaired.makespan, 2)
+        check = type("Check", (), {
+            "slots": repaired.slots,
+            "makespan": repaired.makespan,
+            "crane_loads": repaired.loads,
+            "reversal_count": repaired.reversal_count,
+            "movement_count": repaired.movement_count,
+            "move_time": 0,
+        })()
+        cwp_solver.verify_solution([1, 0, 1], 1, [1], check)
+
+    def test_step8_same_horizon_improves_secondary_objective(self):
+        work = [0, 0, 4, 0, 0]
+        slots = []
+        for t, positions in enumerate(((1, 3), (1, 3), (3, 5), (3, 5))):
+            for q, bay in enumerate(positions):
+                is_work = (q == 1 and t < 2) or (q == 0 and t >= 2)
+                slots.append(cwp_solver.Slot(
+                    t, q + 1, "work" if is_work else "idle",
+                    bay, bay, bay if is_work else None,
+                ))
+        source = cwp_solver._CandidateSchedule(
+            slots=slots, makespan=4, assignment_count=2,
+            split_bay_count=1, load_deviation=0, reversal_count=0,
+            movement_count=2, loads=[2, 2],
+            owners=[set(), set(), {0, 1}, set(), set()], move_time=0,
+        )
+        repaired, _ = cwp_solver._trajectory_repair(
+            work, 2, [], source, time.perf_counter() + 0.2, 0,
+            active_cranes=(0, 1), window=(1, 3), move_time=0,
+            preserve_horizon=True,
+        )
+        self.assertIsNotNone(repaired)
+        self.assertEqual(repaired.makespan, source.makespan)
+        self.assertLess(repaired.objective_key, source.objective_key)
+        self.assertEqual(repaired.split_bay_count, 0)
+
+    def test_construction_only_source_stops_before_steps_7_and_8(self):
+        work = [2, 0, 2, 0, 2]
+        result = cwp_solver.solve_cwp(
+            work, 2, [1, 5], restarts=4, time_limit=0.2, seed=11,
+            critical_mode="both", skip_general_repair=True,
+            stop_before_critical=True,
+        )
+        cwp_solver.verify_solution(work, 2, [1, 5], result)
+        self.assertGreater(result.operator_calls["construction"], 0)
+        self.assertEqual(result.operator_calls["trajectory"], 0)
+        self.assertEqual(result.operator_calls["critical_beam"], 0)
+        self.assertEqual(result.operator_calls["mcts"], 0)
+        self.assertEqual(result.operator_calls["layered"], 0)
+        self.assertEqual(result.operator_calls["exact"], 0)
+        self.assertEqual(
+            result.method, "dp_dispatch_priority_construction_only_no_solver"
+        )
+
+    def test_critical_mode_ablation_switches_only_calls(self):
+        kwargs = dict(restarts=2, time_limit=0.2, seed=7)
+        off = cwp_solver.solve_cwp([2, 0, 2, 0, 2], 2, [1, 5],
+                                   critical_mode="off_reallocate", **kwargs)
+        beam = cwp_solver.solve_cwp([2, 0, 2, 0, 2], 2, [1, 5],
+                                    critical_mode="beam", **kwargs)
+        self.assertEqual(off.operator_calls.get("critical_beam", 0), 0)
+        self.assertGreaterEqual(beam.operator_calls.get("critical_beam", 0), 0)
+
+    def test_four_objective_priority_order(self):
+        def candidate(h=10, split=0, deviation=0, moves=0, assignments=100, reversals=100):
+            return cwp_solver._CandidateSchedule(
+                slots=[], makespan=h, assignment_count=assignments,
+                split_bay_count=split, load_deviation=deviation,
+                reversal_count=reversals, movement_count=moves,
+                loads=[], owners=[])
+
+        self.assertLess(candidate(h=9, split=5, deviation=100, moves=100).objective_key,
+                        candidate().objective_key)
+        self.assertLess(candidate(deviation=100, moves=100).objective_key,
+                        candidate(split=1).objective_key)
+        self.assertLess(candidate(moves=100).objective_key,
+                        candidate(deviation=1).objective_key)
+        self.assertLess(candidate(moves=1).objective_key,
+                        candidate(moves=2).objective_key)
+        self.assertEqual(candidate().objective_key,
+                         candidate(assignments=0, reversals=0).objective_key)
+
+    def test_central_load_preference(self):
+        weights = [1, 2, 3, 3, 2, 1]
+        central = cwp_solver._load_deviation([1, 2, 3, 3, 2, 1], weights, 12)
+        edge = cwp_solver._load_deviation([3, 2, 1, 1, 2, 3], weights, 12)
+        self.assertEqual(central, 0)
+        self.assertLess(central, edge)
+
     def test_initial_dp_matches_complete_domain(self):
         self.assertIsNone(cwp_solver._weighted_initial_positions([1]*5, 3, [2]))
         rng = random.Random(73)
