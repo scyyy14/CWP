@@ -1972,14 +1972,7 @@ def _critical_repair_windows(
         end = min(horizon, start + width)
         if end > start:
             windows.append((start, end))
-    local = [(chain, window) for chain in chains for window in windows]
-    # A one-slot horizon reduction can require a hand-off cascade whose
-    # compensating moves occur far apart (for example Q1->Q2 early and an
-    # outer crane absorbing work near the tail).  No quarter-horizon window
-    # can express that.  Try one explicit global fallback first; local windows
-    # remain the cheaper majority of the neighbourhood portfolio.
-    global_fallback = (tuple(range(M)), (1, horizon))
-    return [global_fallback, *[item for item in local if item != global_fallback]]
+    return [(chain, window) for chain in chains for window in windows]
 
 
 def _critical_window_beam_repair(

@@ -332,12 +332,12 @@ class SolverImprovementTests(unittest.TestCase):
             incumbent = cwp_solver._candidate_from_history(work, m, history)
             windows = cwp_solver._critical_repair_windows(incumbent, m)
             self.assertTrue(windows)
-            self.assertEqual(windows[0], (tuple(range(m)), (1, incumbent.makespan - 1)))
             for chain, (start, end) in windows:
                 self.assertTrue(chain)
                 self.assertTrue(all(0 <= q < m for q in chain))
                 self.assertGreaterEqual(start, 1)
                 self.assertGreater(end, start)
+                self.assertLessEqual(end - start, max(3, (incumbent.makespan - 1) // 4))
             horizon = incumbent.makespan - 1
             self.assertTrue(any(end == horizon for _, (_, end) in windows))
 
