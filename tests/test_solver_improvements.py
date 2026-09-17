@@ -340,6 +340,31 @@ class SolverImprovementTests(unittest.TestCase):
                 self.assertLessEqual(end - start, max(3, (incumbent.makespan - 1) // 4))
             horizon = incumbent.makespan - 1
             self.assertTrue(any(end == horizon for _, (_, end) in windows))
+            if m > 1:
+                self.assertTrue(any(chain[-1] == m - 1 for chain, _ in windows))
+
+    def test_zero_time_shortening_potential_decodes_prepared_schedule(self):
+        slots = [
+            cwp_solver.Slot(0, 1, "work", 1, 1, 1),
+            cwp_solver.Slot(0, 2, "idle", 3, 3, None),
+            cwp_solver.Slot(1, 1, "idle", 1, 1, None),
+            cwp_solver.Slot(1, 2, "work", 3, 3, 3),
+        ]
+        candidate = cwp_solver._CandidateSchedule(
+            slots=slots, makespan=2, assignment_count=2,
+            split_bay_count=0, load_deviation=0, reversal_count=0,
+            movement_count=0, loads=[1, 1], owners=[{0}, set(), {1}],
+            move_time=0,
+        )
+        potential, remove_at, deficits = cwp_solver._shortening_potential(
+            [1, 0, 1], 2, candidate
+        )
+        self.assertEqual(potential[:3], (0, 0, 0))
+        self.assertIsNotNone(remove_at)
+        self.assertFalse(any(deficits))
+        shortened = cwp_solver._decode_best_shortening([1, 0, 1], 2, candidate)
+        self.assertIsNotNone(shortened)
+        self.assertEqual(shortened.makespan, 1)
 
     def test_trajectory_repair_can_resume_after_deadline(self):
         work = [5, 0, 5]

@@ -162,7 +162,7 @@ def plot_view(candidate):
 def direct_run(
     W, M, S, source, mode, budget, seed, *, move_time=1,
     verbose_windows=False, plot_dir: Path | None = None,
-    preserve_horizon=False,
+    preserve_horizon=False, cumulative_local=True,
 ):
     start = time.perf_counter()
     deadline = start + budget
@@ -174,6 +174,81 @@ def direct_run(
     updates = []
     window_results = []
     source_key = tuple(source.objective_key)
+    if (
+        cumulative_local and mode == "trajectory"
+        and move_time == 0 and not preserve_horizon
+    ):
+        trace = []
+        candidate, evaluated, prepared = solver._cumulative_local_trajectory_repair(
+            W, M, S, source, deadline, seed,
+            move_time=move_time, attempt_trace=trace,
+        )
+        verify_candidate(W, M, S, prepared, move_time)
+        if candidate is not None:
+            verify_candidate(W, M, S, candidate, move_time)
+        plot_path = None
+        prepared_path = None
+        if plot_dir is not None:
+            plot_dir.mkdir(parents=True, exist_ok=True)
+            prepared_path = plot_dir / "cumulative_prepared.json"
+            prepared_path.write_text(json.dumps({
+                **summarize(prepared),
+                "slots": slot_dicts(prepared),
+            }, indent=2), encoding="utf-8")
+            plot_path = plot_dir / (
+                "cumulative_found.png" if candidate is not None
+                else "cumulative_prepared.png"
+            )
+            solver.plot_schedule(
+                plot_view(candidate if candidate is not None else prepared),
+                len(W), plot_path, show=False,
+                diagnostic_title=(
+                    "Step 8 cumulative local trajectory — "
+                    + ("modified feasible H-1 schedule" if candidate is not None
+                       else "prepared H schedule; no legal shortening")
+                ),
+            )
+        prepared_potential, remove_at, deficits = solver._shortening_potential(
+            W, M, prepared
+        )
+        updates = []
+        if candidate is not None:
+            updates.append({
+                "chain": None, "window": None, "remove_at": remove_at,
+                "evaluated": evaluated, "attempt_trace": trace,
+                "candidate": summarize(candidate),
+                "strict_source_improvement": candidate.objective_key < source_key,
+                "slots": slot_dicts(candidate),
+            })
+        if verbose_windows:
+            print(
+                f"[trajectory-cumulative] calls={len(trace)} evaluated={evaluated} "
+                f"result={'FOUND' if candidate is not None else 'NO_CANDIDATE'} "
+                f"prepared_potential={list(prepared_potential)} "
+                f"deficit_bays={[bay for bay, amount in enumerate(deficits, 1) if amount]}",
+                flush=True,
+            )
+        return {
+            "experiment": "direct", "mode": mode, "move_time": move_time,
+            "target_mode": "shorten", "local_strategy": "cumulative",
+            "budget_seconds": budget, "seed": seed,
+            "source": summarize(source), "source_objective": list(source_key),
+            "calls": len(trace), "evaluated": evaluated,
+            "status": "FOUND" if candidate is not None else "TIMEOUT",
+            "best": summarize(candidate) if candidate is not None else None,
+            "prepared": summarize(prepared),
+            "prepared_potential": list(prepared_potential),
+            "best_remove_at": remove_at,
+            "deficit_bays": [
+                bay for bay, amount in enumerate(deficits, 1) if amount
+            ],
+            "window_results": trace,
+            "strict_improvements": updates,
+            "candidate_updates": updates,
+            "plot_path": str(plot_path) if plot_path is not None else None,
+            "prepared_path": str(prepared_path) if prepared_path is not None else None,
+            "elapsed_seconds": round(time.perf_counter() - start, 6),
+        }
     for index in range(limit):
         if time.perf_counter() >= deadline:
             break
@@ -420,6 +495,13 @@ def main():
         "--plot-windows", action="store_true",
         help="Save one annotated schedule PNG after every direct window call.",
     )
+    parser.add_argument(
+        "--independent-windows", action="store_true",
+        help=(
+            "Disable cumulative local preparation and test every trajectory "
+            "window independently from the frozen source."
+        ),
+    )
     parser.add_argument("--source-budget", type=float, default=5.0)
     parser.add_argument(
         "--source-restarts", type=int, default=100_000,
@@ -520,6 +602,7 @@ def main():
                                 verbose_windows=args.verbose_windows,
                                 move_time=move_time,
                                 preserve_horizon=preserve_horizon,
+                                cumulative_local=not args.independent_windows,
                                 plot_dir=(
                                     args.out / "window_plots" / name
                                     / f"seed_{seed}" / f"budget_{budget:g}s" / mode

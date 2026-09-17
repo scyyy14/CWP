@@ -159,6 +159,96 @@ class RepairState:
     rng_state: object
 
 
+def _candidate_position_rows(
+    candidate: _CandidateSchedule, M: int,
+) -> list[list[int]]:
+    """Recover one position row per zero-time work boundary."""
+    rows = [[0] * M for _ in range(candidate.makespan + 1)]
+    for slot in candidate.slots:
+        rows[slot.time][slot.crane - 1] = int(slot.start_bay)
+        rows[slot.time + 1][slot.crane - 1] = int(slot.end_bay)
+    if any(any(position == 0 for position in row) for row in rows):
+        raise ValueError("排程缺少完整的桥吊位置轨迹。")
+    return rows
+
+
+def _shortening_potential(
+    W: Sequence[int],
+    M: int,
+    candidate: _CandidateSchedule,
+) -> tuple[tuple[int, int, int, int, int, int, int], int | None, tuple[int, ...]]:
+    """Score how close a complete zero-time schedule is to losing one row.
+
+    The first components are deliberately not the user objective.  They are
+    an intermediate search signal: missing work after the best single-row
+    deletion plus cranes whose current load cannot fit in ``H-1``.  A local
+    preparation may temporarily worsen moves or split bays when it makes a
+    later legal shortening more likely.
+    """
+    if candidate.move_time != 0 or candidate.makespan < 2:
+        fallback = (10**9, 10**9, 10**9, 10**9, 10**9,
+                    candidate.split_bay_count, candidate.movement_count)
+        return fallback, None, tuple(W)
+    rows = _candidate_position_rows(candidate, M)
+    best: tuple[tuple[int, int, int, int, int, int, int], int, tuple[int, ...]] | None = None
+    for remove_at in range(2, len(rows)):
+        shortened = rows[:remove_at] + rows[remove_at + 1:]
+        capacity = [0] * len(W)
+        for row in shortened[:-1]:
+            for bay in row:
+                if 1 <= bay <= len(W):
+                    capacity[bay - 1] += 1
+        deficits = tuple(max(0, W[i] - capacity[i]) for i in range(len(W)))
+        total_deficit = sum(deficits)
+        overload = sum(
+            max(0, load - (candidate.makespan - 1))
+            for load in candidate.loads
+        )
+        deficit_difficulty = sum(
+            amount * (
+                M + 1 - sum(
+                    1
+                    for q in range(M)
+                    if 1 + 2 * q <= bay <= len(W) - 2 * (M - q - 1)
+                )
+            )
+            for bay, amount in enumerate(deficits, 1)
+        )
+        score = (
+            total_deficit + overload,
+            total_deficit,
+            overload,
+            deficit_difficulty,
+            sum(value > 0 for value in deficits),
+            candidate.split_bay_count,
+            candidate.movement_count,
+        )
+        item = (score, remove_at, deficits)
+        if best is None or item < best:
+            best = item
+    if best is None:
+        fallback = (10**9, 10**9, 10**9, 10**9, 10**9,
+                    candidate.split_bay_count, candidate.movement_count)
+        return fallback, None, tuple(W)
+    return best
+
+
+def _decode_best_shortening(
+    W: Sequence[int], M: int, candidate: _CandidateSchedule,
+) -> _CandidateSchedule | None:
+    """Decode the best prepared one-row deletion when it has zero deficit."""
+    score, remove_at, _ = _shortening_potential(W, M, candidate)
+    if remove_at is None or score[1] != 0:
+        return None
+    rows = _candidate_position_rows(candidate, M)
+    shortened = rows[:remove_at] + rows[remove_at + 1:]
+    try:
+        result = _candidate_from_history(W, M, shortened, candidate.move_time)
+    except RuntimeError:
+        return None
+    return result if result.makespan < candidate.makespan else None
+
+
 def _count_reversals(slots: Sequence[Slot], M: int) -> int:
     """Count changes between leftward and rightward moves for each crane."""
     last_direction = [0] * M
@@ -1262,6 +1352,7 @@ def _trajectory_repair(
     attempt_trace: list[dict[str, Any]] | None = None,
     move_time: int = 1,
     preserve_horizon: bool = False,
+    preparation_mode: bool = False,
 ):
     """Annealed interval repair of a shortened complete position trajectory.
 
@@ -1296,8 +1387,16 @@ def _trajectory_repair(
     }
     if not active:
         return (None, 0, None) if return_state else (None, 0)
+    if preparation_mode and (not preserve_horizon or move_time != 0):
+        raise ValueError("局部准备阶段要求 preserve_horizon=True 且 move_time=0。")
+    preparation_reference, _, preparation_deficits = _shortening_potential(
+        W, M, incumbent
+    ) if preparation_mode else ((0, 0, 0, 0, 0, 0, 0), None, tuple())
+    preparation_targets = {
+        bay for bay, deficit in enumerate(preparation_deficits, 1) if deficit > 0
+    }
     context_key = (
-        tuple(W), M, horizon, move_time, preserve_horizon,
+        tuple(W), M, horizon, move_time, preserve_horizon, preparation_mode,
         tuple(sorted(active)), window_start, window_end,
         hash(tuple(tuple(row) for row in rows)),
     )
@@ -1405,7 +1504,14 @@ def _trajectory_repair(
             if loss < 1e-8:
                 history = list(zip(*paths))
                 candidate = _candidate_from_history(W, M, history, move_time)
-                if (
+                if preparation_mode:
+                    candidate_potential, _, _ = _shortening_potential(W, M, candidate)
+                    if (
+                        candidate.makespan == incumbent.makespan
+                        and candidate_potential[:5] < preparation_reference[:5]
+                    ):
+                        return result(candidate, None)
+                elif (
                     not preserve_horizon
                     or candidate.makespan == incumbent.makespan
                     and candidate.objective_key < incumbent.objective_key
@@ -1433,23 +1539,52 @@ def _trajectory_repair(
             else:
                 b = min(horizon, a + rng.randrange(1, max(2, horizon // 3)))
             b = min(b, window_end)
-            coordinated = M >= 4 and len(active) >= 2 and rng.random() < 0.25
+            targeted = preparation_mode and preparation_targets and rng.random() < 0.70
+            coordinated = targeted or (
+                M >= 4 and len(active) >= 2 and rng.random() < 0.25
+            )
             low = 1 + 2 * q if coordinated else (max(paths[q - 1][a:b + 1]) + 2 if q else 1)
             high = len(W) - 2 * (M - q - 1) if coordinated else (min(paths[q + 1][a:b + 1]) - 2 if q + 1 < M else len(W))
             if low > high:
                 continue
+            target_choices = [
+                bay for bay in sorted(preparation_targets)
+                if low <= bay <= high
+                and not all(position == bay for position in path[a:b + 1])
+            ]
             choices = []
             if a:
                 choices.append(path[a - 1])
             if b < horizon:
                 choices.append(path[b + 1])
+            choices.extend(target_choices)
             choices.extend(i + 1 for i in range(low - 1, high) if counts[i] < W[i])
             choices.append(rng.randint(low, high))
-            bay = rng.choice(choices)
+            bay = rng.choice(target_choices if targeted and target_choices else choices)
             if not low <= bay <= high or all(p == bay for p in path[a:b + 1]):
                 continue
             replacements = {q: [bay] * (b - a + 1)}
-            if coordinated:
+            target_left = targeted and bay < min(path[a:b + 1])
+            target_right = targeted and bay > max(path[a:b + 1])
+            if target_left:
+                # Insert the missing bay and relay each vacated trajectory to
+                # the next active crane on the right.  This preserves useful
+                # capacity through a Qk -> Qk+1 hand-off instead of merely
+                # pushing neighbours away from a randomly moved crane.
+                previous = paths[q][a:b + 1]
+                for other in range(q + 1, M):
+                    if other not in active:
+                        break
+                    replacements[other] = previous
+                    previous = paths[other][a:b + 1]
+            elif target_right:
+                following = paths[q][a:b + 1]
+                for other in range(q - 1, -1, -1):
+                    if other not in active:
+                        break
+                    replacements[other] = following
+                    following = paths[other][a:b + 1]
+            elif coordinated:
                 # Propagate only the minimum necessary displacement to
                 # neighboring cranes. Every boundary remains safe; this
                 # permits escaping blocks that no single crane can leave.
@@ -1465,14 +1600,14 @@ def _trajectory_repair(
                     following = replacements.get(other + 1, paths[other + 1][a:b + 1])
                     replacements[other] = [min(p, right - 2) for p, right in
                                            zip(paths[other][a:b + 1], following)]
-                if any(p < 1 or p > len(W) for row in replacements.values() for p in row):
-                    continue
-                if a < 2 and any(
-                    k in replacements
-                    and replacements[k][:2-a] != paths[k][a:min(b+1, 2)]
-                    for k in pinned
-                ):
-                    continue
+            if any(p < 1 or p > len(W) for row in replacements.values() for p in row):
+                continue
+            if a < 2 and any(
+                k in replacements
+                and replacements[k][:2-a] != paths[k][a:min(b+1, 2)]
+                for k in pinned
+            ):
+                continue
             for t in range(a, b + 1):
                 row = [
                     replacements.get(k, paths[k][t])[t - a]
@@ -1942,37 +2077,303 @@ def _critical_repair_windows(
             chain = tuple(range(left, left + width))
             if chain not in chains:
                 chains.append(chain)
+        # Keep an outer-neighbour chain as well.  A saturated inner crane may
+        # need a relay that reaches a completed edge crane even though that
+        # edge crane is far from the latest-working bottleneck.
+        outer = tuple(range(max(0, M - width), M))
+        if outer not in chains:
+            chains.append(outer)
 
-    active_for_events = set(chains[0]) if chains else {bottleneck}
-    events = [
-        t for t in range(max(2, incumbent.makespan // 3), incumbent.makespan)
-        if any(
-            slot.crane - 1 in active_for_events and slot.state != "work"
-            for slot in by_time.get(t, [])
-        )
-    ]
     horizon = incumbent.makespan - 1
-    starts = [
-        max(1, horizon * fraction // 100)
-        for fraction in (35, 50, 65)
-    ]
-    if events:
-        starts[:2] = [
-            max(1, min(horizon - 1, events[0] - 1)),
-            max(1, min(horizon - 1, events[len(events) // 2] - 1)),
-        ]
-    windows = []
     width = max(3, horizon // 4)
-    # Always include a tail window.  The former 35/50/65% starts stopped the
-    # final window near 90% of the schedule, exactly where late hand-offs and
-    # completed-edge-crane space become useful.
-    starts.append(max(1, horizon - width))
-    starts = list(dict.fromkeys(starts))
+    rows = {
+        t: tuple(slot.start_bay for slot in sorted(by_time.get(t, ()), key=lambda x: x.crane))
+        for t in range(incumbent.makespan)
+    }
+    events = [
+        t for t in range(1, incumbent.makespan)
+        if rows.get(t) and rows.get(t - 1) and rows[t] != rows[t - 1]
+    ]
+    events.extend(last + 1 for last in last_work if 1 <= last + 1 < horizon)
+    max_start = max(1, horizon - width)
+    candidates = {
+        max(1, min(max_start, event - width // 2)) for event in events
+    }
+    candidates.update(
+        max(1, min(max_start, horizon * fraction // 100))
+        for fraction in (35, 50, 65)
+    )
+    candidates.update((1, max_start))
+    # Keep five well-spread event windows.  With the bounded crane chains this
+    # stays below the 48-call Step 8 cap while covering early hand-offs, middle
+    # relocations, and the tail.
+    starts: list[int] = []
+    if candidates:
+        starts = [min(candidates)]
+        if max(candidates) != starts[0]:
+            starts.append(max(candidates))
+        while len(starts) < min(5, len(candidates)):
+            remaining = [value for value in candidates if value not in starts]
+            starts.append(max(
+                remaining,
+                key=lambda value: (min(abs(value - chosen) for chosen in starts), -value),
+            ))
+        starts.sort()
+    windows = []
     for start in starts:
         end = min(horizon, start + width)
         if end > start:
             windows.append((start, end))
     return [(chain, window) for chain in chains for window in windows]
+
+
+def _targeted_local_preparation(
+    W: Sequence[int],
+    M: int,
+    candidate: _CandidateSchedule,
+    chain: Sequence[int],
+    window: tuple[int, int],
+) -> tuple[_CandidateSchedule | None, int]:
+    """Enumerate one-row hand-off cascades aimed at current deficit bays."""
+    if candidate.move_time != 0:
+        return None, 0
+    reference, _, deficits = _shortening_potential(W, M, candidate)
+    targets = [bay for bay, amount in enumerate(deficits, 1) if amount]
+    if not targets:
+        return _decode_best_shortening(W, M, candidate), 0
+    active = tuple(sorted({q for q in chain if 0 <= q < M}))
+    active_set = set(active)
+    if not active:
+        return None, 0
+    rows = _candidate_position_rows(candidate, M)
+    capacity = [0] * len(W)
+    for row in rows[:-1]:
+        for bay in row:
+            if 1 <= bay <= len(W):
+                capacity[bay - 1] += 1
+    start = max(1, window[0])
+    end = min(candidate.makespan - 1, window[1])
+    evaluated = 0
+    best: _CandidateSchedule | None = None
+    best_key = reference[:5]
+    for t in range(start, end):
+        original = rows[t]
+        for q in active:
+            for target in targets:
+                if target == original[q]:
+                    continue
+                variants: list[list[int]] = []
+                direct = original[:]
+                direct[q] = target
+                variants.append(direct)
+                cascade = original[:]
+                cascade[q] = target
+                if target < original[q]:
+                    previous = original[q]
+                    for other in range(q + 1, M):
+                        if other not in active_set:
+                            break
+                        displaced = original[other]
+                        cascade[other] = previous
+                        previous = displaced
+                else:
+                    following = original[q]
+                    for other in range(q - 1, -1, -1):
+                        if other not in active_set:
+                            break
+                        displaced = original[other]
+                        cascade[other] = following
+                        following = displaced
+                variants.append(cascade)
+                for replacement in variants:
+                    evaluated += 1
+                    if any(position < 1 or position > len(W) for position in replacement):
+                        continue
+                    if any(right - left < 2 for left, right in zip(replacement, replacement[1:])):
+                        continue
+                    proposed_capacity = capacity[:]
+                    for old, new in zip(original, replacement):
+                        if old == new:
+                            continue
+                        proposed_capacity[old - 1] -= 1
+                        proposed_capacity[new - 1] += 1
+                    if any(
+                        proposed_capacity[i] < W[i] for i in range(len(W))
+                    ):
+                        continue
+                    proposed_rows = rows[:]
+                    proposed_rows[t] = replacement
+                    try:
+                        proposed = _candidate_from_history(
+                            W, M, [tuple(row) for row in proposed_rows], 0
+                        )
+                    except RuntimeError:
+                        continue
+                    if proposed.makespan < candidate.makespan:
+                        return proposed, evaluated
+                    if proposed.makespan != candidate.makespan:
+                        continue
+                    potential, _, _ = _shortening_potential(W, M, proposed)
+                    if potential[:5] < best_key:
+                        best = proposed
+                        best_key = potential[:5]
+    return best, evaluated
+
+
+def _cumulative_local_trajectory_repair(
+    W: Sequence[int],
+    M: int,
+    starts: Sequence[int],
+    incumbent: _CandidateSchedule,
+    deadline: float,
+    seed: int,
+    move_time: int = 1,
+    attempt_trace: list[dict[str, Any]] | None = None,
+) -> tuple[_CandidateSchedule | None, int, _CandidateSchedule]:
+    """Prepare and shorten through cumulative bounded local windows.
+
+    Every mutation remains inside one ordinary critical window.  Accepted
+    same-horizon preparations become the source of the next window, allowing
+    two distant local repairs to cooperate without introducing a global
+    window.  The returned third value is the best prepared H schedule even if
+    no H-1 schedule was found, so callers can retain it as an elite.
+    """
+    current = incumbent
+    evaluated_total = 0
+    if move_time != 0:
+        return None, evaluated_total, current
+    current_potential, _, _ = _shortening_potential(W, M, current)
+    cycle = 0
+    stale_cycles = 0
+    while time.perf_counter() < deadline and cycle < 4 and stale_cycles < 2:
+        windows = _critical_repair_windows(current, M)
+        if not windows:
+            break
+        progress = False
+        for index, (chain, window) in enumerate(windows):
+            if time.perf_counter() >= deadline:
+                break
+            targeted, evaluated = _targeted_local_preparation(
+                W, M, current, chain, window
+            )
+            evaluated_total += evaluated
+            if targeted is not None:
+                if targeted.makespan < current.makespan:
+                    if attempt_trace is not None:
+                        attempt_trace.append({
+                            "cycle": cycle, "window_index": index,
+                            "chain": list(chain), "window": list(window),
+                            "phase": "targeted", "evaluated": evaluated,
+                            "accepted": True, "shortened": True,
+                        })
+                    return targeted, evaluated_total, current
+                targeted_potential, remove_at, deficits = _shortening_potential(
+                    W, M, targeted
+                )
+                if attempt_trace is not None:
+                    attempt_trace.append({
+                        "cycle": cycle, "window_index": index,
+                        "chain": list(chain), "window": list(window),
+                        "phase": "targeted", "evaluated": evaluated,
+                        "accepted": True,
+                        "before_potential": list(current_potential),
+                        "after_potential": list(targeted_potential),
+                        "best_remove_at": remove_at,
+                        "deficit_bays": [
+                            bay for bay, amount in enumerate(deficits, 1) if amount
+                        ],
+                    })
+                current = targeted
+                current_potential = targeted_potential
+                progress = True
+                shortened = _decode_best_shortening(W, M, current)
+                if shortened is not None:
+                    return shortened, evaluated_total, current
+                break
+            remaining_calls = max(1, len(windows) - index)
+            slice_deadline = min(
+                deadline,
+                time.perf_counter() + max(
+                    0.05,
+                    (deadline - time.perf_counter()) / remaining_calls,
+                ),
+            )
+            prepare_deadline = time.perf_counter() + 0.65 * (
+                slice_deadline - time.perf_counter()
+            )
+            prepared, evaluated, _ = _trajectory_repair(
+                W, M, starts, current, prepare_deadline,
+                seed + cycle * 1009 + index,
+                active_cranes=chain,
+                window=window,
+                return_state=True,
+                move_time=move_time,
+                preserve_horizon=True,
+                preparation_mode=True,
+            )
+            evaluated_total += evaluated
+            record = {
+                "cycle": cycle,
+                "window_index": index,
+                "chain": list(chain),
+                "window": list(window),
+                "phase": "prepare",
+                "before_potential": list(current_potential),
+                "evaluated": evaluated,
+                "accepted": prepared is not None,
+            }
+            if prepared is not None:
+                prepared_potential, remove_at, deficits = _shortening_potential(
+                    W, M, prepared
+                )
+                record.update({
+                    "after_potential": list(prepared_potential),
+                    "best_remove_at": remove_at,
+                    "deficit_bays": [
+                        bay for bay, amount in enumerate(deficits, 1) if amount
+                    ],
+                })
+                current = prepared
+                current_potential = prepared_potential
+                progress = True
+                shortened = _decode_best_shortening(W, M, current)
+                if attempt_trace is not None:
+                    attempt_trace.append(record)
+                if shortened is not None:
+                    return shortened, evaluated_total, current
+                # Recompute event windows from the newly prepared trajectory.
+                break
+            if attempt_trace is not None:
+                attempt_trace.append(record)
+            if time.perf_counter() < slice_deadline:
+                shortened, evaluated, _ = _trajectory_repair(
+                    W, M, starts, current, slice_deadline,
+                    seed + 500_003 + cycle * 1009 + index,
+                    active_cranes=chain,
+                    window=window,
+                    return_state=True,
+                    move_time=move_time,
+                )
+                evaluated_total += evaluated
+                if attempt_trace is not None:
+                    attempt_trace.append({
+                        "cycle": cycle,
+                        "window_index": index,
+                        "chain": list(chain),
+                        "window": list(window),
+                        "phase": "shorten",
+                        "before_potential": list(current_potential),
+                        "evaluated": evaluated,
+                        "accepted": shortened is not None,
+                    })
+                if shortened is not None:
+                    return shortened, evaluated_total, current
+        if progress:
+            stale_cycles = 0
+        else:
+            stale_cycles += 1
+        cycle += 1
+    return None, evaluated_total, current
 
 
 def _critical_window_beam_repair(
@@ -2866,6 +3267,35 @@ def solve_cwp(
     )
     reserved_deadline = max(search_start, repair_phase_deadline - critical_reserve)
     critical_started = time.perf_counter()
+    if (
+        not stop_before_critical
+        and move_time == 0
+        and critical_mode in {"trajectory", "both"}
+        and best.makespan > lower_bound
+        and time.perf_counter() < repair_phase_deadline
+    ):
+        cumulative_deadline = repair_phase_deadline
+        if critical_mode == "both":
+            cumulative_deadline = time.perf_counter() + 0.65 * (
+                repair_phase_deadline - time.perf_counter()
+            )
+        operator_calls["trajectory"] += 1
+        cumulative, evaluated, prepared = _cumulative_local_trajectory_repair(
+            W, M, starts, best, cumulative_deadline, seed,
+            move_time=move_time,
+        )
+        critical_repair_iterations += evaluated
+        if prepared is not best:
+            elite_repairs += 1
+            remember_elite(prepared)
+        if cumulative is not None:
+            elite_repairs += 1
+            remember_elite(cumulative)
+            if cumulative.objective_key < best.objective_key:
+                best = cumulative
+                critical_repair_improvements += 1
+                refresh_elite_pool()
+                publish(best)
     while (
         not stop_before_critical
         and critical_mode in {"beam", "trajectory", "both"}
