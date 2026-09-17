@@ -265,6 +265,121 @@ def _candidate_passes_independent_verifier(
     return True
 
 
+def _trajectory_segment_neighbors(
+    W: Sequence[int],
+    M: int,
+    starts: Sequence[int],
+    candidate: _CandidateSchedule,
+    max_candidates: int = 64,
+) -> list[tuple[str, list[tuple[int, ...]]]]:
+    """Generate bounded block-level trajectory proposals for polishing.
+
+    These proposals edit complete position blocks rather than isolated random
+    cells.  They are deliberately conservative: the caller still rebuilds
+    the candidate, checks the fixed horizon, and invokes the independent
+    verifier before accepting anything.
+    """
+    if candidate.move_time != 0 or candidate.makespan < 2:
+        return []
+    rows = [tuple(row) for row in _candidate_position_rows(candidate, M)]
+    proposals: list[tuple[str, list[tuple[int, ...]]]] = []
+    seen: set[tuple[tuple[int, ...], ...]] = {tuple(rows)}
+
+    def add(name: str, changed: list[list[int]]) -> None:
+        if len(proposals) >= max_candidates:
+            return
+        history = tuple(tuple(row) for row in changed)
+        if history in seen:
+            return
+        seen.add(history)
+        proposals.append((name, [tuple(row) for row in changed]))
+
+    excursions = _short_excursion_details(candidate, M)
+    for q, start, end, base, _excursion, _work in excursions:
+        changed = [list(row) for row in rows]
+        for t in range(start, end + 1):
+            changed[t][q] = base
+        add("short_visit_eliminate", changed)
+
+    # A simultaneous batch removes adjacent short hand-offs as one coupled
+    # proposal, so every row is checked with all participating cranes moved.
+    ordered = sorted(excursions, key=lambda item: (item[1], item[2], item[0]))
+    clusters: list[list[tuple[int, int, int, int, int, int]]] = []
+    for detail in ordered:
+        if not clusters or detail[1] > max(item[2] for item in clusters[-1]) + 1:
+            clusters.append([detail])
+        else:
+            clusters[-1].append(detail)
+    for cluster in clusters:
+        if len(cluster) < 2:
+            continue
+        changed = [list(row) for row in rows]
+        for q, start, end, base, _excursion, _work in cluster:
+            for t in range(start, end + 1):
+                changed[t][q] = base
+        add("continuous_handoff_batch", changed)
+
+    # Slide a complete visit boundary by one row.  A proposal can be rejected
+    # later if the row becomes unsafe or loses the fixed horizon.
+    for q in range(M):
+        for t in range(1, candidate.makespan):
+            if rows[t - 1][q] == rows[t][q]:
+                continue
+            delayed = [list(row) for row in rows]
+            delayed[t][q] = rows[t - 1][q]
+            add("visit_boundary_slide_delay", delayed)
+            if t > 1:
+                advanced = [list(row) for row in rows]
+                advanced[t - 1][q] = rows[t][q]
+                add("visit_boundary_slide_advance", advanced)
+
+    # Merge separated blocks at the same position by filling the bounded gap
+    # with that position.  This is an interval proposal, not a point edit.
+    for q in range(M):
+        blocks: list[tuple[int, int, int]] = []
+        start = 0
+        while start < candidate.makespan:
+            end = start
+            while end + 1 < len(rows) and rows[end + 1][q] == rows[start][q]:
+                end += 1
+            blocks.append((start, min(end, candidate.makespan - 1), rows[start][q]))
+            start = end + 1
+        for left_index, left in enumerate(blocks):
+            for right in blocks[left_index + 1:]:
+                if left[2] != right[2] or right[0] <= left[1] + 1:
+                    continue
+                if right[0] - left[1] > 8:
+                    break
+                changed = [list(row) for row in rows]
+                for t in range(left[1] + 1, right[0]):
+                    changed[t][q] = left[2]
+                add("same_bay_segment_merge", changed)
+
+    # For split bays, first try removing only a short visit by one of the
+    # owners.  This keeps the ownership simplification local and lets the
+    # decoder reassign the released work to an existing compatible visit.
+    split_bays = {
+        bay for bay, owners in enumerate(candidate.owners, 1)
+        if len(owners) > 1
+    }
+    work_at = {
+        (slot.time, slot.crane - 1, int(slot.work_bay))
+        for slot in candidate.slots
+        if slot.state == "work" and slot.work_bay is not None
+    }
+    for q, start, end, base, excursion, _work in excursions:
+        if excursion not in split_bays:
+            continue
+        if not any((t, q, excursion) in work_at for t in range(start, end + 1)):
+            continue
+        changed = [list(row) for row in rows]
+        for t in range(start, end + 1):
+            changed[t][q] = base
+        add("split_bay_simplify", changed)
+
+    return proposals
+
+
 def _shortening_potential(
     W: Sequence[int],
     M: int,
@@ -2350,6 +2465,71 @@ def _refine_same_horizon_trajectory(
     cycle = 0
     stale_cycles = 0
     while time.perf_counter() < deadline and cycle < 6 and stale_cycles < 2:
+        # Deterministic block operators get first refusal.  They are cheap,
+        # explainable proposals and are the primary way to remove short
+        # hand-offs without relying on isolated random cell edits.
+        progress = False
+        segment_proposals = _trajectory_segment_neighbors(
+            W, M, starts, best
+        )
+        for segment_index, (operator, history) in enumerate(segment_proposals):
+            if time.perf_counter() >= deadline:
+                break
+            before_key = best.objective_key
+            before_smoothness = _trajectory_smoothness(best, M)
+            evaluated = 1
+            evaluated_total += evaluated
+            try:
+                proposed = _candidate_from_history(W, M, history, move_time)
+            except RuntimeError:
+                proposed = None
+            candidate_found = proposed is not None
+            candidate_legal = proposed is not None and (
+                proposed.makespan == best.makespan
+                and _candidate_passes_independent_verifier(
+                    W, M, starts, proposed
+                )
+            )
+            if not candidate_legal:
+                proposed = None
+            accepted = proposed is not None and (
+                proposed.objective_key < before_key
+                or (
+                    proposed.objective_key == before_key
+                    and _trajectory_smoothness(proposed, M) < before_smoothness
+                )
+            )
+            if attempt_trace is not None:
+                attempt_trace.append({
+                    "cycle": cycle,
+                    "segment_index": segment_index,
+                    "operator": operator,
+                    "chain": None,
+                    "window": None,
+                    "phase": "polish",
+                    "evaluated": evaluated,
+                    "candidate_found": candidate_found,
+                    "candidate_legal": candidate_legal,
+                    "accepted": accepted,
+                    "before_objective": list(before_key),
+                    "before_smoothness": list(before_smoothness),
+                    "after_objective": (
+                        list(proposed.objective_key) if accepted else None
+                    ),
+                    "after_smoothness": (
+                        list(_trajectory_smoothness(proposed, M))
+                        if accepted else None
+                    ),
+                })
+            if accepted:
+                best = proposed
+                progress = True
+                break
+        if progress:
+            stale_cycles = 0
+            cycle += 1
+            continue
+
         windows = _critical_repair_windows(best, M)
         if not windows:
             break
@@ -2388,12 +2568,13 @@ def _refine_same_horizon_trajectory(
             )
             evaluated_total += evaluated
             candidate_found = proposed is not None
-            if proposed is not None and (
-                proposed.makespan != candidate.makespan
-                or not _candidate_passes_independent_verifier(
+            candidate_legal = proposed is not None and (
+                proposed.makespan == best.makespan
+                and _candidate_passes_independent_verifier(
                     W, M, starts, proposed
                 )
-            ):
+            )
+            if not candidate_legal:
                 proposed = None
             accepted = proposed is not None and (
                 proposed.objective_key < before_key
@@ -2411,7 +2592,7 @@ def _refine_same_horizon_trajectory(
                     "phase": "polish",
                     "evaluated": evaluated,
                     "candidate_found": candidate_found,
-                    "candidate_legal": proposed is not None,
+                    "candidate_legal": candidate_legal,
                     "accepted": accepted,
                     "before_objective": list(before_key),
                     "before_smoothness": list(before_smoothness),

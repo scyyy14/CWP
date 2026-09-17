@@ -209,6 +209,44 @@ class SolverImprovementTests(unittest.TestCase):
         )
         self.assertEqual(cwp_solver._short_excursion_details(candidate, 1), [])
 
+    def test_trajectory_segment_neighbors_are_block_level(self):
+        rows = [
+            (2, 9, 13),
+            (2, 7, 9),
+            (4, 9, 13),
+            (4, 9, 13),
+            (4, 9, 12),
+            (4, 9, 12),
+            (4, 9, 13),
+            (4, 9, 11),
+            (4, 9, 11),
+            (4, 9, 13),
+        ]
+        slots = [
+            cwp_solver.Slot(
+                t, q + 1, "work", bay, rows[t + 1][q], bay
+            )
+            for t, row in enumerate(rows[:-1])
+            for q, bay in enumerate(row)
+        ]
+        candidate = cwp_solver._CandidateSchedule(
+            slots=slots, makespan=len(rows) - 1,
+            assignment_count=3, split_bay_count=1,
+            load_deviation=0, reversal_count=0, movement_count=8,
+            loads=[3, 3, 3], owners=[{0}, {1}, {2}], move_time=0,
+        )
+        neighbors = cwp_solver._trajectory_segment_neighbors(
+            [0] * 13, 3, [], candidate
+        )
+        names = {name for name, _history in neighbors}
+        self.assertIn("short_visit_eliminate", names)
+        self.assertIn("continuous_handoff_batch", names)
+        self.assertIn("visit_boundary_slide_delay", names)
+        self.assertTrue(all(len(history) == candidate.makespan + 1
+                            for _name, history in neighbors))
+        self.assertTrue(all(history[0] == tuple(rows[0])
+                            for _name, history in neighbors))
+
     def test_same_horizon_smoothing_uses_smoothness_only_for_formal_ties(self):
         def make_candidate(rows, work_time):
             slots = [
@@ -242,6 +280,8 @@ class SolverImprovementTests(unittest.TestCase):
         smooth = make_candidate([(1,), (2,), (3,), (3,), (3,)], 2)
         with patch.object(
             cwp_solver, "_critical_repair_windows", return_value=[((0,), (1, 3))]
+        ), patch.object(
+            cwp_solver, "_trajectory_segment_neighbors", return_value=[]
         ), patch.object(
             cwp_solver, "_trajectory_repair",
             side_effect=[(smooth, 1), (None, 1), (None, 1)],
