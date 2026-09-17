@@ -174,6 +174,54 @@ def _count_reversals(slots: Sequence[Slot], M: int) -> int:
     return reversals
 
 
+def apply_completed_edge_exits(
+    slots: Sequence[Slot],
+    M: int,
+    N: int,
+    makespan: int,
+    move_time: int,
+) -> list[Slot]:
+    """Remove completed, unblocked edge cranes from the working rail.
+
+    Exit is currently inferred only for ``move_time == 0``: after a crane's
+    last work period, a completed prefix may leave through the left boundary
+    and a completed suffix may leave through the right boundary.  Exited
+    cranes receive ordered virtual positions outside ``1..N`` and state
+    ``offrail``.  The virtual spacing preserves crane order while making it
+    explicit that these devices no longer consume an on-rail safety bay.
+    """
+    if move_time != 0:
+        raise ValueError("自动边界退出目前只支持 move_time=0。")
+    by_time: dict[int, list[Slot]] = {}
+    last_work = [-1] * M
+    for slot in slots:
+        by_time.setdefault(slot.time, []).append(slot)
+        if slot.state == "work":
+            last_work[slot.crane - 1] = max(last_work[slot.crane - 1], slot.time)
+    if any(len(by_time.get(t, ())) != M for t in range(makespan)):
+        raise ValueError("自动边界退出要求每个时间槽都包含 M 条桥吊记录。")
+
+    result: list[Slot] = []
+    for t in range(makespan):
+        rows = sorted(by_time[t], key=lambda row: row.crane)
+        left_count = 0
+        while left_count < M and last_work[left_count] < t:
+            left_count += 1
+        right_first = M
+        while right_first > left_count and last_work[right_first - 1] < t:
+            right_first -= 1
+        for q, slot in enumerate(rows):
+            if q < left_count:
+                position = 1 - 2 * (left_count - q)
+                result.append(Slot(t, q + 1, "offrail", position, position, None))
+            elif q >= right_first:
+                position = N + 2 * (q - right_first + 1)
+                result.append(Slot(t, q + 1, "offrail", position, position, None))
+            else:
+                result.append(slot)
+    return result
+
+
 def _legal_configurations(N: int, M: int) -> list[tuple[int, ...]]:
     """Generate only safe configurations instead of filtering all combinations.
 
@@ -1220,6 +1268,15 @@ def _trajectory_repair(
     window_start, window_end = window or (0, horizon)
     window_start = max(0, min(horizon, window_start))
     window_end = max(window_start, min(horizon, window_end))
+    # An exited crane is no longer part of a local on-rail neighbourhood.
+    # Keep its virtual trajectory frozen and repair only cranes that remain
+    # physically on the rail throughout this window.
+    active = {
+        q for q in active
+        if all(1 <= rows[t][q] <= len(W) for t in range(window_start, window_end + 1))
+    }
+    if not active:
+        return (None, 0, None) if return_state else (None, 0)
     context_key = (
         tuple(W), M, horizon, move_time, preserve_horizon,
         tuple(sorted(active)), window_start, window_end,
@@ -1268,11 +1325,12 @@ def _trajectory_repair(
         for path in paths_to_count:
             if move_time == 0:
                 for bay in path[:-1]:
-                    counts_to_return[bay - 1] += 1
+                    if 1 <= bay <= len(W):
+                        counts_to_return[int(bay) - 1] += 1
             else:
                 for left, right in zip(path, path[1:]):
-                    if left == right:
-                        counts_to_return[left - 1] += 1
+                    if left == right and 1 <= left <= len(W):
+                        counts_to_return[int(left) - 1] += 1
         return counts_to_return
     while time.perf_counter() < deadline:
         # Delete a boundary, not a job. The resulting missing work is measured
@@ -1427,10 +1485,12 @@ def _trajectory_repair(
                     old_a, old_b = trajectory[t], trajectory[t + 1]
                     new_a = replacement[t-a] if a <= t <= b else old_a
                     new_b = replacement[t+1-a] if a <= t + 1 <= b else old_b
-                    if old_a == old_b:
-                        delta[old_a - 1] = delta.get(old_a - 1, 0) - 1
-                    if new_a == new_b:
-                        delta[new_a - 1] = delta.get(new_a - 1, 0) + 1
+                    if old_a == old_b and 1 <= old_a <= len(W):
+                        index = int(old_a) - 1
+                        delta[index] = delta.get(index, 0) - 1
+                    if new_a == new_b and 1 <= new_a <= len(W):
+                        index = int(new_a) - 1
+                        delta[index] = delta.get(index, 0) + 1
             change = sum(penalty(i, counts[i] + d) - penalty(i, counts[i]) for i, d in delta.items())
             temperature = 0.08 + 0.65 * (1.0 - attempt / 4000) ** 2
             if change <= 0 or rng.random() < math.exp(-change / temperature):
@@ -1480,15 +1540,21 @@ def _candidate_from_history(
         if move_time == 0:
             # Work is performed at the current configuration; relocation to
             # next_positions then happens instantaneously at the period edge.
-            work_here = [remaining[bay - 1] > 0 for bay in positions]
+            work_here = [
+                1 <= bay <= len(W) and remaining[int(bay) - 1] > 0
+                for bay in positions
+            ]
             if not any(work_here):
                 continue
             for q, bay in enumerate(positions):
                 if work_here[q]:
-                    remaining[bay - 1] -= 1
-                    owners[bay - 1].add(q)
+                    bay_index = int(bay) - 1
+                    remaining[bay_index] -= 1
+                    owners[bay_index].add(q)
                     loads[q] += 1
-                    slots.append(Slot(output_time, q + 1, "work", bay, bay, bay))
+                    slots.append(Slot(output_time, q + 1, "work", bay, bay, int(bay)))
+                elif not 1 <= bay <= len(W):
+                    slots.append(Slot(output_time, q + 1, "offrail", bay, bay, None))
                 else:
                     slots.append(Slot(output_time, q + 1, "idle", bay, bay, None))
             output_time += 1
@@ -1924,20 +1990,29 @@ def _critical_window_beam_repair(
     for slot in incumbent.slots:
         base_rows[slot.time][slot.crane - 1] = slot.start_bay
         base_rows[slot.time + 1][slot.crane - 1] = slot.end_bay
+    active = tuple(
+        q for q in active
+        if all(
+            1 <= base_rows[t][q] <= len(W)
+            for t in range(spec.start, spec.end + 1)
+        )
+    )
+    if not active:
+        return None, 0
     required = set(starts)
     evaluated = 0
     attempts = 0
     beam_width = 500 if len(active) <= 2 else 280 if len(active) <= 3 else 160
 
     def safe(row: Sequence[int]) -> bool:
-        return all(1 <= bay <= len(W) for bay in row) and all(
-            right - left >= 2 for left, right in zip(row, row[1:])
-        )
+        return all(right - left >= 2 for left, right in zip(row, row[1:]))
 
     def consume(remaining: list[int], current: Sequence[int], following: Sequence[int]) -> None:
         for start_bay, end_bay in zip(current, following):
-            if (move_time == 0 or start_bay == end_bay) and remaining[start_bay - 1] > 0:
-                remaining[start_bay - 1] -= 1
+            if not 1 <= start_bay <= len(W):
+                continue
+            if (move_time == 0 or start_bay == end_bay) and remaining[int(start_bay) - 1] > 0:
+                remaining[int(start_bay) - 1] -= 1
 
     while time.perf_counter() < deadline and attempts < 24:
         attempts += 1
@@ -3006,6 +3081,8 @@ def verify_solution(W: Sequence[int], M: int, S: Iterable[int], solution: Soluti
             if slot.work_bay != slot.start_bay or slot.start_bay != slot.end_bay:
                 raise AssertionError("作业槽的位置不一致。")
             assert slot.work_bay is not None
+            if not 1 <= slot.work_bay <= len(W):
+                raise AssertionError("作业贝位超出 1..N。")
             work_done[slot.work_bay - 1] += 1
             load_done[slot.crane - 1] += 1
         elif slot.state == "move":
@@ -3016,6 +3093,13 @@ def verify_solution(W: Sequence[int], M: int, S: Iterable[int], solution: Soluti
         elif slot.state == "idle":
             if slot.start_bay != slot.end_bay or slot.work_bay is not None:
                 raise AssertionError("空闲槽定义错误。")
+            if not 1 <= slot.start_bay <= len(W):
+                raise AssertionError("轨道内空闲位置超出 1..N。")
+        elif slot.state == "offrail":
+            if slot.start_bay != slot.end_bay or slot.work_bay is not None:
+                raise AssertionError("退场槽定义错误。")
+            if 1 <= slot.start_bay <= len(W):
+                raise AssertionError("offrail 状态必须位于工作轨道之外。")
         else:
             raise AssertionError(f"未知状态：{slot.state}")
 
@@ -3153,6 +3237,8 @@ def plot_schedule(
     for slot in solution.slots:
         color = colors[slot.crane - 1]
         y0 = slot.time
+        if slot.state == "offrail":
+            continue
         if slot.state == "work":
             rect = Rectangle(
                 (slot.start_bay - 0.36, y0 + 0.06), 0.72, 0.88,
@@ -3179,6 +3265,8 @@ def plot_schedule(
                 key=lambda slot: slot.time,
             )
             for previous, current in zip(crane_slots, crane_slots[1:]):
+                if previous.state == "offrail" or current.state == "offrail":
+                    continue
                 if previous.end_bay == current.start_bay:
                     continue
                 boundary = current.time

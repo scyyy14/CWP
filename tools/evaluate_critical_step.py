@@ -40,7 +40,7 @@ def objective(candidate: solver._CandidateSchedule) -> list[int]:
     return list(candidate.objective_key)
 
 
-def source_candidate(W, M, S, path: Path, move_time=1):
+def source_candidate(W, M, S, path: Path, move_time=1, allow_edge_exit=False):
     data = json.loads(path.read_text(encoding="utf-8"))
     source_move_time = data.get("move_time", 1)
     if source_move_time != move_time:
@@ -49,6 +49,10 @@ def source_candidate(W, M, S, path: Path, move_time=1):
             "请用相同移动时间生成固定源。"
         )
     slots = [solver.Slot(**item) for item in data["slots"]]
+    if allow_edge_exit:
+        slots = solver.apply_completed_edge_exits(
+            slots, M, len(W), int(data["makespan"]), move_time
+        )
     owners = [set() for _ in W]
     loads = [0] * M
     for slot in slots:
@@ -401,6 +405,13 @@ def main():
         ),
     )
     parser.add_argument(
+        "--allow-edge-exit", action="store_true",
+        help=(
+            "For move_time=0, let completed unblocked edge cranes leave the "
+            "working rail before source validation and Step 8."
+        ),
+    )
+    parser.add_argument(
         "--verbose-windows", action="store_true",
         help="Print one result line after every critical-window call.",
     )
@@ -486,7 +497,9 @@ def main():
                     "objective": [generated.makespan, generated.split_bay_count,
                                    generated.load_deviation, generated.movement_count],
                 }
-            source = source_candidate(W, M, S, selected_source, move_time)
+            source = source_candidate(
+                W, M, S, selected_source, move_time, args.allow_edge_exit
+            )
             if args.experiment in ("direct", "both"):
                 _, starts, configurations = solver._validate_input(W, M, S, move_time)
                 initial = solver._initial_configurations(W, starts, configurations)

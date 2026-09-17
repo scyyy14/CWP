@@ -17,6 +17,29 @@ def slow_worker(payload, options, checkpoint, error_path):
 
 
 class SolverImprovementTests(unittest.TestCase):
+    def test_completed_unblocked_edge_crane_can_exit_with_zero_move_time(self):
+        slots = [
+            cwp_solver.Slot(0, 1, "work", 1, 1, 1),
+            cwp_solver.Slot(0, 2, "work", 3, 3, 3),
+            cwp_solver.Slot(1, 1, "work", 1, 1, 1),
+            cwp_solver.Slot(1, 2, "idle", 3, 3, None),
+        ]
+        adapted = cwp_solver.apply_completed_edge_exits(
+            slots, M=2, N=3, makespan=2, move_time=0
+        )
+        q2_t1 = next(slot for slot in adapted if slot.time == 1 and slot.crane == 2)
+        self.assertEqual(q2_t1.state, "offrail")
+        self.assertGreater(q2_t1.start_bay, 3)
+        check = type("Check", (), {
+            "slots": adapted,
+            "makespan": 2,
+            "crane_loads": [2, 1],
+            "reversal_count": 0,
+            "movement_count": 1,
+            "move_time": 0,
+        })()
+        cwp_solver.verify_solution([2, 0, 1], 2, [1, 3], check)
+
     def test_move_time_is_configurable_and_default_is_legacy_one(self):
         work = [1, 0, 1]
         results = {
