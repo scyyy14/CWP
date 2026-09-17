@@ -407,8 +407,9 @@ def main():
     parser.add_argument(
         "--allow-edge-exit", action="store_true",
         help=(
-            "For move_time=0, let completed unblocked edge cranes leave the "
-            "working rail before source validation and Step 8."
+            "For move_time=0, legalize completed edge cranes before source "
+            "validation. Prefer outward on-rail moves so Step 8 can reuse "
+            "their capacity; exit only when the rail has no legal space."
         ),
     )
     parser.add_argument(

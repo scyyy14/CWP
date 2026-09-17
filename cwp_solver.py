@@ -180,15 +180,15 @@ def apply_completed_edge_exits(
     N: int,
     makespan: int,
     move_time: int,
+    force_exit: bool = False,
 ) -> list[Slot]:
-    """Remove completed, unblocked edge cranes from the working rail.
+    """Legalize completed edge cranes without needlessly losing capacity.
 
-    Exit is currently inferred only for ``move_time == 0``: after a crane's
-    last work period, a completed prefix may leave through the left boundary
-    and a completed suffix may leave through the right boundary.  Exited
-    cranes receive ordered virtual positions outside ``1..N`` and state
-    ``offrail``.  The virtual spacing preserves crane order while making it
-    explicit that these devices no longer consume an on-rail safety bay.
+    With zero-time relocation, a completed prefix/suffix may move outward to
+    restore the two-bay safety distance.  By default it remains on the rail
+    whenever space exists, so Step 8 may assign it new work later.  A crane is
+    put ``offrail`` only when no legal on-rail position remains.  ``force_exit``
+    retains the old eager-exit behaviour for explicit ablation tests.
     """
     if move_time != 0:
         raise ValueError("自动边界退出目前只支持 move_time=0。")
@@ -210,13 +210,32 @@ def apply_completed_edge_exits(
         right_first = M
         while right_first > left_count and last_work[right_first - 1] < t:
             right_first -= 1
+        positions = [int(slot.start_bay) for slot in rows]
+        if not force_exit:
+            # Keep the still-working middle fixed.  Completed edge cranes are
+            # shifted only as far outward as necessary.  This turns "may
+            # leave" into a capacity-preserving option instead of treating a
+            # source schedule's last work time as an irrevocable exit time.
+            if left_count:
+                right_limit = positions[left_count] - 2 if left_count < M else N
+                for q in range(left_count - 1, -1, -1):
+                    positions[q] = min(positions[q], right_limit)
+                    right_limit = positions[q] - 2
+            if right_first < M:
+                left_limit = positions[right_first - 1] + 2 if right_first else 1
+                for q in range(right_first, M):
+                    positions[q] = max(positions[q], left_limit)
+                    left_limit = positions[q] + 2
         for q, slot in enumerate(rows):
-            if q < left_count:
+            if q < left_count and (force_exit or positions[q] < 1):
                 position = 1 - 2 * (left_count - q)
                 result.append(Slot(t, q + 1, "offrail", position, position, None))
-            elif q >= right_first:
+            elif q >= right_first and (force_exit or positions[q] > N):
                 position = N + 2 * (q - right_first + 1)
                 result.append(Slot(t, q + 1, "offrail", position, position, None))
+            elif q < left_count or q >= right_first:
+                position = positions[q]
+                result.append(Slot(t, q + 1, "idle", position, position, None))
             else:
                 result.append(slot)
     return result
@@ -1944,11 +1963,23 @@ def _critical_repair_windows(
         ]
     windows = []
     width = max(3, horizon // 4)
+    # Always include a tail window.  The former 35/50/65% starts stopped the
+    # final window near 90% of the schedule, exactly where late hand-offs and
+    # completed-edge-crane space become useful.
+    starts.append(max(1, horizon - width))
+    starts = list(dict.fromkeys(starts))
     for start in starts:
         end = min(horizon, start + width)
         if end > start:
             windows.append((start, end))
-    return [(chain, window) for chain in chains for window in windows]
+    local = [(chain, window) for chain in chains for window in windows]
+    # A one-slot horizon reduction can require a hand-off cascade whose
+    # compensating moves occur far apart (for example Q1->Q2 early and an
+    # outer crane absorbing work near the tail).  No quarter-horizon window
+    # can express that.  Try one explicit global fallback first; local windows
+    # remain the cheaper majority of the neighbourhood portfolio.
+    global_fallback = (tuple(range(M)), (1, horizon))
+    return [global_fallback, *[item for item in local if item != global_fallback]]
 
 
 def _critical_window_beam_repair(

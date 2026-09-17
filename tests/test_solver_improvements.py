@@ -17,7 +17,7 @@ def slow_worker(payload, options, checkpoint, error_path):
 
 
 class SolverImprovementTests(unittest.TestCase):
-    def test_completed_unblocked_edge_crane_can_exit_with_zero_move_time(self):
+    def test_completed_edge_crane_stays_available_when_rail_has_space(self):
         slots = [
             cwp_solver.Slot(0, 1, "work", 1, 1, 1),
             cwp_solver.Slot(0, 2, "work", 3, 3, 3),
@@ -28,17 +28,51 @@ class SolverImprovementTests(unittest.TestCase):
             slots, M=2, N=3, makespan=2, move_time=0
         )
         q2_t1 = next(slot for slot in adapted if slot.time == 1 and slot.crane == 2)
-        self.assertEqual(q2_t1.state, "offrail")
-        self.assertGreater(q2_t1.start_bay, 3)
+        self.assertEqual(q2_t1.state, "idle")
+        self.assertEqual(q2_t1.start_bay, 3)
         check = type("Check", (), {
             "slots": adapted,
             "makespan": 2,
             "crane_loads": [2, 1],
             "reversal_count": 0,
-            "movement_count": 1,
+            "movement_count": 0,
             "move_time": 0,
         })()
         cwp_solver.verify_solution([2, 0, 1], 2, [1, 3], check)
+
+    def test_completed_edge_crane_can_still_be_forced_to_exit_for_ablation(self):
+        slots = [
+            cwp_solver.Slot(0, 1, "work", 1, 1, 1),
+            cwp_solver.Slot(0, 2, "work", 3, 3, 3),
+            cwp_solver.Slot(1, 1, "work", 1, 1, 1),
+            cwp_solver.Slot(1, 2, "idle", 3, 3, None),
+        ]
+        adapted = cwp_solver.apply_completed_edge_exits(
+            slots, M=2, N=3, makespan=2, move_time=0, force_exit=True
+        )
+        q2_t1 = next(slot for slot in adapted if slot.time == 1 and slot.crane == 2)
+        self.assertEqual(q2_t1.state, "offrail")
+        self.assertGreater(q2_t1.start_bay, 3)
+
+    def test_completed_suffix_moves_outward_and_remains_reusable(self):
+        slots = []
+        for t in range(2):
+            positions = (7, 10, 13, 14, 16)
+            for q, bay in enumerate(positions):
+                working = t == 0 or q < 3
+                slots.append(cwp_solver.Slot(
+                    t, q + 1, "work" if working else "idle",
+                    bay, bay, bay if working else None,
+                ))
+        adapted = cwp_solver.apply_completed_edge_exits(
+            slots, M=5, N=21, makespan=2, move_time=0
+        )
+        final = sorted(
+            (slot for slot in adapted if slot.time == 1),
+            key=lambda slot: slot.crane,
+        )
+        self.assertEqual([slot.start_bay for slot in final], [7, 10, 13, 15, 17])
+        self.assertTrue(all(slot.state != "offrail" for slot in final))
 
     def test_move_time_is_configurable_and_default_is_legacy_one(self):
         work = [1, 0, 1]
@@ -298,11 +332,14 @@ class SolverImprovementTests(unittest.TestCase):
             incumbent = cwp_solver._candidate_from_history(work, m, history)
             windows = cwp_solver._critical_repair_windows(incumbent, m)
             self.assertTrue(windows)
+            self.assertEqual(windows[0], (tuple(range(m)), (1, incumbent.makespan - 1)))
             for chain, (start, end) in windows:
                 self.assertTrue(chain)
                 self.assertTrue(all(0 <= q < m for q in chain))
                 self.assertGreaterEqual(start, 1)
                 self.assertGreater(end, start)
+            horizon = incumbent.makespan - 1
+            self.assertTrue(any(end == horizon for _, (_, end) in windows))
 
     def test_trajectory_repair_can_resume_after_deadline(self):
         work = [5, 0, 5]
