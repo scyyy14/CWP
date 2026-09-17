@@ -116,6 +116,9 @@ def summarize(candidate):
         "split_bay_count": candidate.split_bay_count,
         "load_deviation": candidate.load_deviation,
         "movement_count": candidate.movement_count,
+        "smoothness": list(solver._trajectory_smoothness(
+            candidate, len(candidate.loads)
+        )),
         "assignment_count": candidate.assignment_count,
         "reversal_count": candidate.reversal_count,
     }
@@ -166,6 +169,13 @@ def direct_run(
 ):
     start = time.perf_counter()
     deadline = start + budget
+    # Reserve a small, explicit tail for the optional diagnostic plots.  The
+    # search deadline is otherwise extended while rendering, so a nominal
+    # 300-second run can exceed its advertised wall-clock budget.
+    plot_reserve = 0.0
+    if plot_dir is not None and cumulative_local and mode == "trajectory":
+        plot_reserve = min(15.0, max(2.0, 0.06 * budget))
+        deadline = start + max(0.01, budget - plot_reserve)
     windows = solver._critical_repair_windows(source, M)
     limit = max(1, min(48, len(windows)))
     best = None
@@ -179,15 +189,26 @@ def direct_run(
         and move_time == 0 and not preserve_horizon
     ):
         trace = []
-        candidate, evaluated, prepared = solver._cumulative_local_trajectory_repair(
+        candidate, evaluated, prepared, first_feasible = solver._cumulative_local_trajectory_repair(
             W, M, S, source, deadline, seed,
             move_time=move_time, attempt_trace=trace,
         )
         verify_candidate(W, M, S, prepared, move_time)
         if candidate is not None:
             verify_candidate(W, M, S, candidate, move_time)
+        first_event = next(
+            (item for item in trace if item.get("phase") == "first_feasible"),
+            None,
+        )
+        polish_event = next(
+            (item for item in reversed(trace)
+             if item.get("phase") == "polish_complete"),
+            None,
+        )
         plot_path = None
         prepared_path = None
+        first_feasible_path = None
+        polished_path = None
         if plot_dir is not None:
             plot_dir.mkdir(parents=True, exist_ok=True)
             prepared_path = plot_dir / "cumulative_prepared.json"
@@ -195,19 +216,47 @@ def direct_run(
                 **summarize(prepared),
                 "slots": slot_dicts(prepared),
             }, indent=2), encoding="utf-8")
-            plot_path = plot_dir / (
-                "cumulative_found.png" if candidate is not None
-                else "cumulative_prepared.png"
-            )
-            solver.plot_schedule(
-                plot_view(candidate if candidate is not None else prepared),
-                len(W), plot_path, show=False,
-                diagnostic_title=(
-                    "Step 8 cumulative local trajectory — "
-                    + ("modified feasible H-1 schedule" if candidate is not None
-                       else "prepared H schedule; no legal shortening")
-                ),
-            )
+            if first_feasible is not None:
+                first_feasible_path = plot_dir / "first_feasible.json"
+                first_feasible_path.write_text(json.dumps({
+                    **summarize(first_feasible),
+                    "slots": slot_dicts(first_feasible),
+                }, indent=2), encoding="utf-8")
+                first_feasible_plot = plot_dir / "first_feasible.png"
+                solver.plot_schedule(
+                    plot_view(first_feasible), len(W), first_feasible_plot,
+                    show=False,
+                    diagnostic_title=(
+                        "Step 8 trajectory — first feasible H-1 schedule"
+                    ),
+                )
+                first_feasible_path = str(first_feasible_path)
+                plot_path = str(first_feasible_plot)
+            if candidate is not None:
+                polished_path = plot_dir / "polished_best.json"
+                polished_path.write_text(json.dumps({
+                    **summarize(candidate),
+                    "slots": slot_dicts(candidate),
+                }, indent=2), encoding="utf-8")
+                polished_plot = plot_dir / "polished_best.png"
+                solver.plot_schedule(
+                    plot_view(candidate), len(W), polished_plot, show=False,
+                    diagnostic_title=(
+                        "Step 8 trajectory — fixed-horizon polished H-1 schedule"
+                    ),
+                )
+                polished_path = str(polished_path)
+                plot_path = str(polished_plot)
+            if candidate is None:
+                plot_path = plot_dir / "cumulative_prepared.png"
+                solver.plot_schedule(
+                    plot_view(prepared), len(W), plot_path, show=False,
+                    diagnostic_title=(
+                        "Step 8 cumulative local trajectory — "
+                        "prepared H schedule; no legal shortening"
+                    ),
+                )
+                plot_path = str(plot_path)
         prepared_potential, remove_at, deficits = solver._shortening_potential(
             W, M, prepared
         )
@@ -219,6 +268,9 @@ def direct_run(
                 "candidate": summarize(candidate),
                 "strict_source_improvement": candidate.objective_key < source_key,
                 "slots": slot_dicts(candidate),
+                "first_feasible": (
+                    summarize(first_feasible) if first_feasible is not None else None
+                ),
             })
         if verbose_windows:
             print(
@@ -232,10 +284,48 @@ def direct_run(
             "experiment": "direct", "mode": mode, "move_time": move_time,
             "target_mode": "shorten", "local_strategy": "cumulative",
             "budget_seconds": budget, "seed": seed,
+            "search_budget_seconds": round(deadline - start, 6),
+            "plot_reserve_seconds": round(plot_reserve, 6),
             "source": summarize(source), "source_objective": list(source_key),
             "calls": len(trace), "evaluated": evaluated,
             "status": "FOUND" if candidate is not None else "TIMEOUT",
             "best": summarize(candidate) if candidate is not None else None,
+            "best_objective": (
+                list(candidate.objective_key) if candidate is not None else None
+            ),
+            "best_smoothness": (
+                list(solver._trajectory_smoothness(candidate, M))
+                if candidate is not None else None
+            ),
+            "first_feasible": (
+                summarize(first_feasible) if first_feasible is not None else None
+            ),
+            "time_to_first_feasible": (
+                first_event.get("time_to_first_feasible")
+                if first_event is not None else None
+            ),
+            "first_feasible_objective": (
+                first_event.get("objective") if first_event is not None else None
+            ),
+            "first_feasible_smoothness": (
+                first_event.get("smoothness") if first_event is not None else None
+            ),
+            "polish_seconds": (
+                polish_event.get("polish_seconds")
+                if polish_event is not None else 0.0
+            ),
+            "polish_attempts": (
+                polish_event.get("polish_attempts")
+                if polish_event is not None else 0
+            ),
+            "polish_complete_candidates": (
+                polish_event.get("polish_complete_candidates")
+                if polish_event is not None else 0
+            ),
+            "polish_legal_improvements": (
+                polish_event.get("polish_legal_improvements")
+                if polish_event is not None else 0
+            ),
             "prepared": summarize(prepared),
             "prepared_potential": list(prepared_potential),
             "best_remove_at": remove_at,
@@ -247,6 +337,8 @@ def direct_run(
             "candidate_updates": updates,
             "plot_path": str(plot_path) if plot_path is not None else None,
             "prepared_path": str(prepared_path) if prepared_path is not None else None,
+            "first_feasible_path": first_feasible_path,
+            "polished_path": polished_path,
             "elapsed_seconds": round(time.perf_counter() - start, 6),
         }
     for index in range(limit):
@@ -365,6 +457,8 @@ def direct_run(
         "mode": mode, "move_time": move_time,
         "target_mode": "same_horizon" if preserve_horizon else "shorten",
         "budget_seconds": budget, "seed": seed,
+        "search_budget_seconds": round(deadline - start, 6),
+        "plot_reserve_seconds": round(plot_reserve, 6),
         "source": summarize(source), "source_objective": list(source_key),
         "calls": calls, "evaluated": attempts,
         "status": "FOUND" if best is not None else ("TIMEOUT" if time.perf_counter() >= deadline else "NO_CANDIDATE"),
