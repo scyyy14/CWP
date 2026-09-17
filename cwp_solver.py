@@ -3190,8 +3190,8 @@ def solve_cwp(
             1.0 / (1 + gap)
             + 0.25 * max(0, previous_best_makespan - candidate.makespan)
             + 0.05 / (1 + candidate.split_bay_count)
-            + 0.01 / (1 + candidate.movement_count)
-            + 0.002 / (1 + candidate.load_deviation)
+            + 0.01 / (1 + candidate.load_deviation)
+            + 0.002 / (1 + candidate.movement_count)
         )
         strategy_rewards[strategy_index] += reward
         if best is None or candidate.objective_key < best.objective_key:
