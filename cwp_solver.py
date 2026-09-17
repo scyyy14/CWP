@@ -112,12 +112,12 @@ class _CandidateSchedule:
 
     @property
     def objective_key(self) -> tuple[int, int, int, int]:
-        """User priorities: duration, single-crane bays, central load, moves."""
+        """User priorities: duration, single-crane bays, moves, central load."""
         return (
             self.makespan,
             self.split_bay_count,
-            self.load_deviation,
             self.movement_count,
+            self.load_deviation,
         )
 
 
@@ -3805,7 +3805,7 @@ def _print_summary(solution: Solution) -> None:
     print(f"方法: {solution.method}")
     print(f"完工时间: {solution.makespan}；理论下界: {solution.makespan_lower_bound}")
     print(f"下界组成: {solution.lower_bound_components}")
-    print("目标优先级: 完工时间 → 拆分贝位数 → 中间重载偏差 → 移动次数")
+    print("目标优先级: 完工时间 → 拆分贝位数 → 移动次数 → 中间重载偏差")
     print(f"桥吊-贝位分配数（统计）: {solution.assignment_count}")
     print(f"被多吊拆分的贝位数: {solution.split_bay_count}")
     print(f"各桥吊作业负荷: {solution.crane_loads}")

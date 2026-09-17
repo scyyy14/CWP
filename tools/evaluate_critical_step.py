@@ -385,7 +385,7 @@ def full_run(W, M, S, source, mode, budget, seed, move_time=1):
     )
     solver.verify_solution(W, M, S, solution)
     key = [solution.makespan, solution.split_bay_count,
-           solution.load_deviation, solution.movement_count]
+           solution.movement_count, solution.load_deviation]
     return {
         "experiment": "full", "mode": mode, "move_time": move_time,
         "budget_seconds": budget,
@@ -436,7 +436,7 @@ def paired_summary(records):
 
 
 def write_report(out: Path, records):
-    lines = ["# Critical-window ablation", "", "四目标：`(makespan, split_bay_count, load_deviation, movement_count)`", ""]
+    lines = ["# Critical-window ablation", "", "四目标：`(makespan, split_bay_count, movement_count, load_deviation)`", ""]
     direct = [r for r in records if r.get("experiment") == "direct"]
     full = [r for r in records if r.get("experiment") == "full"]
     lines.append(f"Direct records: {len(direct)}; full records: {len(full)}.")
@@ -532,7 +532,7 @@ def main():
     shutil.copy2(ROOT / "example_input.json", backup / "example_input.json")
     records = []
     manifest = {"git": __import__("subprocess").check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
-                "code_sha256": sha256(ROOT / "cwp_solver.py"), "objective": "(makespan, split_bay_count, load_deviation, movement_count)",
+                "code_sha256": sha256(ROOT / "cwp_solver.py"), "objective": "(makespan, split_bay_count, movement_count, load_deviation)",
                 "source_generation": {
                     "budget_seconds": args.source_budget,
                     "restarts": args.source_restarts,
@@ -567,7 +567,7 @@ def main():
                 selected_source.write_text(json.dumps(generated.to_dict(), indent=2), encoding="utf-8")
                 print(
                     f"[prepare] instance={name} seed={seed} "
-                    f"objective={[generated.makespan, generated.split_bay_count, generated.load_deviation, generated.movement_count]} "
+                    f"objective={[generated.makespan, generated.split_bay_count, generated.movement_count, generated.load_deviation]} "
                     f"construction_calls={generated.operator_calls.get('construction', 0)} "
                     f"step7_calls={generated.operator_calls.get('trajectory', 0)} "
                     f"step8_calls={generated.operator_calls.get('critical_beam', 0)} "
@@ -578,7 +578,7 @@ def main():
                     "path": str(selected_source), "sha256": sha256(selected_source),
                     "method": generated.method,
                     "objective": [generated.makespan, generated.split_bay_count,
-                                   generated.load_deviation, generated.movement_count],
+                                   generated.movement_count, generated.load_deviation],
                 }
             source = source_candidate(
                 W, M, S, selected_source, move_time, args.allow_edge_exit

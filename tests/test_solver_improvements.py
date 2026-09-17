@@ -195,12 +195,12 @@ class SolverImprovementTests(unittest.TestCase):
 
         self.assertLess(candidate(h=9, split=5, deviation=100, moves=100).objective_key,
                         candidate().objective_key)
-        self.assertLess(candidate(deviation=100, moves=100).objective_key,
-                        candidate(split=1).objective_key)
-        self.assertLess(candidate(moves=100).objective_key,
-                        candidate(deviation=1).objective_key)
-        self.assertLess(candidate(moves=1).objective_key,
-                        candidate(moves=2).objective_key)
+        self.assertLess(candidate(split=0, deviation=100, moves=100).objective_key,
+                         candidate(split=1).objective_key)
+        self.assertLess(candidate(moves=1, deviation=10_000).objective_key,
+                        candidate(moves=2, deviation=0).objective_key)
+        self.assertLess(candidate(moves=10, deviation=1).objective_key,
+                        candidate(moves=10, deviation=2).objective_key)
         self.assertEqual(candidate().objective_key,
                          candidate(assignments=0, reversals=0).objective_key)
 
