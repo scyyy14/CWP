@@ -158,6 +158,129 @@ class SolverImprovementTests(unittest.TestCase):
         self.assertLess(repaired.objective_key, source.objective_key)
         self.assertEqual(repaired.split_bay_count, 0)
 
+    def test_trajectory_short_excursion_diagnostics(self):
+        rows = [
+            (2, 9, 13),
+            (2, 7, 9),
+            (4, 9, 13),
+            (4, 9, 13),
+            (4, 9, 12),
+            (4, 9, 12),
+            (4, 9, 13),
+            (4, 9, 11),
+            (4, 9, 11),
+            (4, 9, 13),
+        ]
+        slots = [
+            cwp_solver.Slot(
+                t, q + 1, "work", bay, rows[t + 1][q], bay
+            )
+            for t, row in enumerate(rows[:-1])
+            for q, bay in enumerate(row)
+        ]
+        candidate = cwp_solver._CandidateSchedule(
+            slots=slots, makespan=len(rows) - 1,
+            assignment_count=3, split_bay_count=0,
+            load_deviation=0, reversal_count=0, movement_count=8,
+            loads=[3, 3, 3], owners=[{0}, {1}, {2}], move_time=0,
+        )
+        self.assertEqual(
+            cwp_solver._short_excursion_details(candidate, 3),
+            [
+                (1, 1, 1, 9, 7, 1),
+                (2, 1, 1, 13, 9, 1),
+                (2, 4, 5, 13, 12, 2),
+                (2, 7, 8, 13, 11, 2),
+            ],
+        )
+        self.assertEqual(cwp_solver._trajectory_smoothness(candidate, 3), (4, 6, 11))
+
+    def test_trajectory_long_visit_is_not_a_short_excursion(self):
+        rows = [(5,), (7,), (7,), (7,), (5,), (5,)]
+        slots = [
+            cwp_solver.Slot(t, 1, "work", row[0], rows[t + 1][0], row[0])
+            for t, row in enumerate(rows[:-1])
+        ]
+        candidate = cwp_solver._CandidateSchedule(
+            slots=slots, makespan=len(rows) - 1,
+            assignment_count=1, split_bay_count=0,
+            load_deviation=0, reversal_count=0, movement_count=2,
+            loads=[4], owners=[set() for _ in range(9)], move_time=0,
+        )
+        self.assertEqual(cwp_solver._short_excursion_details(candidate, 1), [])
+
+    def test_same_horizon_smoothing_uses_smoothness_only_for_formal_ties(self):
+        def make_candidate(rows, work_time):
+            slots = [
+                cwp_solver.Slot(
+                    t, 1,
+                    "work" if t == work_time else "idle",
+                    row[0], row[0], row[0] if t == work_time else None,
+                )
+                for t, row in enumerate(rows[:-1])
+            ]
+            return cwp_solver._CandidateSchedule(
+                slots=slots, makespan=len(rows) - 1,
+                assignment_count=1, split_bay_count=0,
+                load_deviation=0,
+                reversal_count=sum(
+                    a != b
+                    for a, b in zip(
+                        [1 if rows[i + 1][0] > rows[i][0] else -1
+                         for i in range(len(rows) - 1)
+                         if rows[i + 1][0] != rows[i][0]],
+                        [1 if rows[i + 1][0] > rows[i][0] else -1
+                         for i in range(len(rows) - 1)
+                         if rows[i + 1][0] != rows[i][0]][1:],
+                    )
+                ),
+                movement_count=2,
+                loads=[1], owners=[set(), set(), {0}], move_time=0,
+            )
+
+        rough = make_candidate([(1,), (3,), (1,), (1,), (1,)], 1)
+        smooth = make_candidate([(1,), (2,), (3,), (3,), (3,)], 2)
+        with patch.object(
+            cwp_solver, "_critical_repair_windows", return_value=[((0,), (1, 3))]
+        ), patch.object(
+            cwp_solver, "_trajectory_repair",
+            side_effect=[(smooth, 1), (None, 1), (None, 1)],
+        ):
+            refined, evaluated = cwp_solver._refine_same_horizon_trajectory(
+                [0, 0, 1], 1, [], rough, time.perf_counter() + 0.2, 5,
+                move_time=0,
+            )
+        self.assertEqual(refined.slots, smooth.slots)
+        self.assertEqual(refined.objective_key, rough.objective_key)
+        self.assertLess(
+            cwp_solver._trajectory_smoothness(refined, 1),
+            cwp_solver._trajectory_smoothness(rough, 1),
+        )
+        self.assertEqual(evaluated, 3)
+
+    def test_same_horizon_smoothing_returns_valid_input_at_deadline(self):
+        candidate = cwp_solver._candidate_from_history(
+            [1, 0, 1], 1, [(1,), (1,), (3,), (3,)], move_time=0
+        )
+        refined, evaluated = cwp_solver._refine_same_horizon_trajectory(
+            [1, 0, 1], 1, [1], candidate,
+            time.perf_counter() - 1.0, 13, move_time=0,
+        )
+        self.assertEqual(refined.slots, candidate.slots)
+        self.assertEqual(refined.makespan, candidate.makespan)
+        self.assertEqual(evaluated, 0)
+        cwp_solver.verify_solution(
+            [1, 0, 1], 1, [1],
+            type("Check", (), {
+                "slots": refined.slots,
+                "makespan": refined.makespan,
+                "crane_loads": refined.loads,
+                "reversal_count": refined.reversal_count,
+                "movement_count": refined.movement_count,
+                "move_time": 0,
+            })(),
+        )
+
     def test_construction_only_source_stops_before_steps_7_and_8(self):
         work = [2, 0, 2, 0, 2]
         result = cwp_solver.solve_cwp(

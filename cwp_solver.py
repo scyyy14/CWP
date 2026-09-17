@@ -172,6 +172,99 @@ def _candidate_position_rows(
     return rows
 
 
+def _short_excursion_details(
+    candidate: _CandidateSchedule,
+    M: int,
+    short_visit_limit: int = 2,
+) -> list[tuple[int, int, int, int, int, int]]:
+    """Return short ``A -> B -> A`` work visits in a zero-time trajectory.
+
+    The returned tuples are ``(crane, start, end, base, excursion, work)``;
+    ``start`` and ``end`` are inclusive time rows.  A visit counts only when
+    it performs work, so an idle position block is not mislabeled as an
+    operational detour.
+    """
+    if candidate.move_time != 0 or candidate.makespan <= 0:
+        return []
+    if isinstance(short_visit_limit, bool) or short_visit_limit < 1:
+        raise ValueError("short_visit_limit 必须是正整数。")
+    rows = _candidate_position_rows(candidate, M)
+    horizon = candidate.makespan
+    work = {
+        (slot.time, slot.crane - 1)
+        for slot in candidate.slots
+        if slot.state == "work" and 0 <= slot.time < horizon
+    }
+    details: list[tuple[int, int, int, int, int, int]] = []
+    for q in range(M):
+        start = 0
+        while start < horizon:
+            position = rows[start][q]
+            end = start
+            while end + 1 < horizon and rows[end + 1][q] == position:
+                end += 1
+            length = end - start + 1
+            if (
+                start > 0
+                and end + 1 <= horizon
+                and rows[start - 1][q] == rows[end + 1][q]
+                and rows[start - 1][q] != position
+                and length <= short_visit_limit
+            ):
+                work_count = sum((t, q) in work for t in range(start, end + 1))
+                if work_count:
+                    details.append((
+                        q, start, end, rows[start - 1][q], position, work_count,
+                    ))
+            start = end + 1
+    return details
+
+
+def _trajectory_smoothness(
+    candidate: _CandidateSchedule,
+    M: int,
+    short_visit_limit: int = 2,
+) -> tuple[int, int, int]:
+    """Return diagnostics for short visits and fragmented position blocks."""
+    if candidate.move_time != 0:
+        return (0, 0, 0)
+    rows = _candidate_position_rows(candidate, M)
+    horizon = candidate.makespan
+    blocks = 0
+    for q in range(M):
+        blocks += 1
+        for t in range(1, horizon):
+            if rows[t][q] != rows[t - 1][q]:
+                blocks += 1
+    details = _short_excursion_details(candidate, M, short_visit_limit)
+    return (
+        len(details),
+        sum(item[-1] for item in details),
+        blocks,
+    )
+
+
+def _candidate_passes_independent_verifier(
+    W: Sequence[int],
+    M: int,
+    starts: Sequence[int],
+    candidate: _CandidateSchedule,
+) -> bool:
+    """Validate a private candidate through the public schedule verifier."""
+    view = type("_CandidateVerifierView", (), {})()
+    view.slots = candidate.slots
+    view.makespan = candidate.makespan
+    view.crane_loads = candidate.loads
+    view.reversal_count = candidate.reversal_count
+    view.movement_count = candidate.movement_count
+    view.move_time = candidate.move_time
+    try:
+        verify_solution(W, M, starts, view)
+    except AssertionError:
+        return False
+    return True
+
+
 def _shortening_potential(
     W: Sequence[int],
     M: int,
@@ -1353,6 +1446,7 @@ def _trajectory_repair(
     move_time: int = 1,
     preserve_horizon: bool = False,
     preparation_mode: bool = False,
+    accept_smooth_ties: bool = False,
 ):
     """Annealed interval repair of a shortened complete position trajectory.
 
@@ -1514,7 +1608,15 @@ def _trajectory_repair(
                 elif (
                     not preserve_horizon
                     or candidate.makespan == incumbent.makespan
-                    and candidate.objective_key < incumbent.objective_key
+                    and (
+                        candidate.objective_key < incumbent.objective_key
+                        or (
+                            accept_smooth_ties
+                            and candidate.objective_key == incumbent.objective_key
+                            and _trajectory_smoothness(candidate, M)
+                            < _trajectory_smoothness(incumbent, M)
+                        )
+                    )
                 ):
                     return result(candidate, None)
             if loss < best_loss - 1e-8:
@@ -2220,6 +2322,119 @@ def _targeted_local_preparation(
     return best, evaluated
 
 
+def _refine_same_horizon_trajectory(
+    W: Sequence[int],
+    M: int,
+    starts: Sequence[int],
+    candidate: _CandidateSchedule,
+    deadline: float,
+    seed: int,
+    *,
+    move_time: int = 0,
+    attempt_trace: list[dict[str, Any]] | None = None,
+) -> tuple[_CandidateSchedule, int]:
+    """Polish a complete shortened trajectory without changing its horizon.
+
+    The first feasible H-1 trajectory is valuable evidence, but it is not
+    necessarily operationally smooth.  Reuse the bounded local trajectory
+    operator on the remaining budget, prioritizing windows containing short
+    ``A -> B -> A`` work visits.  A candidate with the same formal objective
+    is accepted only when its smoothness key improves.
+    """
+    if move_time != 0 or candidate.move_time != 0:
+        return candidate, 0
+    if not _candidate_passes_independent_verifier(W, M, starts, candidate):
+        raise ValueError("trajectory 平滑阶段收到非法的首个可行方案。")
+    best = candidate
+    evaluated_total = 0
+    cycle = 0
+    stale_cycles = 0
+    while time.perf_counter() < deadline and cycle < 6 and stale_cycles < 2:
+        windows = _critical_repair_windows(best, M)
+        if not windows:
+            break
+        excursions = _short_excursion_details(best, M)
+        ranked: list[tuple[int, int, tuple[int, ...], tuple[int, int]]] = []
+        for index, (chain, window) in enumerate(windows):
+            relevance = sum(
+                1
+                for q, start, end, *_ in excursions
+                if q in chain and start < window[1] and end >= window[0]
+            )
+            ranked.append((-relevance, index, chain, window))
+        ranked.sort(key=lambda item: (item[0], item[3][0], item[1]))
+        progress = False
+        for rank, (_, index, chain, window) in enumerate(ranked):
+            if time.perf_counter() >= deadline:
+                break
+            remaining_calls = max(1, len(ranked) - rank)
+            slice_deadline = min(
+                deadline,
+                time.perf_counter() + max(
+                    0.05,
+                    (deadline - time.perf_counter()) / remaining_calls,
+                ),
+            )
+            before_key = best.objective_key
+            before_smoothness = _trajectory_smoothness(best, M)
+            proposed, evaluated = _trajectory_repair(
+                W, M, starts, best, slice_deadline,
+                seed + cycle * 1009 + index,
+                active_cranes=chain,
+                window=window,
+                move_time=move_time,
+                preserve_horizon=True,
+                accept_smooth_ties=True,
+            )
+            evaluated_total += evaluated
+            candidate_found = proposed is not None
+            if proposed is not None and (
+                proposed.makespan != candidate.makespan
+                or not _candidate_passes_independent_verifier(
+                    W, M, starts, proposed
+                )
+            ):
+                proposed = None
+            accepted = proposed is not None and (
+                proposed.objective_key < before_key
+                or (
+                    proposed.objective_key == before_key
+                    and _trajectory_smoothness(proposed, M) < before_smoothness
+                )
+            )
+            if attempt_trace is not None:
+                attempt_trace.append({
+                    "cycle": cycle,
+                    "window_index": index,
+                    "chain": list(chain),
+                    "window": list(window),
+                    "phase": "polish",
+                    "evaluated": evaluated,
+                    "candidate_found": candidate_found,
+                    "candidate_legal": proposed is not None,
+                    "accepted": accepted,
+                    "before_objective": list(before_key),
+                    "before_smoothness": list(before_smoothness),
+                    "after_objective": (
+                        list(proposed.objective_key) if accepted else None
+                    ),
+                    "after_smoothness": (
+                        list(_trajectory_smoothness(proposed, M))
+                        if accepted else None
+                    ),
+                })
+            if accepted:
+                best = proposed
+                progress = True
+                break
+        if progress:
+            stale_cycles = 0
+        else:
+            stale_cycles += 1
+        cycle += 1
+    return best, evaluated_total
+
+
 def _cumulative_local_trajectory_repair(
     W: Sequence[int],
     M: int,
@@ -2229,19 +2444,80 @@ def _cumulative_local_trajectory_repair(
     seed: int,
     move_time: int = 1,
     attempt_trace: list[dict[str, Any]] | None = None,
-) -> tuple[_CandidateSchedule | None, int, _CandidateSchedule]:
+) -> tuple[
+    _CandidateSchedule | None, int, _CandidateSchedule, _CandidateSchedule | None
+]:
     """Prepare and shorten through cumulative bounded local windows.
 
     Every mutation remains inside one ordinary critical window.  Accepted
     same-horizon preparations become the source of the next window, allowing
     two distant local repairs to cooperate without introducing a global
-    window.  The returned third value is the best prepared H schedule even if
-    no H-1 schedule was found, so callers can retain it as an elite.
+    window.  Once the first H-1 schedule is found, the remaining deadline is
+    used for fixed-horizon smoothing.  The returned values are the polished
+    candidate (if any), evaluated iterations, prepared H schedule, and the
+    first feasible H-1 candidate.
     """
     current = incumbent
     evaluated_total = 0
+    first_feasible: _CandidateSchedule | None = None
+    started = time.perf_counter()
     if move_time != 0:
-        return None, evaluated_total, current
+        return None, evaluated_total, current, first_feasible
+
+    def polish_and_return(
+        shortened: _CandidateSchedule,
+        prepared: _CandidateSchedule,
+    ) -> tuple[_CandidateSchedule, _CandidateSchedule, _CandidateSchedule]:
+        nonlocal evaluated_total, first_feasible
+        if first_feasible is None:
+            first_feasible = shortened
+            if attempt_trace is not None:
+                attempt_trace.append({
+                    "phase": "first_feasible",
+                    "time_to_first_feasible": round(
+                        time.perf_counter() - started, 6
+                    ),
+                    "objective": list(shortened.objective_key),
+                    "smoothness": list(_trajectory_smoothness(shortened, M)),
+                })
+        polish_started = time.perf_counter()
+        trace_start = len(attempt_trace) if attempt_trace is not None else 0
+        polished, polish_evaluated = _refine_same_horizon_trajectory(
+            W, M, starts, first_feasible, deadline,
+            seed + 700_001, move_time=move_time,
+            attempt_trace=attempt_trace,
+        )
+        evaluated_total += polish_evaluated
+        polish_trace = (
+            attempt_trace[trace_start:]
+            if attempt_trace is not None else []
+        )
+        polish_attempts = sum(
+            item.get("phase") == "polish" for item in polish_trace
+        )
+        polish_complete_candidates = sum(
+            item.get("phase") == "polish" and item.get("candidate_legal", False)
+            for item in polish_trace
+        )
+        polish_legal_improvements = sum(
+            item.get("phase") == "polish" and item.get("accepted", False)
+            for item in polish_trace
+        )
+        if attempt_trace is not None:
+            attempt_trace.append({
+                "phase": "polish_complete",
+                "polish_evaluated": polish_evaluated,
+                "polish_seconds": round(
+                    time.perf_counter() - polish_started, 6
+                ),
+                "polish_attempts": polish_attempts,
+                "polish_complete_candidates": polish_complete_candidates,
+                "polish_legal_improvements": polish_legal_improvements,
+                "objective": list(polished.objective_key),
+                "smoothness": list(_trajectory_smoothness(polished, M)),
+            })
+        return polished, prepared, first_feasible
+
     current_potential, _, _ = _shortening_potential(W, M, current)
     cycle = 0
     stale_cycles = 0
@@ -2266,7 +2542,8 @@ def _cumulative_local_trajectory_repair(
                             "phase": "targeted", "evaluated": evaluated,
                             "accepted": True, "shortened": True,
                         })
-                    return targeted, evaluated_total, current
+                    polished, prepared, first = polish_and_return(targeted, current)
+                    return polished, evaluated_total, prepared, first
                 targeted_potential, remove_at, deficits = _shortening_potential(
                     W, M, targeted
                 )
@@ -2288,7 +2565,8 @@ def _cumulative_local_trajectory_repair(
                 progress = True
                 shortened = _decode_best_shortening(W, M, current)
                 if shortened is not None:
-                    return shortened, evaluated_total, current
+                    polished, prepared, first = polish_and_return(shortened, current)
+                    return polished, evaluated_total, prepared, first
                 break
             remaining_calls = max(1, len(windows) - index)
             slice_deadline = min(
@@ -2340,7 +2618,8 @@ def _cumulative_local_trajectory_repair(
                 if attempt_trace is not None:
                     attempt_trace.append(record)
                 if shortened is not None:
-                    return shortened, evaluated_total, current
+                    polished, prepared, first = polish_and_return(shortened, current)
+                    return polished, evaluated_total, prepared, first
                 # Recompute event windows from the newly prepared trajectory.
                 break
             if attempt_trace is not None:
@@ -2373,7 +2652,7 @@ def _cumulative_local_trajectory_repair(
         else:
             stale_cycles += 1
         cycle += 1
-    return None, evaluated_total, current
+    return None, evaluated_total, current, first_feasible
 
 
 def _critical_window_beam_repair(
@@ -3280,7 +3559,7 @@ def solve_cwp(
                 repair_phase_deadline - time.perf_counter()
             )
         operator_calls["trajectory"] += 1
-        cumulative, evaluated, prepared = _cumulative_local_trajectory_repair(
+        cumulative, evaluated, prepared, first_feasible = _cumulative_local_trajectory_repair(
             W, M, starts, best, cumulative_deadline, seed,
             move_time=move_time,
         )
