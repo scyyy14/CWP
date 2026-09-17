@@ -190,7 +190,7 @@ def direct_run(
         )
         trace = []
         calls += 1
-        if mode == "beam" or (mode == "both" and index % 2 == 0):
+        if mode == "beam" or (mode == "both" and index % 2 == 1):
             candidate, evaluated = solver._critical_window_beam_repair(
                 W, M, S, source, chain, slice_deadline, seed + 1009 + index,
                 window=window, attempt_trace=trace, move_time=move_time,

@@ -2894,7 +2894,7 @@ def solve_cwp(
             time.perf_counter() + max(0.20, min(7.0, remaining_budget / 3.0)),
         )
         if critical_mode == "beam" or (
-            critical_mode == "both" and critical_index % 2 == 0
+            critical_mode == "both" and critical_index % 2 == 1
         ):
             operator_calls["critical_beam"] += 1
             improved, evaluated = _critical_window_beam_repair(
