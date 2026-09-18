@@ -184,7 +184,7 @@ def direct_run(
     # search deadline is otherwise extended while rendering, so a nominal
     # 300-second run can exceed its advertised wall-clock budget.
     plot_reserve = 0.0
-    if plot_dir is not None and cumulative_local and mode == "trajectory":
+    if plot_dir is not None:
         plot_reserve = min(15.0, max(2.0, 0.06 * budget))
         deadline = start + max(0.01, budget - plot_reserve)
     windows = solver._critical_repair_windows(source, M)
@@ -246,7 +246,10 @@ def direct_run(
         formal_best_path = None
         continuity_best_path = None
         operational_best_path = None
-        if plot_dir is not None:
+        # Beam is measured as a 300-second search and gets one final artifact
+        # below.  Rendering all 48 intermediate beam windows during the search
+        # makes plotting part of the algorithm and can consume the reserve.
+        if plot_dir is not None and mode != "beam":
             plot_dir.mkdir(parents=True, exist_ok=True)
             source_path = plot_dir / "source.json"
             source_path.write_text(json.dumps({
@@ -508,7 +511,6 @@ def direct_run(
         }
         window_results.append(window_record)
         if plot_dir is not None:
-            plot_started = time.perf_counter()
             plot_dir.mkdir(parents=True, exist_ok=True)
             plot_candidate = candidate if candidate is not None else source
             plot_path = plot_dir / (
@@ -533,9 +535,6 @@ def direct_run(
                 highlight_window=tuple(window),
             )
             window_record["plot_path"] = str(plot_path)
-            # Diagnostic rendering must not reduce the search budget available
-            # to later windows in the same experiment.
-            deadline += time.perf_counter() - plot_started
         if verbose_windows:
             candidate_text = (
                 str(window_record["candidate"]["objective"])
@@ -567,6 +566,30 @@ def direct_run(
         updates.append(record)
         if best is None or candidate.objective_key < best.objective_key:
             best = candidate
+    found_best = best is not None
+    reported_best = best if found_best else source
+    if plot_dir is not None and mode == "beam":
+        plot_dir.mkdir(parents=True, exist_ok=True)
+        source_json = plot_dir / "source.json"
+        source_json.write_text(json.dumps({
+            **summarize(source), "slots": slot_dicts(source),
+        }, indent=2), encoding="utf-8")
+        solver.plot_schedule(
+            plot_view(source), len(W), plot_dir / "source.png", show=False,
+            diagnostic_title="Step 8 beam — adapted source schedule",
+        )
+        best_json = plot_dir / "best.json"
+        best_json.write_text(json.dumps({
+            **summarize(reported_best), "slots": slot_dicts(reported_best),
+        }, indent=2), encoding="utf-8")
+        solver.plot_schedule(
+            plot_view(reported_best), len(W), plot_dir / "best.png", show=False,
+            diagnostic_title=(
+                "Step 8 beam — best feasible schedule"
+                if found_best else
+                "Step 8 beam — no feasible modification; source retained"
+            ),
+        )
     return {
         "experiment": "direct",
         "mode": mode, "move_time": move_time,
@@ -576,8 +599,9 @@ def direct_run(
         "plot_reserve_seconds": round(plot_reserve, 6),
         "source": summarize(source), "source_objective": list(source_key),
         "calls": calls, "evaluated": attempts,
-        "status": "FOUND" if best is not None else ("TIMEOUT" if time.perf_counter() >= deadline else "NO_CANDIDATE"),
-        "best": summarize(best) if best is not None else None,
+        "status": "FOUND" if found_best else ("TIMEOUT" if time.perf_counter() >= deadline else "NO_CANDIDATE"),
+        "best": summarize(reported_best),
+        "best_is_source": not found_best,
         "window_results": window_results,
         "strict_improvements": [item for item in updates if item["strict_source_improvement"]],
         "candidate_updates": updates,
