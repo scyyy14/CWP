@@ -216,6 +216,7 @@ def direct_run(
             None,
         )
         plot_path = None
+        source_path = None
         prepared_path = None
         first_feasible_path = None
         polished_path = None
@@ -223,6 +224,17 @@ def direct_run(
         continuity_best_path = None
         if plot_dir is not None:
             plot_dir.mkdir(parents=True, exist_ok=True)
+            source_path = plot_dir / "source.json"
+            source_path.write_text(json.dumps({
+                **summarize(source),
+                "slots": slot_dicts(source),
+            }, indent=2), encoding="utf-8")
+            source_plot = plot_dir / "source.png"
+            solver.plot_schedule(
+                plot_view(source), len(W), source_plot, show=False,
+                diagnostic_title="Step 8 trajectory — adapted source schedule",
+            )
+            source_path = str(source_path)
             prepared_path = plot_dir / "cumulative_prepared.json"
             prepared_path.write_text(json.dumps({
                 **summarize(prepared),
@@ -383,6 +395,7 @@ def direct_run(
             "candidate_updates": updates,
             "plot_path": str(plot_path) if plot_path is not None else None,
             "prepared_path": str(prepared_path) if prepared_path is not None else None,
+            "source_path": source_path,
             "first_feasible_path": first_feasible_path,
             "polished_path": polished_path,
             "formal_best_path": formal_best_path,
@@ -565,6 +578,9 @@ def continuity_run(
     validation_seconds = time.perf_counter() - validation_started
 
     out.mkdir(parents=True, exist_ok=True)
+    source_json, source_png = _write_continuity_artifact(
+        out, "source", source, W
+    )
     first_json, first_png = _write_continuity_artifact(
         out, "first_feasible", source, W
     )
@@ -609,6 +625,8 @@ def continuity_run(
         "formal_best_objective": objective(formal_best),
         "continuity_best_objective": objective(continuity_best),
         "changed_regions": changed_regions,
+        "source_path": source_json,
+        "source_plot": source_png,
         "first_feasible_path": first_json,
         "first_feasible_plot": first_png,
         "formal_best_path": formal_json,
