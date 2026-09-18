@@ -559,7 +559,12 @@ def continuity_run(
 ):
     """Run only the fixed-H continuity stage on an immutable source."""
     started = time.perf_counter()
-    deadline = started + budget
+    # Keep a small explicit tail for validation and serialization.  A large
+    # deterministic proposal can finish just after its loop check, so the
+    # reserve also prevents the advertised search budget from being exceeded
+    # by the last decode.
+    search_reserve = min(2.0, max(0.25, 0.01 * budget))
+    deadline = started + max(0.01, budget - search_reserve)
     trace: list[dict] = []
     details: dict = {}
     result, evaluated = solver._refine_same_horizon_trajectory(
@@ -608,6 +613,8 @@ def continuity_run(
         "mode": "trajectory_continuity",
         "move_time": source.move_time,
         "budget_seconds": budget,
+        "search_budget_seconds": round(budget - search_reserve, 6),
+        "search_reserve_seconds": round(search_reserve, 6),
         "seed": seed,
         "validated": True,
         "search_seconds": round(search_finished - started, 6),
