@@ -209,6 +209,169 @@ class SolverImprovementTests(unittest.TestCase):
         )
         self.assertEqual(cwp_solver._short_excursion_details(candidate, 1), [])
 
+    def test_continuity_detects_same_crane_bay_fragmentation(self):
+        candidate = cwp_solver._candidate_from_history(
+            [0, 3, 0], 1, [(2,), (2,), (3,), (2,), (2,)],
+            move_time=0, preserve_horizon=True,
+        )
+        report = cwp_solver._continuity_diagnostics(candidate, 1)
+        self.assertEqual(candidate.makespan, 4)
+        self.assertEqual(report["bay_fragmentation"], 1)
+        self.assertEqual(
+            [(item["start"], item["end_exclusive"])
+             for item in report["work_blocks_by_bay"]["2"]],
+            [(0, 2), (3, 4)],
+        )
+        self.assertEqual(report["work_revisit_count"], 1)
+        self.assertEqual(report["crane_work_revisits"][0]["bay"], 2)
+
+    def test_continuity_detects_long_and_abc_revisits(self):
+        candidate = cwp_solver._candidate_from_history(
+            [0, 0, 0, 0, 2, 0, 3, 0, 1], 1,
+            [(5,), (7,), (7,), (7,), (9,), (5,), (5,)],
+            move_time=0, preserve_horizon=True,
+        )
+        report = cwp_solver._continuity_diagnostics(candidate, 1)
+        blocks = report["crane_position_blocks"]
+        seven_block = next(item for item in blocks if item["position"] == 7)
+        self.assertEqual(seven_block["length"], 3)
+        self.assertEqual(report["work_revisit_count"], 1)
+        self.assertEqual(report["crane_work_revisits"][0]["bay"], 5)
+        self.assertEqual(cwp_solver._short_excursion_details(candidate, 1), [])
+
+    def test_h208_continuity_regression_sees_known_fragmentation(self):
+        root = Path(__file__).resolve().parents[1]
+        source_path = root / "experiments" / "mentor_step8_trajectory_smoothing_20260917" / "seed0_300s_segment_operators" / "window_plots" / "fixed" / "seed_0" / "budget_300s" / "trajectory" / "polished_best.json"
+        input_path = root / "experiments" / "mentor_step8_baseline_20260917_h209" / "input" / "instance.json"
+        if not source_path.exists() or not input_path.exists():
+            self.skipTest("历史 H=208 实验文件不在精简测试环境中")
+        source = json.loads(source_path.read_text(encoding="utf-8"))
+        instance = json.loads(input_path.read_text(encoding="utf-8"))
+        slots = [cwp_solver.Slot(**item) for item in source["slots"]]
+        M = instance["M"]
+        owners = [set() for _ in instance["W"]]
+        loads = [0] * M
+        for slot in slots:
+            if slot.state == "work":
+                owners[slot.work_bay - 1].add(slot.crane - 1)
+                loads[slot.crane - 1] += 1
+        candidate = cwp_solver._CandidateSchedule(
+            slots=slots, makespan=source["makespan"],
+            assignment_count=source["assignment_count"],
+            split_bay_count=source["split_bay_count"],
+            load_deviation=source["load_deviation"],
+            reversal_count=source["reversal_count"],
+            movement_count=source["movement_count"], loads=loads,
+            owners=owners, move_time=0,
+        )
+        report = cwp_solver._continuity_diagnostics(candidate, M)
+        self.assertEqual(
+            [(item["start"], item["end_exclusive"])
+             for item in report["work_blocks_by_bay"]["2"]],
+            [(0, 1), (207, 208)],
+        )
+        q3_bay11 = [
+            item for item in report["crane_work_revisits"]
+            if item["crane"] == 3 and item["bay"] == 11
+        ]
+        self.assertTrue(q3_bay11)
+        self.assertEqual(q3_bay11[0]["previous_block"]["length"], 7)
+
+    def test_continuity_does_not_count_pure_yielding_as_work_revisit(self):
+        candidate = cwp_solver._candidate_from_history(
+            [0, 0, 1], 1, [(1,), (3,), (1,), (1,)],
+            move_time=0, preserve_horizon=True,
+        )
+        report = cwp_solver._continuity_diagnostics(candidate, 1)
+        self.assertEqual(report["work_revisit_count"], 0)
+        self.assertEqual(report["position_revisit_count"], 1)
+        self.assertEqual(len(report["pure_yielding_revisits"]), 1)
+
+    def test_fixed_horizon_decoder_keeps_global_idle_rows(self):
+        compressed = cwp_solver._candidate_from_history(
+            [0, 0, 1], 1, [(1,), (1,), (3,), (3,)], move_time=0
+        )
+        fixed = cwp_solver._candidate_from_history(
+            [0, 0, 1], 1, [(1,), (1,), (3,), (3,)],
+            move_time=0, preserve_horizon=True,
+        )
+        self.assertEqual(compressed.makespan, 1)
+        self.assertEqual(fixed.makespan, 3)
+        self.assertEqual(len(fixed.slots), 3)
+        cwp_solver.verify_solution(
+            [0, 0, 1], 1, [],
+            type("Check", (), {
+                "slots": fixed.slots,
+                "makespan": fixed.makespan,
+                "crane_loads": fixed.loads,
+                "reversal_count": fixed.reversal_count,
+                "movement_count": fixed.movement_count,
+                "move_time": 0,
+            })(),
+        )
+
+    def test_revisit_exchange_is_paired_and_verified(self):
+        source_history = [(5,), (7,), (7,), (7,), (5,), (5,), (5,)] + [(7,)] * 8
+        candidate = cwp_solver._candidate_from_history(
+            [0, 0, 0, 0, 4, 0, 10, 0, 0], 1,
+            source_history, move_time=0, preserve_horizon=True,
+        )
+        proposals = cwp_solver._continuity_block_neighbors(
+            [0, 0, 0, 0, 4, 0, 10, 0, 0], 1, candidate,
+        )
+        exchange = next(
+            proposal_history for name, proposal_history in proposals
+            if name == "revisit_work_exchange"
+        )
+        changed = cwp_solver._history_diff_regions(
+            [tuple(row) for row in source_history], exchange
+        )
+        self.assertLessEqual(len(changed), 2)
+        self.assertTrue(all(item["length"] <= 8 for item in changed))
+        repaired = cwp_solver._candidate_from_history(
+            [0, 0, 0, 0, 4, 0, 10, 0, 0], 1, exchange,
+            move_time=0, preserve_horizon=True,
+        )
+        self.assertEqual(repaired.makespan, candidate.makespan)
+        cwp_solver.verify_solution(
+            [0, 0, 0, 0, 4, 0, 10, 0, 0], 1, [5],
+            type("Check", (), {
+                "slots": repaired.slots,
+                "makespan": repaired.makespan,
+                "crane_loads": repaired.loads,
+                "reversal_count": repaired.reversal_count,
+                "movement_count": repaired.movement_count,
+                "move_time": 0,
+            })(),
+        )
+
+    def test_continuity_can_accept_more_than_six_successive_improvements(self):
+        source_history = [
+            (1,), (3,), (1,), (3,), (1,), (3,), (1,), (3,),
+            (1,), (3,), (1,), (3,), (1,), (3,), (1,),
+        ]
+        candidate = cwp_solver._candidate_from_history(
+            [1, 0, 0], 1, source_history, move_time=0,
+            preserve_horizon=True,
+        )
+        proposal_histories = []
+        working = list(source_history)
+        for index in range(1, 8):
+            working[2 * index - 1] = (1,)
+            proposal_histories.append(("test_progress", [tuple(row) for row in working]))
+        with patch.object(cwp_solver, "_trajectory_segment_neighbors", return_value=[]), \
+             patch.object(
+                 cwp_solver, "_continuity_block_neighbors",
+                 side_effect=[[item] for item in proposal_histories] + [[]],
+             ), patch.object(cwp_solver, "_critical_repair_windows", return_value=[]):
+            refined, evaluated = cwp_solver._refine_same_horizon_trajectory(
+                [1, 0, 0], 1, [1], candidate,
+                time.perf_counter() + 0.5, 91, move_time=0,
+                continuity=True,
+            )
+        self.assertGreaterEqual(evaluated, 7)
+        self.assertLessEqual(refined.movement_count, 1)
+
     def test_trajectory_segment_neighbors_are_block_level(self):
         rows = [
             (2, 9, 13),
