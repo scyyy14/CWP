@@ -42,7 +42,9 @@ def objective(candidate: solver._CandidateSchedule) -> list[int]:
 
 def source_candidate(W, M, S, path: Path, move_time=1, allow_edge_exit=False):
     data = json.loads(path.read_text(encoding="utf-8"))
-    source_move_time = data.get("move_time", 1)
+    # Older polished experiment records omitted move_time.  In that case the
+    # caller's instance configuration is the only unambiguous default.
+    source_move_time = data.get("move_time", move_time)
     if source_move_time != move_time:
         raise ValueError(
             f"固定源 move_time={source_move_time} 与输入 move_time={move_time} 不一致；"
@@ -113,6 +115,7 @@ def summarize(candidate):
     return {
         "objective": objective(candidate),
         "makespan": candidate.makespan,
+        "move_time": candidate.move_time,
         "split_bay_count": candidate.split_bay_count,
         "load_deviation": candidate.load_deviation,
         "movement_count": candidate.movement_count,
@@ -121,6 +124,9 @@ def summarize(candidate):
         )),
         "assignment_count": candidate.assignment_count,
         "reversal_count": candidate.reversal_count,
+        "continuity": solver._continuity_diagnostics(
+            candidate, len(candidate.loads)
+        ),
     }
 
 
@@ -189,10 +195,14 @@ def direct_run(
         and move_time == 0 and not preserve_horizon
     ):
         trace = []
+        continuity_output = {}
         candidate, evaluated, prepared, first_feasible = solver._cumulative_local_trajectory_repair(
             W, M, S, source, deadline, seed,
             move_time=move_time, attempt_trace=trace,
+            continuity_output=continuity_output,
         )
+        formal_best = continuity_output.get("formal_best", candidate)
+        continuity_best = continuity_output.get("continuity_best", candidate)
         verify_candidate(W, M, S, prepared, move_time)
         if candidate is not None:
             verify_candidate(W, M, S, candidate, move_time)
@@ -209,6 +219,8 @@ def direct_run(
         prepared_path = None
         first_feasible_path = None
         polished_path = None
+        formal_best_path = None
+        continuity_best_path = None
         if plot_dir is not None:
             plot_dir.mkdir(parents=True, exist_ok=True)
             prepared_path = plot_dir / "cumulative_prepared.json"
@@ -247,6 +259,36 @@ def direct_run(
                 )
                 polished_path = str(polished_path)
                 plot_path = str(polished_plot)
+            if formal_best is not None:
+                formal_best_path = plot_dir / "formal_best.json"
+                formal_best_path.write_text(json.dumps({
+                    **summarize(formal_best),
+                    "slots": slot_dicts(formal_best),
+                }, indent=2), encoding="utf-8")
+                formal_best_plot = plot_dir / "formal_best.png"
+                solver.plot_schedule(
+                    plot_view(formal_best), len(W), formal_best_plot,
+                    show=False,
+                    diagnostic_title=(
+                        "Step 8 trajectory — formal best H-1 schedule"
+                    ),
+                )
+                formal_best_path = str(formal_best_path)
+            if continuity_best is not None:
+                continuity_best_path = plot_dir / "continuity_best.json"
+                continuity_best_path.write_text(json.dumps({
+                    **summarize(continuity_best),
+                    "slots": slot_dicts(continuity_best),
+                }, indent=2), encoding="utf-8")
+                continuity_best_plot = plot_dir / "continuity_best.png"
+                solver.plot_schedule(
+                    plot_view(continuity_best), len(W), continuity_best_plot,
+                    show=False,
+                    diagnostic_title=(
+                        "Step 8 trajectory — continuity best H-1 schedule"
+                    ),
+                )
+                continuity_best_path = str(continuity_best_path)
             if candidate is None:
                 plot_path = plot_dir / "cumulative_prepared.png"
                 solver.plot_schedule(
@@ -297,6 +339,10 @@ def direct_run(
                 list(solver._trajectory_smoothness(candidate, M))
                 if candidate is not None else None
             ),
+            "formal_best": summarize(formal_best) if formal_best is not None else None,
+            "continuity_best": summarize(continuity_best) if continuity_best is not None else None,
+            "continuity_operator_stats": continuity_output.get("stats"),
+            "continuity_stop_reason": continuity_output.get("stop_reason"),
             "first_feasible": (
                 summarize(first_feasible) if first_feasible is not None else None
             ),
@@ -339,6 +385,8 @@ def direct_run(
             "prepared_path": str(prepared_path) if prepared_path is not None else None,
             "first_feasible_path": first_feasible_path,
             "polished_path": polished_path,
+            "formal_best_path": formal_best_path,
+            "continuity_best_path": continuity_best_path,
             "elapsed_seconds": round(time.perf_counter() - start, 6),
         }
     for index in range(limit):
@@ -470,6 +518,109 @@ def direct_run(
     }
 
 
+def _write_continuity_artifact(
+    out: Path,
+    label: str,
+    candidate,
+    W,
+    *,
+    highlight_window=None,
+):
+    """Write one verified candidate and its post-search diagnostic plot."""
+    json_path = out / f"{label}.json"
+    json_path.write_text(json.dumps({
+        **summarize(candidate),
+        "slots": slot_dicts(candidate),
+    }, indent=2), encoding="utf-8")
+    png_path = out / f"{label}.png"
+    solver.plot_schedule(
+        plot_view(candidate), len(W), png_path, show=False,
+        diagnostic_title=f"Step 8 continuity — {label}",
+        highlight_window=highlight_window,
+    )
+    return str(json_path), str(png_path)
+
+
+def continuity_run(
+    W, M, S, source, budget, seed, out: Path,
+):
+    """Run only the fixed-H continuity stage on an immutable source."""
+    started = time.perf_counter()
+    deadline = started + budget
+    trace: list[dict] = []
+    details: dict = {}
+    result, evaluated = solver._refine_same_horizon_trajectory(
+        W, M, S, source, deadline, seed,
+        move_time=source.move_time,
+        attempt_trace=trace,
+        continuity=True,
+        result_box=details,
+    )
+    search_finished = time.perf_counter()
+    formal_best = details.get("formal_best", result)
+    continuity_best = details.get("continuity_best", result)
+    validation_started = time.perf_counter()
+    for candidate in (source, formal_best, continuity_best):
+        verify_candidate(W, M, S, candidate, source.move_time)
+    validation_seconds = time.perf_counter() - validation_started
+
+    out.mkdir(parents=True, exist_ok=True)
+    first_json, first_png = _write_continuity_artifact(
+        out, "first_feasible", source, W
+    )
+    formal_json, formal_png = _write_continuity_artifact(
+        out, "formal_best", formal_best, W
+    )
+    continuity_json, continuity_png = _write_continuity_artifact(
+        out, "continuity_best", continuity_best, W
+    )
+    plot_seconds = time.perf_counter() - validation_started - validation_seconds
+    before_rows = solver._candidate_position_rows(source, M)
+    after_rows = solver._candidate_position_rows(continuity_best, M)
+    changed_regions = solver._history_diff_regions(
+        [tuple(row) for row in before_rows],
+        [tuple(row) for row in after_rows],
+    )
+    total_seconds = time.perf_counter() - started
+    polish_event = next(
+        (item for item in reversed(trace)
+         if item.get("phase") == "polish_complete"),
+        None,
+    )
+    return {
+        "experiment": "continuity",
+        "mode": "trajectory_continuity",
+        "move_time": source.move_time,
+        "budget_seconds": budget,
+        "seed": seed,
+        "validated": True,
+        "search_seconds": round(search_finished - started, 6),
+        "validation_seconds": round(validation_seconds, 6),
+        "plot_seconds": round(plot_seconds, 6),
+        "total_seconds": round(total_seconds, 6),
+        "evaluated": evaluated,
+        "pool_size": details.get("pool_size"),
+        "stop_reason": details.get("stop_reason"),
+        "operator_stats": details.get("stats"),
+        "source": summarize(source),
+        "first_feasible": summarize(source),
+        "formal_best": summarize(formal_best),
+        "continuity_best": summarize(continuity_best),
+        "formal_best_objective": objective(formal_best),
+        "continuity_best_objective": objective(continuity_best),
+        "changed_regions": changed_regions,
+        "first_feasible_path": first_json,
+        "first_feasible_plot": first_png,
+        "formal_best_path": formal_json,
+        "formal_best_plot": formal_png,
+        "continuity_best_path": continuity_json,
+        "continuity_best_plot": continuity_png,
+        "attempt_trace": trace,
+        "polish_complete": polish_event,
+        "elapsed_seconds": round(total_seconds, 6),
+    }
+
+
 def full_run(W, M, S, source, mode, budget, seed, move_time=1):
     start = time.perf_counter()
     solution = solver.solve_cwp_bounded(
@@ -546,7 +697,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument(
-        "--experiment", choices=("prepare", "direct", "full", "both"),
+        "--experiment", choices=("prepare", "continuity", "direct", "full", "both"),
         default="both",
     )
     parser.add_argument("--instances", nargs="+", choices=tuple(INSTANCES), default=list(INSTANCES))
@@ -677,6 +828,20 @@ def main():
             source = source_candidate(
                 W, M, S, selected_source, move_time, args.allow_edge_exit
             )
+            if args.experiment == "continuity":
+                for budget in args.budgets:
+                    continuity_out = (
+                        args.out / "continuity_plots" / name
+                        / f"seed_{seed}" / f"budget_{budget:g}s"
+                    )
+                    item = continuity_run(
+                        W, M, S, source, budget, seed, continuity_out
+                    )
+                    item["instance"] = name
+                    item["input_sha256"] = sha256(input_path)
+                    item["source_sha256"] = sha256(selected_source)
+                    records.append(item)
+                continue
             if args.experiment in ("direct", "both"):
                 _, starts, configurations = solver._validate_input(W, M, S, move_time)
                 initial = solver._initial_configurations(W, starts, configurations)
