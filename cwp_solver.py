@@ -3543,6 +3543,8 @@ def _cumulative_local_trajectory_repair(
     move_time: int = 1,
     attempt_trace: list[dict[str, Any]] | None = None,
     continuity_output: dict[str, Any] | None = None,
+    *,
+    polish_after_first: bool = True,
 ) -> tuple[
     _CandidateSchedule | None, int, _CandidateSchedule, _CandidateSchedule | None
 ]:
@@ -3579,6 +3581,8 @@ def _cumulative_local_trajectory_repair(
                     "objective": list(shortened.objective_key),
                     "smoothness": list(_trajectory_smoothness(shortened, M)),
                 })
+        if not polish_after_first:
+            return shortened, prepared, first_feasible
         polish_started = time.perf_counter()
         trace_start = len(attempt_trace) if attempt_trace is not None else 0
         polish_result: dict[str, Any] = {}
@@ -3784,6 +3788,7 @@ def _cumulative_local_trajectory_repair_iterative(
     *,
     enable_descent: bool = True,
     enable_operational_repairs: bool = True,
+    preserve_horizon: bool = False,
 ) -> tuple[
     _CandidateSchedule | None, int, _CandidateSchedule, _CandidateSchedule | None
 ]:
@@ -3825,7 +3830,10 @@ def _cumulative_local_trajectory_repair_iterative(
     stop_reason = "deadline"
     descent_phase_deadline = min(
         deadline,
-        started + 0.70 * max(0.0, deadline - started),
+        # Borrow the quality reserve when no shorter horizon has been found;
+        # a difficult H-1 target should receive enough complete window rounds
+        # to be comparable with the former one-shot trajectory search.
+        started + 0.90 * max(0.0, deadline - started),
     )
 
     def add_pool(item: _CandidateSchedule) -> None:
@@ -3842,14 +3850,16 @@ def _cumulative_local_trajectory_repair_iterative(
         ))
         candidate_pool = candidate_pool[:16]
 
+    def preparation_score(item: _CandidateSchedule) -> tuple[int, ...]:
+        """Score a same-H state by its ability to lose the next row."""
+        return tuple(_shortening_potential(W, M, item)[0])
+
     def register(item: _CandidateSchedule, phase: str) -> None:
-        nonlocal formal_best, continuity_best, operational_best
+        nonlocal formal_best, continuity_best, operational_best, first_feasible
         if item.makespan not in first_by_h:
             first_by_h[item.makespan] = item
             if item.makespan < incumbent.makespan and first_feasible is None:
-                # The outer variable is assigned explicitly below because the
-                # helper's primary purpose is keeping the per-H history.
-                pass
+                first_feasible = item
             if attempt_trace is not None:
                 attempt_trace.append({
                     "phase": "first_feasible_by_h",
@@ -3980,26 +3990,76 @@ def _cumulative_local_trajectory_repair_iterative(
                     return shortened, best_prepared, evaluated, "window_shorten"
         return None, best_prepared, evaluated, "timeout_or_no_improvement"
 
+    legacy_seed_used = False
+    if (
+        enable_descent
+        and not preserve_horizon
+        and current.makespan > safe_lower_bound
+        and time.perf_counter() < descent_phase_deadline
+    ):
+        # The previous cumulative helper has already demonstrated that this
+        # exact source can reach H-1.  Use it only as a bounded first seed and
+        # stop it immediately after the first shortening; the new iterative
+        # orchestration then continues from that state toward lower horizons.
+        legacy_seed_used = True
+        legacy_shortened, legacy_evaluated, legacy_prepared, legacy_first = (
+            _cumulative_local_trajectory_repair(
+                W, M, starts, current, descent_phase_deadline, seed,
+                move_time=0, attempt_trace=attempt_trace,
+                continuity_output={}, polish_after_first=False,
+            )
+        )
+        evaluated_total += legacy_evaluated
+        if legacy_shortened is not None:
+            current = legacy_shortened
+            prepared = legacy_shortened
+            if legacy_first is not None and first_feasible is None:
+                first_feasible = legacy_first
+            register(legacy_shortened, "legacy_descent")
+            descent_history.append({
+                "round": round_index,
+                "source_horizons": [incumbent.makespan],
+                "target_horizon": incumbent.makespan - 1,
+                "result": "FOUND_LEGACY_SEED",
+                "horizon": legacy_shortened.makespan,
+                "objective": list(legacy_shortened.objective_key),
+                "evaluated": legacy_evaluated,
+                "elapsed_seconds": round(time.perf_counter() - started, 6),
+            })
+            round_index += 1
+        elif legacy_prepared is not None:
+            current = legacy_prepared
+            prepared = legacy_prepared
+            register(legacy_prepared, "legacy_preparation")
+
     if not enable_descent:
         stop_reason = "descent_disabled"
+    elif preserve_horizon:
+        stop_reason = "preserve_horizon"
     else:
         while (
             time.perf_counter() < descent_phase_deadline
             and current.makespan > safe_lower_bound
         ):
-            sources = sorted(
+            source_pool = sorted(
                 candidate_pool,
                 key=lambda item: (
                     item.makespan,
                     item.objective_key,
                     _operational_rank(item, M),
                 ),
-            )[:4]
+            )
+            # One source gets a complete round.  Dividing a 20-second round
+            # across all elite alternatives made each of the 48 bounded
+            # windows too short to reproduce the old trajectory search.
+            sources = [
+                source_pool[round_index % len(source_pool)]
+            ] if source_pool else [current]
             remaining = descent_phase_deadline - time.perf_counter()
             round_deadline = min(
                 descent_phase_deadline,
                 time.perf_counter() + max(
-                    0.20, min(20.0, remaining / max(1, len(sources)))
+                    0.20, min(20.0, remaining)
                 ),
             )
             found = None
@@ -4013,29 +4073,37 @@ def _cumulative_local_trajectory_repair_iterative(
                     source, round_deadline, source_index
                 )
                 round_evaluated += evaluated
-                if prepared_candidate.objective_key < best_prepared.objective_key:
+                if preparation_score(prepared_candidate) < preparation_score(best_prepared):
                     best_prepared = prepared_candidate
                 if proposed is not None and proposed.makespan < source.makespan:
                     found = proposed
                     break
             evaluated_total += round_evaluated
-            if best_prepared.makespan < current.makespan:
+            preparation_progress = (
+                best_prepared.makespan < current.makespan
+                or preparation_score(best_prepared) < preparation_score(current)
+            )
+            if preparation_progress:
                 current = best_prepared
                 prepared = best_prepared
                 register(current, "preparation")
             if found is None:
-                stale_rounds += 1
+                stale_rounds = 0 if preparation_progress else stale_rounds + 1
                 descent_history.append({
                     "round": round_index,
                     "source_horizons": [item.makespan for item in sources],
                     "target_horizon": min((item.makespan for item in sources), default=current.makespan) - 1,
-                    "result": "NO_IMPROVEMENT",
+                    "result": "PREPARED_NO_SHORTENING" if preparation_progress else "NO_IMPROVEMENT",
                     "reason": reason,
                     "evaluated": round_evaluated,
                     "elapsed_seconds": round(time.perf_counter() - started, 6),
                 })
                 round_index += 1
-                if stale_rounds >= 3:
+                # A bounded local round can legitimately fail while a later
+                # window or random continuation succeeds.  Do not hand the
+                # majority of the deadline to polishing after only a few
+                # misses; leave early only after a long, recorded plateau.
+                if stale_rounds >= 20:
                     stop_reason = "descent_stalled"
                     break
                 continue
@@ -4095,7 +4163,36 @@ def _cumulative_local_trajectory_repair_iterative(
             "safe_workload_lower_bound": safe_lower_bound,
             "horizons_seen": sorted(first_by_h),
             "descent_rounds": len(descent_history),
+            "legacy_seed_used": legacy_seed_used,
+            "preserve_horizon": preserve_horizon,
         })
+    aggregate_stats = {
+        "generated": 0,
+        "unique_complete": 0,
+        "deduplicated": 0,
+        "capacity_rejected": 0,
+        "safety_rejected": 0,
+        "decoded": 0,
+        "verified": 0,
+        "accepted": 0,
+        "formal_improvements": 0,
+        "operational_improvements": 0,
+        "operator": {},
+    }
+    if continuity_output is not None:
+        for run in continuity_output.get("polish_runs", []):
+            stats = run.get("stats") or {}
+            for key in aggregate_stats:
+                if key == "operator":
+                    continue
+                if isinstance(stats.get(key), int):
+                    aggregate_stats[key] += stats[key]
+            for name, values in (stats.get("operator") or {}).items():
+                destination = aggregate_stats["operator"].setdefault(name, {})
+                for key, value in values.items():
+                    if isinstance(value, int):
+                        destination[key] = destination.get(key, 0) + value
+        aggregate_stats["polish_runs"] = len(continuity_output.get("polish_runs", []))
     if continuity_output is not None:
         continuity_output.update({
             "formal_best": formal_best,
@@ -4110,6 +4207,7 @@ def _cumulative_local_trajectory_repair_iterative(
             ],
             "safe_workload_lower_bound": safe_lower_bound,
             "descent_rounds": len(descent_history),
+            "stats": aggregate_stats,
         })
     return (
         formal_best if first_feasible is not None else None,

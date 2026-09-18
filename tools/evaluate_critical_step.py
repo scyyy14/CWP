@@ -207,6 +207,7 @@ def direct_run(
             continuity_output=continuity_output,
             enable_descent=enable_descent,
             enable_operational_repairs=enable_operational_repairs,
+            preserve_horizon=preserve_horizon,
         )
         formal_best = continuity_output.get("formal_best", candidate)
         continuity_best = continuity_output.get("continuity_best", candidate)
