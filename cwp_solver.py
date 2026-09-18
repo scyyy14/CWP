@@ -244,6 +244,194 @@ def _trajectory_smoothness(
     )
 
 
+def _continuity_diagnostics(
+    candidate: _CandidateSchedule,
+    M: int,
+) -> dict[str, Any]:
+    """Describe real work fragmentation and crane revisits.
+
+    ``_trajectory_smoothness`` is intentionally retained as the historical
+    compatibility metric.  It only counts short work visits, however, so it
+    cannot see a seven-period return or the same crane doing one bay at the
+    beginning and again at the end.  This report works on the complete
+    absolute-time schedule and distinguishes work visits from idle/yielding
+    visits.
+    """
+    if candidate.makespan < 0:
+        raise ValueError("candidate.makespan 必须是非负整数。")
+    horizon = candidate.makespan
+    work_by_time_crane: dict[tuple[int, int], int] = {}
+    work_times_by_bay: list[list[int]] = [[] for _ in candidate.owners]
+    work_slots_by_bay: list[list[tuple[int, int]]] = [
+        [] for _ in candidate.owners
+    ]
+    for slot in candidate.slots:
+        if slot.state != "work" or slot.work_bay is None:
+            continue
+        q = slot.crane - 1
+        bay = int(slot.work_bay)
+        if 0 <= slot.time < horizon and 0 <= q < M and 1 <= bay <= len(candidate.owners):
+            work_by_time_crane[(slot.time, q)] = bay
+            work_times_by_bay[bay - 1].append(slot.time)
+            work_slots_by_bay[bay - 1].append((slot.time, q))
+
+    def interval_records(times: Sequence[int], bay: int) -> list[dict[str, Any]]:
+        if not times:
+            return []
+        unique = sorted(set(times))
+        records: list[dict[str, Any]] = []
+        start = previous = unique[0]
+        for value in unique[1:] + [None]:
+            if value is not None and value == previous + 1:
+                previous = value
+                continue
+            end = previous + 1
+            owners = sorted(
+                q + 1
+                for t, q in work_slots_by_bay[bay - 1]
+                if start <= t < end
+            )
+            records.append({
+                "bay": bay,
+                "start": start,
+                "end_exclusive": end,
+                "length": end - start,
+                "work_count": end - start,
+                "cranes": sorted(set(owners)),
+            })
+            if value is not None:
+                start = previous = value
+        return records
+
+    work_blocks_by_bay: dict[str, list[dict[str, Any]]] = {}
+    bay_gaps_by_bay: dict[str, list[dict[str, Any]]] = {}
+    bay_fragmentation = 0
+    for bay, times in enumerate(work_times_by_bay, 1):
+        blocks = interval_records(times, bay)
+        work_blocks_by_bay[str(bay)] = blocks
+        bay_fragmentation += max(0, len(blocks) - 1)
+        gaps: list[dict[str, Any]] = []
+        for left, right in zip(blocks, blocks[1:]):
+            if right["start"] > left["end_exclusive"]:
+                gaps.append({
+                    "start": left["end_exclusive"],
+                    "end_exclusive": right["start"],
+                    "length": right["start"] - left["end_exclusive"],
+                })
+        bay_gaps_by_bay[str(bay)] = gaps
+
+    if candidate.move_time == 0:
+        rows = _candidate_position_rows(candidate, M)
+    else:
+        # The detailed continuity search is defined for instantaneous moves.
+        # Keep the report useful for other callers without pretending that a
+        # fractional move is a work position.
+        rows = [
+            [int(slot.start_bay) for slot in sorted(
+                (item for item in candidate.slots if item.time == t),
+                key=lambda item: item.crane,
+            )]
+            for t in range(horizon)
+        ]
+
+    crane_position_blocks: list[dict[str, Any]] = []
+    crane_work_revisits: list[dict[str, Any]] = []
+    pure_yielding_revisits: list[dict[str, Any]] = []
+    position_revisit_count = 0
+    work_revisit_count = 0
+    for q in range(M):
+        if not rows or len(rows[0]) <= q:
+            continue
+        blocks: list[dict[str, Any]] = []
+        start = 0
+        while start < horizon:
+            position = rows[start][q]
+            end = start + 1
+            while end < horizon and rows[end][q] == position:
+                end += 1
+            work_bays = sorted({
+                work_by_time_crane[(t, q)]
+                for t in range(start, end)
+                if (t, q) in work_by_time_crane
+            })
+            block = {
+                "crane": q + 1,
+                "start": start,
+                "end_exclusive": end,
+                "length": end - start,
+                "position": position,
+                "work_count": sum(
+                    (t, q) in work_by_time_crane for t in range(start, end)
+                ),
+                "work_bays": work_bays,
+                "state": "work" if work_bays else "idle_or_offrail",
+            }
+            blocks.append(block)
+            start = end
+        crane_position_blocks.extend(blocks)
+        seen_work: dict[int, dict[str, Any]] = {}
+        seen_any: dict[int, dict[str, Any]] = {}
+        for block in blocks:
+            position = int(block["position"])
+            previous_any = seen_any.get(position)
+            if previous_any is not None:
+                position_revisit_count += 1
+                if not block["work_count"]:
+                    pure_yielding_revisits.append({
+                        "crane": q + 1,
+                        "position": position,
+                        "start": block["start"],
+                        "end_exclusive": block["end_exclusive"],
+                        "length": block["length"],
+                        "previous_block": {
+                            "start": previous_any["start"],
+                            "end_exclusive": previous_any["end_exclusive"],
+                        },
+                    })
+            if block["work_count"]:
+                previous_work = seen_work.get(position)
+                if previous_work is not None:
+                    work_revisit_count += 1
+                    crane_work_revisits.append({
+                        "crane": q + 1,
+                        "bay": position,
+                        "start": block["start"],
+                        "end_exclusive": block["end_exclusive"],
+                        "length": block["length"],
+                        "work_count": block["work_count"],
+                        "previous_block": {
+                            "start": previous_work["start"],
+                            "end_exclusive": previous_work["end_exclusive"],
+                            "length": previous_work["length"],
+                            "work_count": previous_work["work_count"],
+                        },
+                    })
+                seen_work[position] = block
+            seen_any[position] = block
+
+    return {
+        "bay_fragmentation": bay_fragmentation,
+        "work_blocks_by_bay": work_blocks_by_bay,
+        "bay_gaps_by_bay": bay_gaps_by_bay,
+        "crane_position_blocks": crane_position_blocks,
+        "position_revisit_count": position_revisit_count,
+        "work_revisit_count": work_revisit_count,
+        "crane_work_revisits": crane_work_revisits,
+        "pure_yielding_revisits": pure_yielding_revisits,
+        "movement_count": candidate.movement_count,
+        "reversal_count": candidate.reversal_count,
+        "load_deviation": candidate.load_deviation,
+        "short_excursion": list(_trajectory_smoothness(candidate, M)),
+        "continuity_key": [
+            work_revisit_count,
+            bay_fragmentation,
+            candidate.reversal_count,
+            candidate.movement_count,
+            candidate.load_deviation,
+        ],
+    }
+
+
 def _candidate_passes_independent_verifier(
     W: Sequence[int],
     M: int,
@@ -378,6 +566,262 @@ def _trajectory_segment_neighbors(
         add("split_bay_simplify", changed)
 
     return proposals
+
+
+def _history_diff_regions(
+    before: Sequence[tuple[int, ...]],
+    after: Sequence[tuple[int, ...]],
+) -> list[dict[str, Any]]:
+    """Return contiguous changed rows, grouped by crane.
+
+    The records are deliberately expressed in absolute position-row indices so
+    a caller can verify the local-window contract without looking at a plot.
+    """
+    if len(before) != len(after):
+        raise ValueError("轨迹提案的时间轴长度不能改变。")
+    regions: list[dict[str, Any]] = []
+    width = len(before[0]) if before else 0
+    for q in range(width):
+        changed = [
+            t for t, (left, right) in enumerate(zip(before, after))
+            if left[q] != right[q]
+        ]
+        start = 0
+        while start < len(changed):
+            end = start
+            while end + 1 < len(changed) and changed[end + 1] == changed[end] + 1:
+                end += 1
+            first = changed[start]
+            last = changed[end] + 1
+            regions.append({
+                "crane": q + 1,
+                "start": first,
+                "end_exclusive": last,
+                "length": last - first,
+                "changed_rows": list(range(first, last)),
+            })
+            start = end + 1
+    return regions
+
+
+def _continuity_block_neighbors(
+    W: Sequence[int],
+    M: int,
+    candidate: _CandidateSchedule,
+    max_candidates: int = 128,
+) -> list[tuple[str, list[tuple[int, ...]]]]:
+    """Generate fixed-H work-block proposals with fair operator quotas.
+
+    Every proposal edits one bounded block or an explicitly paired set of
+    bounded blocks.  The decoder is responsible for assigning work/idle at
+    the resulting positions; this function never edits or deletes a slot.
+    """
+    if candidate.move_time != 0 or candidate.makespan < 2:
+        return []
+    rows = [tuple(row) for row in _candidate_position_rows(candidate, M)]
+    horizon = candidate.makespan
+    work_at = {
+        (slot.time, slot.crane - 1): int(slot.work_bay)
+        for slot in candidate.slots
+        if slot.state == "work" and slot.work_bay is not None
+        and 0 <= slot.time < horizon
+    }
+    proposals: list[tuple[str, list[tuple[int, ...]]]] = []
+    seen: set[tuple[tuple[int, ...], ...]] = {tuple(rows)}
+    quotas = {
+        "revisit_work_exchange": 48,
+        "early_residual_completion": 32,
+        "idle_completion_hold": 24,
+        "adjacent_relay_batch": 32,
+    }
+    generated_by_operator = {name: 0 for name in quotas}
+
+    def add(name: str, changed: list[list[int]]) -> None:
+        if name not in quotas or generated_by_operator[name] >= quotas[name]:
+            return
+        history = tuple(tuple(row) for row in changed)
+        if history in seen:
+            return
+        if len(proposals) >= max_candidates:
+            return
+        seen.add(history)
+        generated_by_operator[name] += 1
+        proposals.append((name, [tuple(row) for row in changed]))
+
+    def candidate_lengths(values: Sequence[int]) -> list[int]:
+        usable = sorted({int(value) for value in values if int(value) > 0})
+        return [value for value in (1, 2, 3, 4, 7, 8) if value in usable]
+
+    def position_blocks(q: int) -> list[dict[str, Any]]:
+        blocks: list[dict[str, Any]] = []
+        start = 0
+        while start < horizon:
+            position = rows[start][q]
+            end = start + 1
+            while end < horizon and rows[end][q] == position:
+                end += 1
+            blocks.append({
+                "start": start,
+                "end": end,
+                "position": position,
+                "length": end - start,
+                "work_count": sum((t, q) in work_at for t in range(start, end)),
+            })
+            start = end
+        return blocks
+
+    def safe_replacements(
+        q: int,
+        times: Sequence[int],
+        excluded: int,
+    ) -> list[int]:
+        """Find one common on-rail replacement safe in every edited row."""
+        if not times:
+            return []
+        preferred = [
+            rows[times[0] - 1][q] if times[0] > 0 else excluded,
+            1 + 2 * q,
+            len(W) - 2 * (M - q - 1),
+        ]
+        candidates = list(dict.fromkeys([
+            *preferred,
+            *range(1, len(W) + 1),
+        ]))
+        result: list[int] = []
+        for target in candidates:
+            if target == excluded or not 1 <= target <= len(W):
+                continue
+            if all(
+                all(
+                    other_q == q or abs(target - rows[t][other_q]) >= 2
+                    for other_q in range(M)
+                )
+                for t in times
+            ):
+                result.append(target)
+        return result
+
+    # A repeated work position can often exchange complete units between an
+    # early block and a later block.  The two changed regions stay bounded:
+    # the early block is returned to its predecessor and the later block is
+    # extended backwards into the intervening block.
+    for q in range(M):
+        blocks = position_blocks(q)
+        for left_index, left in enumerate(blocks):
+            if not left["work_count"] or left["start"] <= 0:
+                continue
+            for right in blocks[left_index + 1:]:
+                if right["position"] != left["position"] or not right["work_count"]:
+                    continue
+                gap = right["start"] - left["end"]
+                predecessor = rows[left["start"] - 1][q]
+                if gap <= 0 or predecessor == left["position"]:
+                    continue
+                lengths = candidate_lengths((left["length"], gap, right["length"]))
+                for length in lengths:
+                    changed = [list(row) for row in rows]
+                    for t in range(left["start"], left["start"] + length):
+                        changed[t][q] = predecessor
+                    for t in range(right["start"] - length, right["start"]):
+                        changed[t][q] = left["position"]
+                    add("revisit_work_exchange", changed)
+
+    # When the first block leaves a small amount of work for a distant return,
+    # move the same number of capacity slots to the beginning and give the
+    # late block back to the position it came from.  This is the generalized
+    # form of the Q1/bay-2 pattern; no bay or crane identity is hard-coded.
+    for q in range(M):
+        blocks = position_blocks(q)
+        for left_index, left in enumerate(blocks):
+            if left["start"] != 0 or not left["work_count"]:
+                continue
+            for right in blocks[left_index + 1:]:
+                if right["position"] != left["position"] or not right["work_count"]:
+                    continue
+                if left_index + 1 >= len(blocks):
+                    continue
+                next_block = blocks[left_index + 1]
+                available_early = next_block["length"]
+                available_late = right["length"]
+                for length in candidate_lengths((available_early, available_late)):
+                    late_times = list(range(right["end"] - length, right["end"]))
+                    for replacement in safe_replacements(
+                        q, late_times, left["position"]
+                    ):
+                        changed = [list(row) for row in rows]
+                        for t in range(left["end"], left["end"] + length):
+                            changed[t][q] = left["position"]
+                        for t in late_times:
+                            changed[t][q] = replacement
+                        add("early_residual_completion", changed)
+
+    # A completed crane may have a short, work-free terminal visit.  Holding
+    # its preceding position is safe only as a candidate proposal; the full
+    # verifier still checks every row and the work decoder checks capacity.
+    for q in range(M):
+        blocks = position_blocks(q)
+        if len(blocks) < 2:
+            continue
+        final = blocks[-1]
+        previous = blocks[-2]
+        if final["work_count"] or final["length"] > 8:
+            continue
+        if final["position"] == previous["position"]:
+            continue
+        changed = [list(row) for row in rows]
+        for t in range(final["start"], final["end"]):
+            changed[t][q] = previous["position"]
+        add("idle_completion_hold", changed)
+
+    # Apply the same bounded boundary shift to adjacent cranes.  This is a
+    # relay proposal, not an unconstrained global re-layout.
+    for t in range(1, horizon):
+        for q in range(M - 1):
+            if rows[t - 1][q] == rows[t][q] or rows[t - 1][q + 1] == rows[t][q + 1]:
+                continue
+            changed = [list(row) for row in rows]
+            changed[t][q] = rows[t - 1][q]
+            changed[t][q + 1] = rows[t - 1][q + 1]
+            add("adjacent_relay_batch", changed)
+
+    # Rotate operators rather than returning a fixed prefix.  This preserves
+    # the quota guarantee even if one family generates many duplicates.
+    by_name: dict[str, list[tuple[str, list[tuple[int, ...]]]]] = {}
+    for item in proposals:
+        by_name.setdefault(item[0], []).append(item)
+    ordered: list[tuple[str, list[tuple[int, ...]]]] = []
+    names = list(quotas)
+    index = 0
+    while any(by_name.get(name) for name in names):
+        name = names[index % len(names)]
+        if by_name.get(name):
+            ordered.append(by_name[name].pop(0))
+        index += 1
+    return ordered[:max_candidates]
+
+
+def _continuity_rank(
+    candidate: _CandidateSchedule,
+    M: int,
+) -> tuple[int, int, int, int, int]:
+    """Rank a candidate only after the formal acceptance constraints pass."""
+    report = _continuity_diagnostics(candidate, M)
+    return tuple(int(value) for value in report["continuity_key"])
+
+
+def _trajectory_signature(candidate: _CandidateSchedule) -> tuple[Any, ...]:
+    """Joint position/work signature used to deduplicate candidate pools."""
+    return tuple(
+        (
+            slot.time,
+            slot.crane,
+            slot.state,
+            slot.start_bay,
+            slot.end_bay,
+            slot.work_bay,
+        )
+        for slot in candidate.slots
+    )
 
 
 def _shortening_potential(
@@ -1882,6 +2326,7 @@ def _candidate_from_history(
     M: int,
     history: Sequence[tuple[int, ...]],
     move_time: int = 1,
+    preserve_horizon: bool = False,
 ) -> _CandidateSchedule:
     """Decode a configuration path using the configured relocation duration.
 
@@ -1890,6 +2335,11 @@ def _candidate_from_history(
     are expanded into that many unit slots; positions during a simultaneous
     move are linearly interpolated, which preserves crane order and the
     two-bay separation whenever both endpoint configurations are safe.
+
+    With ``preserve_horizon=True`` a zero-time history keeps every absolute
+    time row, including rows where every crane is idle.  The older decoder
+    intentionally removed such rows while searching for a shorter makespan;
+    that behavior is not safe for fixed-H continuity proposals.
     """
     if isinstance(move_time, bool) or not isinstance(move_time, int) or move_time < 0:
         raise ValueError("move_time 必须是非负整数。")
@@ -1915,7 +2365,7 @@ def _candidate_from_history(
                 1 <= bay <= len(W) and remaining[int(bay) - 1] > 0
                 for bay in positions
             ]
-            if not any(work_here):
+            if not any(work_here) and not preserve_horizon:
                 continue
             for q, bay in enumerate(positions):
                 if work_here[q]:
@@ -2447,84 +2897,191 @@ def _refine_same_horizon_trajectory(
     *,
     move_time: int = 0,
     attempt_trace: list[dict[str, Any]] | None = None,
+    continuity: bool = False,
+    result_box: dict[str, Any] | None = None,
 ) -> tuple[_CandidateSchedule, int]:
     """Polish a complete shortened trajectory without changing its horizon.
 
     The first feasible H-1 trajectory is valuable evidence, but it is not
     necessarily operationally smooth.  Reuse the bounded local trajectory
-    operator on the remaining budget, prioritizing windows containing short
-    ``A -> B -> A`` work visits.  A candidate with the same formal objective
-    is accepted only when its smoothness key improves.
+    operator on the remaining budget, prioritizing windows containing real
+    work revisits.  ``continuity=True`` additionally enables paired fixed-H
+    block exchanges and keeps formal and continuity candidates separately.
+    The formal objective is never silently replaced by the continuity rank.
     """
     if move_time != 0 or candidate.move_time != 0:
         return candidate, 0
     if not _candidate_passes_independent_verifier(W, M, starts, candidate):
         raise ValueError("trajectory 平滑阶段收到非法的首个可行方案。")
     best = candidate
+    formal_best = candidate
+    continuity_best = candidate
+    baseline = candidate
     evaluated_total = 0
+    polish_started_at = time.perf_counter()
     cycle = 0
     stale_cycles = 0
-    while time.perf_counter() < deadline and cycle < 6 and stale_cycles < 2:
+    pool: dict[tuple[Any, ...], _CandidateSchedule] = {
+        _trajectory_signature(candidate): candidate
+    }
+    operator_stats: dict[str, dict[str, int]] = {}
+    continuity_stats = {
+        "generated": 0,
+        "deduplicated": 0,
+        "capacity_rejected": 0,
+        "safety_rejected": 0,
+        "decoded": 0,
+        "verified": 0,
+        "accepted": 0,
+        "time_seconds": 0.0,
+        "operator": operator_stats,
+    }
+    stop_reason = "deadline"
+
+    def operator_counter(name: str) -> dict[str, int]:
+        return operator_stats.setdefault(name, {
+            "generated": 0,
+            "deduplicated": 0,
+            "capacity_rejected": 0,
+            "safety_rejected": 0,
+            "decoded": 0,
+            "verified": 0,
+            "accepted": 0,
+        })
+
+    def continuity_allowed(proposed: _CandidateSchedule) -> bool:
+        return (
+            proposed.makespan == baseline.makespan
+            and proposed.split_bay_count <= baseline.split_bay_count
+            and proposed.movement_count <= baseline.movement_count
+        )
+
+    def record_candidate(
+        proposed: _CandidateSchedule | None,
+        operator: str,
+        before_key: tuple[int, int, int, int],
+        before_smoothness: tuple[int, int, int],
+        cycle_number: int,
+        segment_index: int,
+        before_history: Sequence[tuple[int, ...]],
+        decode_failed: bool = False,
+    ) -> tuple[bool, bool]:
+        """Validate and consider one proposal; return (accepted, legal)."""
+        nonlocal best, formal_best, continuity_best, evaluated_total
+        counter = operator_counter(operator)
+        counter["generated"] += 1
+        continuity_stats["generated"] += 1
+        candidate_found = proposed is not None
+        candidate_legal = proposed is not None and (
+            proposed.makespan == best.makespan
+            and _candidate_passes_independent_verifier(W, M, starts, proposed)
+        )
+        if decode_failed:
+            counter["capacity_rejected"] += 1
+            continuity_stats["capacity_rejected"] += 1
+        if proposed is not None:
+            counter["decoded"] += 1
+            continuity_stats["decoded"] += 1
+        if not candidate_legal:
+            if proposed is not None:
+                counter["safety_rejected"] += 1
+                continuity_stats["safety_rejected"] += 1
+            proposed = None
+        else:
+            counter["verified"] += 1
+            continuity_stats["verified"] += 1
+        accepted = False
+        if proposed is not None:
+            signature = _trajectory_signature(proposed)
+            if signature in pool:
+                counter["deduplicated"] += 1
+                continuity_stats["deduplicated"] += 1
+            else:
+                if len(pool) < 16:
+                    pool[signature] = proposed
+                formal_improvement = proposed.objective_key < formal_best.objective_key
+                formal_tie_smoother = (
+                    proposed.objective_key == before_key
+                    and _trajectory_smoothness(proposed, M) < before_smoothness
+                )
+                continuity_improvement = (
+                    continuity
+                    and continuity_allowed(proposed)
+                    and _continuity_rank(proposed, M) < _continuity_rank(continuity_best, M)
+                )
+                accepted = formal_improvement or formal_tie_smoother or continuity_improvement
+                if formal_improvement:
+                    formal_best = proposed
+                if continuity and continuity_allowed(proposed) and (
+                    _continuity_rank(proposed, M) < _continuity_rank(continuity_best, M)
+                ):
+                    continuity_best = proposed
+                if accepted:
+                    best = proposed
+                    counter["accepted"] += 1
+                    continuity_stats["accepted"] += 1
+        if attempt_trace is not None:
+            attempt_trace.append({
+                "cycle": cycle_number,
+                "segment_index": segment_index,
+                "operator": operator,
+                "chain": None,
+                "window": None,
+                "phase": "polish",
+                "evaluated": 1,
+                "candidate_found": candidate_found,
+                "candidate_legal": candidate_legal,
+                "accepted": accepted,
+                "before_objective": list(before_key),
+                "before_smoothness": list(before_smoothness),
+                "after_objective": (
+                    list(proposed.objective_key) if accepted else None
+                ),
+                "after_continuity": (
+                    list(_continuity_rank(proposed, M)) if accepted else None
+                ),
+                "changed_regions": (
+                    _history_diff_regions(
+                        before_history,
+                        _candidate_position_rows(proposed, M),
+                    ) if accepted and proposed is not None else []
+                ),
+            })
+        return accepted, candidate_legal
+
+    while time.perf_counter() < deadline and stale_cycles < 2:
         # Deterministic block operators get first refusal.  They are cheap,
         # explainable proposals and are the primary way to remove short
         # hand-offs without relying on isolated random cell edits.
         progress = False
-        segment_proposals = _trajectory_segment_neighbors(
-            W, M, starts, best
-        )
+        segment_proposals = _trajectory_segment_neighbors(W, M, starts, best)
+        if continuity:
+            segment_proposals.extend(
+                _continuity_block_neighbors(W, M, best)
+            )
         for segment_index, (operator, history) in enumerate(segment_proposals):
             if time.perf_counter() >= deadline:
                 break
             before_key = best.objective_key
             before_smoothness = _trajectory_smoothness(best, M)
+            before_history = [
+                tuple(row) for row in _candidate_position_rows(best, M)
+            ]
             evaluated = 1
             evaluated_total += evaluated
             try:
-                proposed = _candidate_from_history(W, M, history, move_time)
+                proposed = _candidate_from_history(
+                    W, M, history, move_time, preserve_horizon=True
+                )
             except RuntimeError:
                 proposed = None
-            candidate_found = proposed is not None
-            candidate_legal = proposed is not None and (
-                proposed.makespan == best.makespan
-                and _candidate_passes_independent_verifier(
-                    W, M, starts, proposed
-                )
+            accepted, _ = record_candidate(
+                proposed, operator, before_key, before_smoothness,
+                cycle, segment_index, before_history,
+                decode_failed=proposed is None,
             )
-            if not candidate_legal:
-                proposed = None
-            accepted = proposed is not None and (
-                proposed.objective_key < before_key
-                or (
-                    proposed.objective_key == before_key
-                    and _trajectory_smoothness(proposed, M) < before_smoothness
-                )
-            )
-            if attempt_trace is not None:
-                attempt_trace.append({
-                    "cycle": cycle,
-                    "segment_index": segment_index,
-                    "operator": operator,
-                    "chain": None,
-                    "window": None,
-                    "phase": "polish",
-                    "evaluated": evaluated,
-                    "candidate_found": candidate_found,
-                    "candidate_legal": candidate_legal,
-                    "accepted": accepted,
-                    "before_objective": list(before_key),
-                    "before_smoothness": list(before_smoothness),
-                    "after_objective": (
-                        list(proposed.objective_key) if accepted else None
-                    ),
-                    "after_smoothness": (
-                        list(_trajectory_smoothness(proposed, M))
-                        if accepted else None
-                    ),
-                })
             if accepted:
-                best = proposed
                 progress = True
-                break
         if progress:
             stale_cycles = 0
             cycle += 1
@@ -2557,6 +3114,9 @@ def _refine_same_horizon_trajectory(
             )
             before_key = best.objective_key
             before_smoothness = _trajectory_smoothness(best, M)
+            before_history = [
+                tuple(row) for row in _candidate_position_rows(best, M)
+            ]
             proposed, evaluated = _trajectory_repair(
                 W, M, starts, best, slice_deadline,
                 seed + cycle * 1009 + index,
@@ -2576,36 +3136,11 @@ def _refine_same_horizon_trajectory(
             )
             if not candidate_legal:
                 proposed = None
-            accepted = proposed is not None and (
-                proposed.objective_key < before_key
-                or (
-                    proposed.objective_key == before_key
-                    and _trajectory_smoothness(proposed, M) < before_smoothness
-                )
+            accepted, _ = record_candidate(
+                proposed, f"random_window_{index}", before_key,
+                before_smoothness, cycle, index, before_history,
             )
-            if attempt_trace is not None:
-                attempt_trace.append({
-                    "cycle": cycle,
-                    "window_index": index,
-                    "chain": list(chain),
-                    "window": list(window),
-                    "phase": "polish",
-                    "evaluated": evaluated,
-                    "candidate_found": candidate_found,
-                    "candidate_legal": candidate_legal,
-                    "accepted": accepted,
-                    "before_objective": list(before_key),
-                    "before_smoothness": list(before_smoothness),
-                    "after_objective": (
-                        list(proposed.objective_key) if accepted else None
-                    ),
-                    "after_smoothness": (
-                        list(_trajectory_smoothness(proposed, M))
-                        if accepted else None
-                    ),
-                })
             if accepted:
-                best = proposed
                 progress = True
                 break
         if progress:
@@ -2613,7 +3148,37 @@ def _refine_same_horizon_trajectory(
         else:
             stale_cycles += 1
         cycle += 1
-    return best, evaluated_total
+    if time.perf_counter() >= deadline:
+        stop_reason = "deadline"
+    elif stale_cycles >= 2:
+        stop_reason = "stalled_after_operator_rounds"
+    elif not _critical_repair_windows(best, M):
+        stop_reason = "no_windows"
+    result = best
+    if continuity:
+        # A continuity candidate with the same formal key is safe to return;
+        # otherwise the official formal candidate remains the result.
+        if (
+            continuity_best.objective_key == formal_best.objective_key
+            and _continuity_rank(continuity_best, M)
+            <= _continuity_rank(formal_best, M)
+        ):
+            result = continuity_best
+        else:
+            result = formal_best
+    continuity_stats["time_seconds"] = round(
+        max(0.0, time.perf_counter() - polish_started_at),
+        6,
+    )
+    if result_box is not None:
+        result_box.update({
+            "formal_best": formal_best,
+            "continuity_best": continuity_best,
+            "pool_size": len(pool),
+            "stats": continuity_stats,
+            "stop_reason": stop_reason,
+        })
+    return result, evaluated_total
 
 
 def _cumulative_local_trajectory_repair(
@@ -2625,6 +3190,7 @@ def _cumulative_local_trajectory_repair(
     seed: int,
     move_time: int = 1,
     attempt_trace: list[dict[str, Any]] | None = None,
+    continuity_output: dict[str, Any] | None = None,
 ) -> tuple[
     _CandidateSchedule | None, int, _CandidateSchedule, _CandidateSchedule | None
 ]:
@@ -2663,11 +3229,16 @@ def _cumulative_local_trajectory_repair(
                 })
         polish_started = time.perf_counter()
         trace_start = len(attempt_trace) if attempt_trace is not None else 0
+        polish_result: dict[str, Any] = {}
         polished, polish_evaluated = _refine_same_horizon_trajectory(
             W, M, starts, first_feasible, deadline,
             seed + 700_001, move_time=move_time,
             attempt_trace=attempt_trace,
+            continuity=True,
+            result_box=polish_result,
         )
+        if continuity_output is not None:
+            continuity_output.update(polish_result)
         evaluated_total += polish_evaluated
         polish_trace = (
             attempt_trace[trace_start:]
@@ -2696,6 +3267,17 @@ def _cumulative_local_trajectory_repair(
                 "polish_legal_improvements": polish_legal_improvements,
                 "objective": list(polished.objective_key),
                 "smoothness": list(_trajectory_smoothness(polished, M)),
+                "formal_best_objective": list(
+                    polish_result["formal_best"].objective_key
+                ) if polish_result.get("formal_best") is not None else None,
+                "continuity_best_objective": list(
+                    polish_result["continuity_best"].objective_key
+                ) if polish_result.get("continuity_best") is not None else None,
+                "continuity_best_rank": list(
+                    _continuity_rank(polish_result["continuity_best"], M)
+                ) if polish_result.get("continuity_best") is not None else None,
+                "continuity_operator_stats": polish_result.get("stats"),
+                "continuity_stop_reason": polish_result.get("stop_reason"),
             })
         return polished, prepared, first_feasible
 
@@ -2827,7 +3409,8 @@ def _cumulative_local_trajectory_repair(
                         "accepted": shortened is not None,
                     })
                 if shortened is not None:
-                    return shortened, evaluated_total, current
+                    polished, prepared, first = polish_and_return(shortened, current)
+                    return polished, evaluated_total, prepared, first
         if progress:
             stale_cycles = 0
         else:
