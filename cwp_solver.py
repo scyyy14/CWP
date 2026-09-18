@@ -609,7 +609,10 @@ def _continuity_block_neighbors(
     M: int,
     candidate: _CandidateSchedule,
     max_candidates: int = 128,
-) -> list[tuple[str, list[tuple[int, ...]]]]:
+    return_details: bool = False,
+) -> list[tuple[str, list[tuple[int, ...]]] | tuple[
+    str, list[tuple[int, ...]], list[dict[str, Any]]
+]]:
     """Generate fixed-H work-block proposals with fair operator quotas.
 
     Every proposal edits one bounded block or an explicitly paired set of
@@ -626,7 +629,7 @@ def _continuity_block_neighbors(
         if slot.state == "work" and slot.work_bay is not None
         and 0 <= slot.time < horizon
     }
-    proposals: list[tuple[str, list[tuple[int, ...]]]] = []
+    proposals: list[tuple[str, list[tuple[int, ...]], list[dict[str, Any]]]] = []
     seen: set[tuple[tuple[int, ...], ...]] = {tuple(rows)}
     quotas = {
         "revisit_work_exchange": 48,
@@ -636,7 +639,11 @@ def _continuity_block_neighbors(
     }
     generated_by_operator = {name: 0 for name in quotas}
 
-    def add(name: str, changed: list[list[int]]) -> None:
+    def add(
+        name: str,
+        changed: list[list[int]],
+        declared_regions: list[dict[str, Any]] | None = None,
+    ) -> None:
         if name not in quotas or generated_by_operator[name] >= quotas[name]:
             return
         history = tuple(tuple(row) for row in changed)
@@ -646,7 +653,11 @@ def _continuity_block_neighbors(
             return
         seen.add(history)
         generated_by_operator[name] += 1
-        proposals.append((name, [tuple(row) for row in changed]))
+        proposals.append((
+            name,
+            [tuple(row) for row in changed],
+            declared_regions or _history_diff_regions(rows, history),
+        ))
 
     def candidate_lengths(values: Sequence[int]) -> list[int]:
         usable = sorted({int(value) for value in values if int(value) > 0})
@@ -724,7 +735,22 @@ def _continuity_block_neighbors(
                         changed[t][q] = predecessor
                     for t in range(right["start"] - length, right["start"]):
                         changed[t][q] = left["position"]
-                    add("revisit_work_exchange", changed)
+                    add(
+                        "revisit_work_exchange", changed, [
+                            {
+                                "crane": q + 1,
+                                "start": left["start"],
+                                "end_exclusive": left["start"] + length,
+                                "length": length,
+                            },
+                            {
+                                "crane": q + 1,
+                                "start": right["start"] - length,
+                                "end_exclusive": right["start"],
+                                "length": length,
+                            },
+                        ]
+                    )
 
     # When the first block leaves a small amount of work for a distant return,
     # move the same number of capacity slots to the beginning and give the
@@ -753,7 +779,22 @@ def _continuity_block_neighbors(
                             changed[t][q] = left["position"]
                         for t in late_times:
                             changed[t][q] = replacement
-                        add("early_residual_completion", changed)
+                        add(
+                            "early_residual_completion", changed, [
+                                {
+                                    "crane": q + 1,
+                                    "start": left["end"],
+                                    "end_exclusive": left["end"] + length,
+                                    "length": length,
+                                },
+                                {
+                                    "crane": q + 1,
+                                    "start": right["end"] - length,
+                                    "end_exclusive": right["end"],
+                                    "length": length,
+                                },
+                            ]
+                        )
 
     # A completed crane may have a short, work-free terminal visit.  Holding
     # its preceding position is safe only as a candidate proposal; the full
@@ -771,7 +812,12 @@ def _continuity_block_neighbors(
         changed = [list(row) for row in rows]
         for t in range(final["start"], final["end"]):
             changed[t][q] = previous["position"]
-        add("idle_completion_hold", changed)
+        add("idle_completion_hold", changed, [{
+            "crane": q + 1,
+            "start": final["start"],
+            "end_exclusive": final["end"],
+            "length": final["length"],
+        }])
 
     # Apply the same bounded boundary shift to adjacent cranes.  This is a
     # relay proposal, not an unconstrained global re-layout.
@@ -782,14 +828,19 @@ def _continuity_block_neighbors(
             changed = [list(row) for row in rows]
             changed[t][q] = rows[t - 1][q]
             changed[t][q + 1] = rows[t - 1][q + 1]
-            add("adjacent_relay_batch", changed)
+            add("adjacent_relay_batch", changed, [
+                {"crane": q + 1, "start": t, "end_exclusive": t + 1, "length": 1},
+                {"crane": q + 2, "start": t, "end_exclusive": t + 1, "length": 1},
+            ])
 
     # Rotate operators rather than returning a fixed prefix.  This preserves
     # the quota guarantee even if one family generates many duplicates.
-    by_name: dict[str, list[tuple[str, list[tuple[int, ...]]]]] = {}
+    by_name: dict[
+        str, list[tuple[str, list[tuple[int, ...]], list[dict[str, Any]]]]
+    ] = {}
     for item in proposals:
         by_name.setdefault(item[0], []).append(item)
-    ordered: list[tuple[str, list[tuple[int, ...]]]] = []
+    ordered: list[tuple[str, list[tuple[int, ...]], list[dict[str, Any]]]] = []
     names = list(quotas)
     index = 0
     while any(by_name.get(name) for name in names):
@@ -797,7 +848,9 @@ def _continuity_block_neighbors(
         if by_name.get(name):
             ordered.append(by_name[name].pop(0))
         index += 1
-    return ordered[:max_candidates]
+    if return_details:
+        return ordered[:max_candidates]
+    return [(name, history) for name, history, _regions in ordered[:max_candidates]]
 
 
 def _continuity_rank(
@@ -2965,6 +3018,7 @@ def _refine_same_horizon_trajectory(
         segment_index: int,
         before_history: Sequence[tuple[int, ...]],
         decode_failed: bool = False,
+        declared_regions: list[dict[str, Any]] | None = None,
     ) -> tuple[bool, bool]:
         """Validate and consider one proposal; return (accepted, legal)."""
         nonlocal best, formal_best, continuity_best, evaluated_total
@@ -3041,6 +3095,7 @@ def _refine_same_horizon_trajectory(
                     list(_continuity_rank(proposed, M)) if accepted else None
                 ),
                 "changed_regions": (
+                    declared_regions if declared_regions is not None else
                     _history_diff_regions(
                         before_history,
                         _candidate_position_rows(proposed, M),
@@ -3055,10 +3110,20 @@ def _refine_same_horizon_trajectory(
         # hand-offs without relying on isolated random cell edits.
         progress = False
         segment_proposals = _trajectory_segment_neighbors(W, M, starts, best)
+        declared_by_proposal: dict[tuple[str, tuple[tuple[int, ...], ...]], list[dict[str, Any]]] = {}
         if continuity:
-            segment_proposals.extend(
-                _continuity_block_neighbors(W, M, best)
+            details = _continuity_block_neighbors(
+                W, M, best, return_details=True
             )
+            for item in details:
+                if len(item) == 3:
+                    operator, history, regions = item
+                else:
+                    operator, history = item
+                    regions = None
+                segment_proposals.append((operator, history))
+                if regions is not None:
+                    declared_by_proposal[(operator, tuple(history))] = regions
         for segment_index, (operator, history) in enumerate(segment_proposals):
             if time.perf_counter() >= deadline:
                 break
@@ -3079,6 +3144,9 @@ def _refine_same_horizon_trajectory(
                 proposed, operator, before_key, before_smoothness,
                 cycle, segment_index, before_history,
                 decode_failed=proposed is None,
+                declared_regions=declared_by_proposal.get(
+                    (operator, tuple(history))
+                ),
             )
             if accepted:
                 progress = True
