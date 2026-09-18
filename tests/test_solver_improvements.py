@@ -885,6 +885,88 @@ class SolverImprovementTests(unittest.TestCase):
                 seen.add(config)
         self.assertGreater(len(seen), 1)
 
+    def test_idle_diagnostics_separates_internal_and_completed_suffix(self) -> None:
+        candidate = cwp_solver._candidate_from_history(
+            [1, 0, 1], 1, [(1,), (1,), (3,), (3,)],
+            move_time=0, preserve_horizon=True,
+        )
+        report = cwp_solver._idle_diagnostics(candidate, 1)
+        self.assertEqual(report["total_internal_idle"], 1)
+        self.assertEqual(report["max_internal_idle"], 1)
+        self.assertEqual(report["per_crane"][0]["leading_idle"], 0)
+        self.assertEqual(report["per_crane"][0]["trailing_idle"], 0)
+
+    def test_fixed_window_work_decoder_freezes_external_work(self) -> None:
+        work = [3, 0, 2]
+        source = cwp_solver._candidate_from_history(
+            work, 1, [(1,), (1,), (1,), (3,), (3,), (3,)],
+            move_time=0, preserve_horizon=True,
+        )
+        proposed = cwp_solver._candidate_from_history_with_frozen_work(
+            work, 1, [(1,), (1,), (3,), (1,), (3,), (3,)], source,
+            [{"crane": 1, "start": 2, "end_exclusive": 4}],
+        )
+        cwp_solver.verify_solution(
+            work, 1, [1], type("Check", (), {
+                "slots": proposed.slots, "makespan": proposed.makespan,
+                "crane_loads": proposed.loads,
+                "reversal_count": proposed.reversal_count,
+                "movement_count": proposed.movement_count, "move_time": 0,
+            })(),
+        )
+        source_outside = [
+            (slot.time, slot.work_bay)
+            for slot in source.slots if slot.state == "work" and slot.time not in (2, 3)
+        ]
+        proposed_outside = [
+            (slot.time, slot.work_bay)
+            for slot in proposed.slots if slot.state == "work" and slot.time not in (2, 3)
+        ]
+        self.assertEqual(proposed_outside, source_outside)
+
+    def test_iterative_descent_continues_after_first_shortening(self) -> None:
+        work = [8]
+        source = cwp_solver._candidate_from_history(
+            work, 1, [(1,)] * 11, move_time=0, preserve_horizon=True,
+        )
+        h9 = cwp_solver._candidate_from_history(
+            work, 1, [(1,)] * 10, move_time=0, preserve_horizon=True,
+        )
+        h8 = cwp_solver._candidate_from_history(
+            work, 1, [(1,)] * 9, move_time=0, preserve_horizon=True,
+        )
+        seen_sources = []
+
+        def targeted(_W, _M, candidate, _chain, _window):
+            seen_sources.append(candidate.makespan)
+            if candidate.makespan == 10:
+                return h9, 1
+            if candidate.makespan == 9:
+                return h8, 1
+            return None, 1
+
+        with patch.object(
+            cwp_solver, "_critical_repair_windows",
+            return_value=[((0,), (1, 2))],
+        ), patch.object(
+            cwp_solver, "_targeted_local_preparation",
+            side_effect=targeted,
+        ):
+            result, evaluated, prepared, first = (
+                cwp_solver._cumulative_local_trajectory_repair_iterative(
+                    work, 1, [1], source,
+                    time.perf_counter() + 0.4, 123,
+                    move_time=0, enable_operational_repairs=False,
+                )
+            )
+        self.assertIsNotNone(result)
+        self.assertEqual(result.makespan, 8)
+        self.assertEqual(prepared.makespan, 8)
+        self.assertEqual(first.makespan, 9)
+        self.assertIn(10, seen_sources)
+        self.assertIn(9, seen_sources)
+        self.assertGreaterEqual(evaluated, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

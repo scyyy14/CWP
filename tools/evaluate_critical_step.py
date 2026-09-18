@@ -127,6 +127,10 @@ def summarize(candidate):
         "continuity": solver._continuity_diagnostics(
             candidate, len(candidate.loads)
         ),
+        "idle": solver._idle_diagnostics(candidate, len(candidate.loads)),
+        "operational_rank": list(solver._operational_rank(
+            candidate, len(candidate.loads)
+        )),
     }
 
 
@@ -172,6 +176,7 @@ def direct_run(
     W, M, S, source, mode, budget, seed, *, move_time=1,
     verbose_windows=False, plot_dir: Path | None = None,
     preserve_horizon=False, cumulative_local=True,
+    enable_descent=True, enable_operational_repairs=True,
 ):
     start = time.perf_counter()
     deadline = start + budget
@@ -192,20 +197,37 @@ def direct_run(
     source_key = tuple(source.objective_key)
     if (
         cumulative_local and mode == "trajectory"
-        and move_time == 0 and not preserve_horizon
+        and move_time == 0
     ):
         trace = []
         continuity_output = {}
-        candidate, evaluated, prepared, first_feasible = solver._cumulative_local_trajectory_repair(
+        candidate, evaluated, prepared, first_feasible = solver._cumulative_local_trajectory_repair_iterative(
             W, M, S, source, deadline, seed,
             move_time=move_time, attempt_trace=trace,
             continuity_output=continuity_output,
+            enable_descent=enable_descent,
+            enable_operational_repairs=enable_operational_repairs,
         )
         formal_best = continuity_output.get("formal_best", candidate)
         continuity_best = continuity_output.get("continuity_best", candidate)
-        verify_candidate(W, M, S, prepared, move_time)
+        operational_best = continuity_output.get("operational_best", candidate)
+        if formal_best is None:
+            formal_best = source
+        if continuity_best is None:
+            continuity_best = formal_best
+        if operational_best is None:
+            operational_best = continuity_best
+        reported_best = formal_best if candidate is None else candidate
         if candidate is not None:
-            verify_candidate(W, M, S, candidate, move_time)
+            run_status = "FOUND"
+        elif formal_best.objective_key < source.objective_key:
+            run_status = "NO_SHORTENING_SAME_H_IMPROVEMENT"
+        else:
+            run_status = "TIMEOUT"
+        verify_candidate(W, M, S, prepared, move_time)
+        for polished_candidate in (candidate, formal_best, continuity_best, operational_best):
+            if polished_candidate is not None:
+                verify_candidate(W, M, S, polished_candidate, move_time)
         first_event = next(
             (item for item in trace if item.get("phase") == "first_feasible"),
             None,
@@ -222,6 +244,7 @@ def direct_run(
         polished_path = None
         formal_best_path = None
         continuity_best_path = None
+        operational_best_path = None
         if plot_dir is not None:
             plot_dir.mkdir(parents=True, exist_ok=True)
             source_path = plot_dir / "source.json"
@@ -301,6 +324,21 @@ def direct_run(
                     ),
                 )
                 continuity_best_path = str(continuity_best_path)
+            if operational_best is not None:
+                operational_best_path = plot_dir / "operational_best.json"
+                operational_best_path.write_text(json.dumps({
+                    **summarize(operational_best),
+                    "slots": slot_dicts(operational_best),
+                }, indent=2), encoding="utf-8")
+                operational_best_plot = plot_dir / "operational_best.png"
+                solver.plot_schedule(
+                    plot_view(operational_best), len(W), operational_best_plot,
+                    show=False,
+                    diagnostic_title=(
+                        "Step 8 trajectory — operational best schedule"
+                    ),
+                )
+                operational_best_path = str(operational_best_path)
             if candidate is None:
                 plot_path = plot_dir / "cumulative_prepared.png"
                 solver.plot_schedule(
@@ -336,16 +374,17 @@ def direct_run(
             )
         return {
             "experiment": "direct", "mode": mode, "move_time": move_time,
-            "target_mode": "shorten", "local_strategy": "cumulative",
+            "target_mode": "same_horizon" if preserve_horizon else "shorten",
+            "local_strategy": "iterative_cumulative",
             "budget_seconds": budget, "seed": seed,
             "search_budget_seconds": round(deadline - start, 6),
             "plot_reserve_seconds": round(plot_reserve, 6),
             "source": summarize(source), "source_objective": list(source_key),
             "calls": len(trace), "evaluated": evaluated,
-            "status": "FOUND" if candidate is not None else "TIMEOUT",
-            "best": summarize(candidate) if candidate is not None else None,
+            "status": run_status,
+            "best": summarize(reported_best) if reported_best is not None else None,
             "best_objective": (
-                list(candidate.objective_key) if candidate is not None else None
+                list(reported_best.objective_key) if reported_best is not None else None
             ),
             "best_smoothness": (
                 list(solver._trajectory_smoothness(candidate, M))
@@ -353,8 +392,21 @@ def direct_run(
             ),
             "formal_best": summarize(formal_best) if formal_best is not None else None,
             "continuity_best": summarize(continuity_best) if continuity_best is not None else None,
+            "operational_best": summarize(operational_best) if operational_best is not None else None,
             "continuity_operator_stats": continuity_output.get("stats"),
             "continuity_stop_reason": continuity_output.get("stop_reason"),
+            "descent_history": continuity_output.get("descent_history", []),
+            "first_feasible_by_h": [
+                {
+                    "horizon": item["horizon"],
+                    "candidate": summarize(item["candidate"]),
+                }
+                for item in continuity_output.get("first_feasible_by_h", [])
+            ],
+            "safe_workload_lower_bound": continuity_output.get("safe_workload_lower_bound"),
+            "descent_rounds": continuity_output.get("descent_rounds", 0),
+            "enable_descent": enable_descent,
+            "enable_operational_repairs": enable_operational_repairs,
             "first_feasible": (
                 summarize(first_feasible) if first_feasible is not None else None
             ),
@@ -400,6 +452,7 @@ def direct_run(
             "polished_path": polished_path,
             "formal_best_path": formal_best_path,
             "continuity_best_path": continuity_best_path,
+            "operational_best_path": operational_best_path,
             "elapsed_seconds": round(time.perf_counter() - start, 6),
         }
     for index in range(limit):
@@ -772,6 +825,18 @@ def main():
             "window independently from the frozen source."
         ),
     )
+    parser.add_argument(
+        "--descent",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Continue trying H-1, H-2, ... after the first feasible shortening.",
+    )
+    parser.add_argument(
+        "--operational-repairs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run fixed-H block and operational continuity repairs after descent.",
+    )
     parser.add_argument("--source-budget", type=float, default=5.0)
     parser.add_argument(
         "--source-restarts", type=int, default=100_000,
@@ -806,7 +871,9 @@ def main():
                 "source_generation": {
                     "budget_seconds": args.source_budget,
                     "restarts": args.source_restarts,
-                    "without_step7": args.source_without_step7,
+                "without_step7": args.source_without_step7,
+                "descent": args.descent,
+                "operational_repairs": args.operational_repairs,
                 },
                 "instances": {}}
     for name, (input_path, source_path) in selected_instances.items():
@@ -887,6 +954,8 @@ def main():
                                 move_time=move_time,
                                 preserve_horizon=preserve_horizon,
                                 cumulative_local=not args.independent_windows,
+                                enable_descent=args.descent,
+                                enable_operational_repairs=args.operational_repairs,
                                 plot_dir=(
                                     args.out / "window_plots" / name
                                     / f"seed_{seed}" / f"budget_{budget:g}s" / mode

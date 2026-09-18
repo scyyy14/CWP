@@ -432,6 +432,96 @@ def _continuity_diagnostics(
     }
 
 
+def _idle_diagnostics(candidate: _CandidateSchedule, M: int) -> dict[str, Any]:
+    """Separate waiting, movement, off-rail time, and completed suffixes.
+
+    A fixed-horizon schedule always contains a constant amount of non-work
+    capacity.  Therefore this report never treats the total number of idle
+    slots as an improvement target.  It identifies idle slots between a
+    crane's first and last work slot, which are the only idle slots that may
+    be removable through a legal hand-off.
+    """
+    by_crane: list[list[Slot]] = [[] for _ in range(M)]
+    for slot in candidate.slots:
+        if 1 <= slot.crane <= M:
+            by_crane[slot.crane - 1].append(slot)
+
+    def intervals(values: Sequence[int]) -> list[dict[str, int]]:
+        if not values:
+            return []
+        ordered = sorted(set(values))
+        result: list[dict[str, int]] = []
+        start = previous = ordered[0]
+        for value in ordered[1:] + [None]:
+            if value is not None and value == previous + 1:
+                previous = value
+                continue
+            result.append({
+                "start": start,
+                "end_exclusive": previous + 1,
+                "length": previous - start + 1,
+            })
+            if value is not None:
+                start = previous = value
+        return result
+
+    details: list[dict[str, Any]] = []
+    total_internal = 0
+    total_idle = 0
+    total_moves = 0
+    total_offrail = 0
+    max_internal = 0
+    for q, slots in enumerate(by_crane, 1):
+        slots = sorted(slots, key=lambda item: item.time)
+        work_times = [slot.time for slot in slots if slot.state == "work"]
+        idle_times = [slot.time for slot in slots if slot.state == "idle"]
+        move_times = [slot.time for slot in slots if slot.state == "move"]
+        offrail_times = [slot.time for slot in slots if slot.state == "offrail"]
+        first_work = min(work_times) if work_times else None
+        last_work = max(work_times) if work_times else None
+        internal_times = (
+            [t for t in idle_times if first_work is not None and last_work is not None
+             and first_work < t < last_work]
+        )
+        internal_blocks = intervals(internal_times)
+        internal_total = sum(item["length"] for item in internal_blocks)
+        max_internal_for_crane = max(
+            (item["length"] for item in internal_blocks), default=0
+        )
+        total_internal += internal_total
+        total_idle += len(idle_times)
+        total_moves += len(move_times)
+        total_offrail += len(offrail_times)
+        max_internal = max(max_internal, max_internal_for_crane)
+        details.append({
+            "crane": q,
+            "first_work": first_work,
+            "last_work": last_work,
+            "work_slots": len(work_times),
+            "leading_idle": len([t for t in idle_times if first_work is not None and t < first_work]),
+            "internal_idle": internal_total,
+            "internal_idle_blocks": internal_blocks,
+            "max_internal_idle": max_internal_for_crane,
+            "trailing_idle": len([t for t in idle_times if last_work is not None and t > last_work]),
+            "idle_slots": len(idle_times),
+            "move_slots": len(move_times),
+            "offrail_slots": len(offrail_times),
+            "state_intervals": {
+                "idle": intervals(idle_times),
+                "move": intervals(move_times),
+                "offrail": intervals(offrail_times),
+            },
+        })
+    return {
+        "per_crane": details,
+        "total_idle": total_idle,
+        "total_internal_idle": total_internal,
+        "max_internal_idle": max_internal,
+        "total_move_slots": total_moves,
+        "total_offrail_slots": total_offrail,
+    }
+
+
 def _candidate_passes_independent_verifier(
     W: Sequence[int],
     M: int,
@@ -602,6 +692,121 @@ def _history_diff_regions(
             })
             start = end + 1
     return regions
+
+
+def _candidate_from_history_with_frozen_work(
+    W: Sequence[int],
+    M: int,
+    history: Sequence[tuple[int, ...]],
+    source: _CandidateSchedule,
+    declared_regions: Sequence[dict[str, Any]],
+) -> _CandidateSchedule:
+    """Decode a paired local proposal while freezing work outside its regions.
+
+    Position-only decoding is useful for broad trajectory search, but it can
+    silently reassign work in rows that the proposal did not declare.  This
+    decoder keeps every source work slot outside the declared crane/time
+    regions and lets only the local cells absorb the remaining work.  It is a
+    zero-time, fixed-horizon transaction by design.
+    """
+    if source.move_time != 0 or len(history) != source.makespan + 1:
+        raise RuntimeError("冻结工作事务只支持零移动时间的固定工期。")
+    if len(history) != len(_candidate_position_rows(source, M)):
+        raise RuntimeError("冻结工作事务的时间轴长度不一致。")
+    source_rows = _candidate_position_rows(source, M)
+    proposed_rows = [tuple(int(value) for value in row) for row in history]
+    if any(len(row) != M for row in proposed_rows):
+        raise RuntimeError("冻结工作事务的桥吊数量不一致。")
+    horizon = source.makespan
+    editable: set[tuple[int, int]] = set()
+    for region in declared_regions:
+        q = int(region.get("crane", 0)) - 1
+        if not 0 <= q < M:
+            raise RuntimeError("冻结工作事务包含非法桥吊。")
+        start = max(0, int(region.get("start", 0)))
+        end = min(horizon, int(region.get("end_exclusive", start)))
+        if end - start > 8:
+            raise RuntimeError("冻结工作事务超过8个时间单位。")
+        editable.update((t, q) for t in range(start, end))
+    for t in range(horizon):
+        for q in range(M):
+            if proposed_rows[t][q] != source_rows[t][q] and (t, q) not in editable:
+                raise RuntimeError("候选修改超出声明工作区域。")
+
+    source_work: dict[tuple[int, int], int] = {
+        (slot.time, slot.crane - 1): int(slot.work_bay)
+        for slot in source.slots
+        if slot.state == "work" and slot.work_bay is not None
+    }
+    fixed_future = [0] * len(W)
+    for (t, q), bay in source_work.items():
+        if (t, q) not in editable:
+            fixed_future[bay - 1] += 1
+    remaining = list(W)
+    work_plan: dict[tuple[int, int], int] = {}
+    for t in range(horizon):
+        for q in range(M):
+            key = (t, q)
+            if key not in editable:
+                source_bay = source_work.get(key)
+                if source_bay is not None:
+                    if proposed_rows[t][q] != source_bay:
+                        raise RuntimeError("窗口外源作业位置发生变化。")
+                    if remaining[source_bay - 1] <= 0:
+                        raise RuntimeError("固定作业量重复使用。")
+                    remaining[source_bay - 1] -= 1
+                    fixed_future[source_bay - 1] -= 1
+                    work_plan[key] = source_bay
+                elif proposed_rows[t][q] != source_rows[t][q]:
+                    raise RuntimeError("窗口外空闲槽位置发生变化。")
+                continue
+            bay = proposed_rows[t][q]
+            if 1 <= bay <= len(W) and remaining[bay - 1] > fixed_future[bay - 1]:
+                remaining[bay - 1] -= 1
+                work_plan[key] = bay
+    if any(remaining):
+        raise RuntimeError("局部冻结工作事务无法守恒全部作业。")
+
+    slots: list[Slot] = []
+    owners: list[set[int]] = [set() for _ in W]
+    loads = [0] * M
+    movement_directions: list[list[int]] = [[] for _ in range(M)]
+    for t, (positions, next_positions) in enumerate(zip(proposed_rows, proposed_rows[1:])):
+        for q, (start_bay, end_bay) in enumerate(zip(positions, next_positions)):
+            if start_bay != end_bay:
+                movement_directions[q].append(1 if end_bay > start_bay else -1)
+            bay = work_plan.get((t, q))
+            if bay is not None:
+                owners[bay - 1].add(q)
+                loads[q] += 1
+                slots.append(Slot(t, q + 1, "work", bay, bay, bay))
+            elif not 1 <= start_bay <= len(W):
+                slots.append(Slot(t, q + 1, "offrail", start_bay, start_bay, None))
+            else:
+                slots.append(Slot(t, q + 1, "idle", start_bay, start_bay, None))
+    movement_count = sum(
+        before != after
+        for row_before, row_after in zip(proposed_rows, proposed_rows[1:])
+        for before, after in zip(row_before, row_after)
+    )
+    reversal_count = sum(
+        previous != current
+        for directions in movement_directions
+        for previous, current in zip(directions, directions[1:])
+    )
+    target_weights = [min(q + 1, M - q) for q in range(M)]
+    return _CandidateSchedule(
+        slots=slots,
+        makespan=horizon,
+        assignment_count=sum(len(item) for item in owners),
+        split_bay_count=sum(len(item) > 1 for item in owners),
+        load_deviation=_load_deviation(loads, target_weights, sum(W)),
+        reversal_count=reversal_count,
+        movement_count=movement_count,
+        loads=loads,
+        owners=owners,
+        move_time=0,
+    )
 
 
 def _continuity_block_neighbors(
@@ -860,6 +1065,30 @@ def _continuity_rank(
     """Rank a candidate only after the formal acceptance constraints pass."""
     report = _continuity_diagnostics(candidate, M)
     return tuple(int(value) for value in report["continuity_key"])
+
+
+def _operational_rank(
+    candidate: _CandidateSchedule,
+    M: int,
+) -> tuple[int, int, int, int, int, int, int, int]:
+    """Rank equal-horizon candidates by operational nuisance costs.
+
+    This is deliberately separate from ``objective_key``.  It is used to
+    publish a useful operational alternative while the formal result keeps
+    the project's original lexicographic priorities.
+    """
+    continuity = _continuity_diagnostics(candidate, M)
+    idle = _idle_diagnostics(candidate, M)
+    return (
+        int(candidate.movement_count),
+        int(candidate.reversal_count),
+        int(continuity["work_revisit_count"]),
+        int(continuity["bay_fragmentation"]),
+        int(idle["max_internal_idle"]),
+        int(idle["total_internal_idle"]),
+        int(candidate.split_bay_count),
+        int(candidate.load_deviation),
+    )
 
 
 def _trajectory_signature(candidate: _CandidateSchedule) -> tuple[Any, ...]:
@@ -2969,6 +3198,7 @@ def _refine_same_horizon_trajectory(
     best = candidate
     formal_best = candidate
     continuity_best = candidate
+    operational_best = candidate
     baseline = candidate
     evaluated_total = 0
     polish_started_at = time.perf_counter()
@@ -2986,6 +3216,9 @@ def _refine_same_horizon_trajectory(
         "decoded": 0,
         "verified": 0,
         "accepted": 0,
+        "unique_complete": 0,
+        "formal_improvements": 0,
+        "operational_improvements": 0,
         "time_seconds": 0.0,
         "operator": operator_stats,
     }
@@ -3005,8 +3238,13 @@ def _refine_same_horizon_trajectory(
     def continuity_allowed(proposed: _CandidateSchedule) -> bool:
         return (
             proposed.makespan == baseline.makespan
-            and proposed.split_bay_count <= baseline.split_bay_count
-            and proposed.movement_count <= baseline.movement_count
+            # Keep a small exploration allowance.  A relay may temporarily
+            # use one extra split or two extra moves before a later block
+            # exchange removes more movement and waiting.  These are search
+            # bounds only; the published operational candidate still shows
+            # the complete trade-off against formal_best.
+            and proposed.split_bay_count <= baseline.split_bay_count + 1
+            and proposed.movement_count <= baseline.movement_count + 2
         )
 
     def record_candidate(
@@ -3021,7 +3259,7 @@ def _refine_same_horizon_trajectory(
         declared_regions: list[dict[str, Any]] | None = None,
     ) -> tuple[bool, bool]:
         """Validate and consider one proposal; return (accepted, legal)."""
-        nonlocal best, formal_best, continuity_best, evaluated_total
+        nonlocal best, formal_best, continuity_best, operational_best, evaluated_total
         counter = operator_counter(operator)
         counter["generated"] += 1
         continuity_stats["generated"] += 1
@@ -3053,6 +3291,26 @@ def _refine_same_horizon_trajectory(
             else:
                 if len(pool) < 16:
                     pool[signature] = proposed
+                else:
+                    # Do not let the first 16 legal trajectories starve
+                    # later schedules.  Replace the worst complete member
+                    # when the new joint position/work signature is better.
+                    worst_signature, worst_candidate = max(
+                        pool.items(),
+                        key=lambda item: (
+                            _operational_rank(item[1], M),
+                            item[1].objective_key,
+                        ),
+                    )
+                    if (
+                        _operational_rank(proposed, M), proposed.objective_key
+                    ) < (
+                        _operational_rank(worst_candidate, M),
+                        worst_candidate.objective_key,
+                    ):
+                        del pool[worst_signature]
+                        pool[signature] = proposed
+                continuity_stats["unique_complete"] += 1
                 formal_improvement = proposed.objective_key < formal_best.objective_key
                 formal_tie_smoother = (
                     proposed.objective_key == before_key
@@ -3063,13 +3321,28 @@ def _refine_same_horizon_trajectory(
                     and continuity_allowed(proposed)
                     and _continuity_rank(proposed, M) < _continuity_rank(continuity_best, M)
                 )
-                accepted = formal_improvement or formal_tie_smoother or continuity_improvement
+                operational_improvement = (
+                    continuity
+                    and proposed.makespan == baseline.makespan
+                    and _operational_rank(proposed, M)
+                    < _operational_rank(operational_best, M)
+                )
+                accepted = (
+                    formal_improvement
+                    or formal_tie_smoother
+                    or continuity_improvement
+                    or operational_improvement
+                )
                 if formal_improvement:
                     formal_best = proposed
+                    continuity_stats["formal_improvements"] += 1
                 if continuity and continuity_allowed(proposed) and (
                     _continuity_rank(proposed, M) < _continuity_rank(continuity_best, M)
                 ):
                     continuity_best = proposed
+                if continuity and operational_improvement:
+                    operational_best = proposed
+                    continuity_stats["operational_improvements"] += 1
                 if accepted:
                     best = proposed
                     counter["accepted"] += 1
@@ -3093,6 +3366,10 @@ def _refine_same_horizon_trajectory(
                 ),
                 "after_continuity": (
                     list(_continuity_rank(proposed, M)) if accepted else None
+                ),
+                "after_operational": (
+                    list(_operational_rank(proposed, M))
+                    if accepted and proposed is not None else None
                 ),
                 "changed_regions": (
                     declared_regions if declared_regions is not None else
@@ -3134,19 +3411,25 @@ def _refine_same_horizon_trajectory(
             ]
             evaluated = 1
             evaluated_total += evaluated
+            declared_regions = declared_by_proposal.get(
+                (operator, tuple(history))
+            )
             try:
-                proposed = _candidate_from_history(
-                    W, M, history, move_time, preserve_horizon=True
-                )
+                if declared_regions:
+                    proposed = _candidate_from_history_with_frozen_work(
+                        W, M, history, best, declared_regions
+                    )
+                else:
+                    proposed = _candidate_from_history(
+                        W, M, history, move_time, preserve_horizon=True
+                    )
             except RuntimeError:
                 proposed = None
             accepted, _ = record_candidate(
                 proposed, operator, before_key, before_smoothness,
                 cycle, segment_index, before_history,
                 decode_failed=proposed is None,
-                declared_regions=declared_by_proposal.get(
-                    (operator, tuple(history))
-                ),
+                declared_regions=declared_regions,
             )
             if accepted:
                 progress = True
@@ -3242,6 +3525,7 @@ def _refine_same_horizon_trajectory(
         result_box.update({
             "formal_best": formal_best,
             "continuity_best": continuity_best,
+            "operational_best": operational_best,
             "pool_size": len(pool),
             "stats": continuity_stats,
             "stop_reason": stop_reason,
@@ -3485,6 +3769,354 @@ def _cumulative_local_trajectory_repair(
             stale_cycles += 1
         cycle += 1
     return None, evaluated_total, current, first_feasible
+
+
+def _cumulative_local_trajectory_repair_iterative(
+    W: Sequence[int],
+    M: int,
+    starts: Sequence[int],
+    incumbent: _CandidateSchedule,
+    deadline: float,
+    seed: int,
+    move_time: int = 1,
+    attempt_trace: list[dict[str, Any]] | None = None,
+    continuity_output: dict[str, Any] | None = None,
+    *,
+    enable_descent: bool = True,
+    enable_operational_repairs: bool = True,
+) -> tuple[
+    _CandidateSchedule | None, int, _CandidateSchedule, _CandidateSchedule | None
+]:
+    """Run several bounded H-1 repairs under one shared deadline.
+
+    The legacy cumulative routine stops after the first shortened schedule.
+    This wrapper keeps the old local operators and changes their orchestration:
+    each newly found horizon becomes the source for the next target horizon,
+    while fixed-H polishing receives only a bounded slice of the remaining
+    budget.  No call changes the declared local-window contract.
+    """
+    started = time.perf_counter()
+    if move_time != 0:
+        if continuity_output is not None:
+            continuity_output.update({
+                "status": "UNSUPPORTED",
+                "stop_reason": "nonzero_move_time_trajectory_descent_unsupported",
+                "descent_history": [],
+                "first_feasible_by_h": [],
+            })
+        return None, 0, incumbent, None
+
+    safe_lower_bound = max(
+        max(W, default=0),
+        math.ceil(sum(W) / max(1, M)),
+    )
+    current = incumbent
+    prepared = incumbent
+    evaluated_total = 0
+    first_feasible: _CandidateSchedule | None = None
+    first_by_h: dict[int, _CandidateSchedule] = {incumbent.makespan: incumbent}
+    formal_best = incumbent
+    continuity_best = incumbent
+    operational_best = incumbent
+    candidate_pool: list[_CandidateSchedule] = [incumbent]
+    descent_history: list[dict[str, Any]] = []
+    round_index = 0
+    stale_rounds = 0
+    stop_reason = "deadline"
+    descent_phase_deadline = min(
+        deadline,
+        started + 0.70 * max(0.0, deadline - started),
+    )
+
+    def add_pool(item: _CandidateSchedule) -> None:
+        nonlocal candidate_pool
+        signature = _trajectory_signature(item)
+        for index, old in enumerate(candidate_pool):
+            if _trajectory_signature(old) == signature:
+                if item.objective_key < old.objective_key:
+                    candidate_pool[index] = item
+                return
+        candidate_pool.append(item)
+        candidate_pool.sort(key=lambda value: (
+            value.makespan, value.objective_key, _operational_rank(value, M),
+        ))
+        candidate_pool = candidate_pool[:16]
+
+    def register(item: _CandidateSchedule, phase: str) -> None:
+        nonlocal formal_best, continuity_best, operational_best
+        if item.makespan not in first_by_h:
+            first_by_h[item.makespan] = item
+            if item.makespan < incumbent.makespan and first_feasible is None:
+                # The outer variable is assigned explicitly below because the
+                # helper's primary purpose is keeping the per-H history.
+                pass
+            if attempt_trace is not None:
+                attempt_trace.append({
+                    "phase": "first_feasible_by_h",
+                    "horizon": item.makespan,
+                    "source_phase": phase,
+                    "time_from_start": round(time.perf_counter() - started, 6),
+                    "objective": list(item.objective_key),
+                })
+        if item.objective_key < formal_best.objective_key:
+            formal_best = item
+        if (
+            item.makespan < continuity_best.makespan
+            or item.makespan == continuity_best.makespan
+            and _continuity_rank(item, M) < _continuity_rank(continuity_best, M)
+        ):
+            continuity_best = item
+        if (
+            item.makespan < operational_best.makespan
+            or item.makespan == operational_best.makespan
+            and _operational_rank(item, M) < _operational_rank(operational_best, M)
+        ):
+            operational_best = item
+        add_pool(item)
+
+    def polish(item: _CandidateSchedule, seconds: float) -> _CandidateSchedule:
+        nonlocal evaluated_total, first_feasible
+        if not enable_operational_repairs or seconds <= 0.05:
+            return item
+        details: dict[str, Any] = {}
+        local_deadline = min(deadline, time.perf_counter() + seconds)
+        polished, evaluated = _refine_same_horizon_trajectory(
+            W, M, starts, item, local_deadline,
+            seed + 700_001 + round_index,
+            move_time=0,
+            attempt_trace=attempt_trace,
+            continuity=True,
+            result_box=details,
+        )
+        evaluated_total += evaluated
+        formal = details.get("formal_best", polished)
+        continuity = details.get("continuity_best", polished)
+        operational = details.get("operational_best", polished)
+        for value, phase in (
+            (formal, "polish_formal"),
+            (continuity, "polish_continuity"),
+            (operational, "polish_operational"),
+        ):
+            register(value, phase)
+        if first_feasible is None and item.makespan < incumbent.makespan:
+            first_feasible = item
+        if continuity_output is not None:
+            continuity_output.setdefault("polish_runs", []).append({
+                "horizon": item.makespan,
+                "evaluated": evaluated,
+                "stats": details.get("stats"),
+                "stop_reason": details.get("stop_reason"),
+            })
+        return formal
+
+    def attempt_source(
+        source: _CandidateSchedule,
+        local_deadline: float,
+        source_index: int,
+    ) -> tuple[_CandidateSchedule | None, _CandidateSchedule, int, str]:
+        windows = _critical_repair_windows(source, M)
+        if not windows:
+            return None, source, 0, "no_windows"
+        ordered = (
+            windows[source_index % len(windows):]
+            + windows[:source_index % len(windows)]
+        )
+        best_prepared = source
+        evaluated = 0
+        for index, (chain, window) in enumerate(ordered):
+            if time.perf_counter() >= local_deadline:
+                break
+            remaining_windows = max(1, len(ordered) - index)
+            slice_deadline = min(
+                local_deadline,
+                time.perf_counter() + max(
+                    0.05,
+                    (local_deadline - time.perf_counter()) / remaining_windows,
+                ),
+            )
+            targeted, targeted_evaluated = _targeted_local_preparation(
+                W, M, source, chain, window
+            )
+            evaluated += targeted_evaluated
+            if targeted is not None:
+                best_prepared = targeted
+                if targeted.makespan < source.makespan:
+                    return targeted, best_prepared, evaluated, "targeted"
+
+            prepare_deadline = min(
+                slice_deadline,
+                time.perf_counter()
+                + 0.55 * max(0.0, slice_deadline - time.perf_counter()),
+            )
+            prepared_candidate, prepared_evaluated, _ = _trajectory_repair(
+                W, M, starts, best_prepared, prepare_deadline,
+                seed + round_index * 1009 + source_index * 17 + index,
+                active_cranes=chain,
+                window=window,
+                return_state=True,
+                move_time=0,
+                preserve_horizon=True,
+                preparation_mode=True,
+            )
+            evaluated += prepared_evaluated
+            if prepared_candidate is not None:
+                best_prepared = prepared_candidate
+                shortened = _decode_best_shortening(W, M, prepared_candidate)
+                if shortened is not None:
+                    return shortened, best_prepared, evaluated, "prepared_decode"
+
+            if time.perf_counter() < slice_deadline:
+                shortened, shortened_evaluated, _ = _trajectory_repair(
+                    W, M, starts, best_prepared, slice_deadline,
+                    seed + 500_003 + round_index * 1009
+                    + source_index * 17 + index,
+                    active_cranes=chain,
+                    window=window,
+                    return_state=True,
+                    move_time=0,
+                )
+                evaluated += shortened_evaluated
+                if shortened is not None and shortened.makespan < source.makespan:
+                    return shortened, best_prepared, evaluated, "window_shorten"
+        return None, best_prepared, evaluated, "timeout_or_no_improvement"
+
+    if not enable_descent:
+        stop_reason = "descent_disabled"
+    else:
+        while (
+            time.perf_counter() < descent_phase_deadline
+            and current.makespan > safe_lower_bound
+        ):
+            sources = sorted(
+                candidate_pool,
+                key=lambda item: (
+                    item.makespan,
+                    item.objective_key,
+                    _operational_rank(item, M),
+                ),
+            )[:4]
+            remaining = descent_phase_deadline - time.perf_counter()
+            round_deadline = min(
+                descent_phase_deadline,
+                time.perf_counter() + max(
+                    0.20, min(20.0, remaining / max(1, len(sources)))
+                ),
+            )
+            found = None
+            best_prepared = current
+            round_evaluated = 0
+            reason = "no_candidate"
+            for source_index, source in enumerate(sources or [current]):
+                if time.perf_counter() >= round_deadline:
+                    break
+                proposed, prepared_candidate, evaluated, reason = attempt_source(
+                    source, round_deadline, source_index
+                )
+                round_evaluated += evaluated
+                if prepared_candidate.objective_key < best_prepared.objective_key:
+                    best_prepared = prepared_candidate
+                if proposed is not None and proposed.makespan < source.makespan:
+                    found = proposed
+                    break
+            evaluated_total += round_evaluated
+            if best_prepared.makespan < current.makespan:
+                current = best_prepared
+                prepared = best_prepared
+                register(current, "preparation")
+            if found is None:
+                stale_rounds += 1
+                descent_history.append({
+                    "round": round_index,
+                    "source_horizons": [item.makespan for item in sources],
+                    "target_horizon": min((item.makespan for item in sources), default=current.makespan) - 1,
+                    "result": "NO_IMPROVEMENT",
+                    "reason": reason,
+                    "evaluated": round_evaluated,
+                    "elapsed_seconds": round(time.perf_counter() - started, 6),
+                })
+                round_index += 1
+                if stale_rounds >= 3:
+                    stop_reason = "descent_stalled"
+                    break
+                continue
+
+            stale_rounds = 0
+            previous_h = current.makespan
+            if first_feasible is None and found.makespan < incumbent.makespan:
+                first_feasible = found
+            if found.makespan not in first_by_h:
+                first_by_h[found.makespan] = found
+            current = found
+            prepared = found
+            register(found, "descent")
+            current = polish(
+                current,
+                min(2.0, max(0.05, 0.12 * (deadline - time.perf_counter()))),
+            )
+            prepared = current
+            descent_history.append({
+                "round": round_index,
+                "source_horizons": [item.makespan for item in sources],
+                "target_horizon": previous_h - 1,
+                "result": "FOUND",
+                "horizon": current.makespan,
+                "objective": list(current.objective_key),
+                "evaluated": round_evaluated,
+                "elapsed_seconds": round(time.perf_counter() - started, 6),
+            })
+            round_index += 1
+            if current.makespan <= safe_lower_bound:
+                stop_reason = "safe_workload_lower_bound_reached"
+                break
+
+    # Once descent is exhausted, spend the rest of the shared deadline on the
+    # best shortest-horizon candidate.  This stage never changes the horizon.
+    if enable_operational_repairs and time.perf_counter() < deadline:
+        shortest_h = min(item.makespan for item in candidate_pool)
+        quality_source = min(
+            (item for item in candidate_pool if item.makespan == shortest_h),
+            key=lambda item: (_operational_rank(item, M), item.objective_key),
+            default=current,
+        )
+        quality = polish(quality_source, max(0.05, deadline - time.perf_counter()))
+        prepared = quality
+        if quality.makespan < current.makespan:
+            current = quality
+
+    if time.perf_counter() >= deadline:
+        stop_reason = "deadline"
+    elif current.makespan <= safe_lower_bound:
+        stop_reason = "safe_workload_lower_bound_reached"
+
+    if attempt_trace is not None:
+        attempt_trace.append({
+            "phase": "descent_complete",
+            "stop_reason": stop_reason,
+            "safe_workload_lower_bound": safe_lower_bound,
+            "horizons_seen": sorted(first_by_h),
+            "descent_rounds": len(descent_history),
+        })
+    if continuity_output is not None:
+        continuity_output.update({
+            "formal_best": formal_best,
+            "continuity_best": continuity_best,
+            "operational_best": operational_best,
+            "pool_size": len(candidate_pool),
+            "stop_reason": stop_reason,
+            "descent_history": descent_history,
+            "first_feasible_by_h": [
+                {"horizon": horizon, "candidate": item}
+                for horizon, item in sorted(first_by_h.items(), reverse=True)
+            ],
+            "safe_workload_lower_bound": safe_lower_bound,
+            "descent_rounds": len(descent_history),
+        })
+    return (
+        formal_best if first_feasible is not None else None,
+        evaluated_total,
+        prepared,
+        first_feasible,
+    )
 
 
 def _critical_window_beam_repair(
@@ -4391,7 +5023,7 @@ def solve_cwp(
                 repair_phase_deadline - time.perf_counter()
             )
         operator_calls["trajectory"] += 1
-        cumulative, evaluated, prepared, first_feasible = _cumulative_local_trajectory_repair(
+        cumulative, evaluated, prepared, first_feasible = _cumulative_local_trajectory_repair_iterative(
             W, M, starts, best, cumulative_deadline, seed,
             move_time=move_time,
         )
