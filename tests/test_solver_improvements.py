@@ -345,6 +345,153 @@ class SolverImprovementTests(unittest.TestCase):
             })(),
         )
 
+    def test_explicit_work_transfer_is_a_real_local_transaction(self):
+        """A local relay moves work with its crane and freezes the outside."""
+        work = [0, 4, 0, 0, 0]
+        source = cwp_solver._candidate_from_history(
+            work, 2, [(2, 5)] * 5, move_time=0, preserve_horizon=True,
+        )
+        proposals, stats = cwp_solver._work_transfer_transactions(
+            work, 2, source, max_candidates=32,
+        )
+        self.assertGreater(stats["unique"], 0)
+        proposal = next(
+            item for item in proposals
+            if item["operator"] == "tail_relay"
+            and item["details"]["source_interval"] == [1, 4]
+        )
+        candidate = cwp_solver._candidate_from_explicit_work_transaction(
+            work, 2, proposal["history"], source,
+            proposal["work_plan"], proposal["regions"],
+        )
+        self.assertEqual(len({item["crane"] for item in proposal["regions"]}), 2)
+        self.assertTrue(all(item["length"] <= 8 for item in proposal["regions"]))
+        check = type("Check", (), {
+            "slots": candidate.slots, "makespan": candidate.makespan,
+            "crane_loads": candidate.loads,
+            "reversal_count": candidate.reversal_count,
+            "movement_count": candidate.movement_count,
+            "move_time": 0,
+        })()
+        cwp_solver.verify_solution(work, 2, [], check)
+        # The first slot is outside the [1,4) work transfer and remains the
+        # original Q1 work / Q2 idle pair.
+        self.assertEqual(
+            [(slot.crane, slot.state, slot.work_bay)
+             for slot in candidate.slots if slot.time == 0],
+            [(1, "work", 2), (2, "idle", None)],
+        )
+
+    def test_residual_exchange_closes_a_real_same_bay_gap(self):
+        work = [0, 4, 0, 0, 0, 0]
+        rows = [(2,)] * 6
+        source_plan = {
+            (t, 0): (2 if t in (0, 1, 3, 4) else None)
+            for t in range(5)
+        }
+        source = cwp_solver._candidate_from_rows_and_work_plan(
+            work, 1, rows, source_plan,
+        )
+        before = cwp_solver._continuity_diagnostics(source, 1)
+        proposals, stats = cwp_solver._work_transfer_transactions(
+            work, 1, source, max_candidates=16,
+        )
+        proposal = next(
+            item for item in proposals
+            if item["operator"] == "paired_residual_exchange"
+        )
+        candidate = cwp_solver._candidate_from_explicit_work_transaction(
+            work, 1, proposal["history"], source,
+            proposal["work_plan"], proposal["regions"],
+        )
+        after = cwp_solver._continuity_diagnostics(candidate, 1)
+        self.assertEqual(before["bay_fragmentation"], 1)
+        self.assertEqual(after["bay_fragmentation"], 0)
+        self.assertEqual(after["work_revisit_count"], 0)
+        self.assertEqual(len(proposal["regions"]), 2)
+        self.assertTrue(all(item["length"] <= 8 for item in proposal["regions"]))
+        self.assertEqual(stats["operators"]["paired_residual_exchange"], 1)
+
+    def test_work_transfer_rejects_outside_work_and_oversized_contract(self):
+        work = [0, 5, 0, 0, 0]
+        source = cwp_solver._candidate_from_history(
+            work, 2, [(2, 5)] * 6, move_time=0, preserve_horizon=True,
+        )
+        proposals, _ = cwp_solver._work_transfer_transactions(
+            work, 2, source, max_candidates=32,
+        )
+        proposal = next(
+            item for item in proposals
+            if item["details"]["source_interval"] == [1, 4]
+        )
+        tampered = dict(proposal["work_plan"])
+        tampered[(4, 0)] = None
+        with self.assertRaisesRegex(RuntimeError, "窗口外作业"):
+            cwp_solver._candidate_from_explicit_work_transaction(
+                work, 2, proposal["history"], source,
+                tampered, proposal["regions"],
+            )
+        with self.assertRaisesRegex(RuntimeError, "不能超过8"):
+            cwp_solver._normalize_work_transfer_regions(
+                [{"crane": 1, "start": 0, "end_exclusive": 9}],
+                10, 2,
+            )
+        with self.assertRaisesRegex(RuntimeError, "三台相邻"):
+            cwp_solver._normalize_work_transfer_regions(
+                [
+                    {"crane": 1, "start": 0, "end_exclusive": 1},
+                    {"crane": 2, "start": 0, "end_exclusive": 1},
+                    {"crane": 3, "start": 0, "end_exclusive": 1},
+                    {"crane": 4, "start": 0, "end_exclusive": 1},
+                ],
+                source.makespan, 4,
+            )
+
+    def test_work_transfer_rejects_source_hash_mismatch(self):
+        work = [0, 4, 0, 0, 0]
+        source = cwp_solver._candidate_from_history(
+            work, 2, [(2, 5)] * 5, move_time=0, preserve_horizon=True,
+        )
+        proposals, _ = cwp_solver._work_transfer_transactions(
+            work, 2, source, max_candidates=32, source_hash="source-a",
+        )
+        proposal = next(
+            item for item in proposals if item["operator"] == "tail_relay"
+        )
+        with self.assertRaisesRegex(RuntimeError, "source_hash"):
+            cwp_solver._candidate_from_explicit_work_transaction(
+                work, 2, proposal["history"], source,
+                proposal["work_plan"], proposal["regions"],
+                source_hash="source-b",
+                transaction_source_hash=proposal["source_hash"],
+            )
+
+    def test_strict_polish_accepts_only_explicit_continuity_transaction(self):
+        work = [0, 4, 0, 0, 0, 0]
+        rows = [(2,)] * 6
+        source_plan = {
+            (t, 0): (2 if t in (0, 1, 3, 4) else None)
+            for t in range(5)
+        }
+        source = cwp_solver._candidate_from_rows_and_work_plan(
+            work, 1, rows, source_plan,
+        )
+        details = {}
+        refined, _ = cwp_solver._refine_same_horizon_trajectory(
+            work, 1, [], source, time.perf_counter() + 0.2, 4,
+            continuity=True, result_box=details,
+            enable_work_transfer=True,
+            protect_source_continuity=True,
+            strict_local_transactions=True,
+        )
+        self.assertEqual(
+            cwp_solver._continuity_diagnostics(refined, 1)["bay_fragmentation"],
+            0,
+        )
+        self.assertGreaterEqual(
+            details["stats"]["work_transfer"]["accepted"], 1,
+        )
+
     def test_continuity_can_accept_more_than_six_successive_improvements(self):
         source_history = [
             (1,), (3,), (1,), (3,), (1,), (3,), (1,), (3,),

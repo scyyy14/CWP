@@ -177,6 +177,11 @@ def direct_run(
     verbose_windows=False, plot_dir: Path | None = None,
     preserve_horizon=False, cumulative_local=True,
     enable_descent=True, enable_operational_repairs=True,
+    enable_work_transfer=False, protect_source_continuity=False,
+    strict_local_transactions=False,
+    source_hash=None,
+    use_legacy_seed=False,
+    enable_multi_relay=True,
 ):
     start = time.perf_counter()
     deadline = start + budget
@@ -208,6 +213,12 @@ def direct_run(
             enable_descent=enable_descent,
             enable_operational_repairs=enable_operational_repairs,
             preserve_horizon=preserve_horizon,
+            enable_work_transfer=enable_work_transfer,
+            protect_source_continuity=protect_source_continuity,
+            strict_local_transactions=strict_local_transactions,
+            source_hash=source_hash,
+            use_legacy_seed=use_legacy_seed,
+            enable_multi_relay=enable_multi_relay,
         )
         formal_best = continuity_output.get("formal_best", candidate)
         continuity_best = continuity_output.get("continuity_best", candidate)
@@ -411,6 +422,12 @@ def direct_run(
             "descent_rounds": continuity_output.get("descent_rounds", 0),
             "enable_descent": enable_descent,
             "enable_operational_repairs": enable_operational_repairs,
+            "enable_work_transfer": enable_work_transfer,
+            "protect_source_continuity": protect_source_continuity,
+            "strict_local_transactions": strict_local_transactions,
+            "source_hash": source_hash,
+            "use_legacy_seed": use_legacy_seed,
+            "enable_multi_relay": enable_multi_relay,
             "first_feasible": (
                 summarize(first_feasible) if first_feasible is not None else None
             ),
@@ -459,17 +476,24 @@ def direct_run(
             "operational_best_path": operational_best_path,
             "elapsed_seconds": round(time.perf_counter() - start, 6),
         }
+    beam_polish_reserve = 0.0
+    beam_search_deadline = deadline
+    if (
+        mode == "beam" and enable_work_transfer and move_time == 0
+    ):
+        beam_polish_reserve = min(15.0, max(1.0, 0.05 * budget))
+        beam_search_deadline = max(start + 0.01, deadline - beam_polish_reserve)
     for index in range(limit):
-        if time.perf_counter() >= deadline:
+        if time.perf_counter() >= beam_search_deadline:
             break
         chain, window = windows[index]
         window_started = time.perf_counter()
-        remaining = deadline - time.perf_counter()
+        remaining = beam_search_deadline - time.perf_counter()
         # Divide the complete requested budget across the windows.  A former
         # seven-second cap silently reduced a nominal five-minute experiment
         # to at most 7 * window_count seconds.
         slice_deadline = min(
-            deadline,
+            beam_search_deadline,
             time.perf_counter()
             + max(0.02, remaining / max(1, limit - index)),
         )
@@ -566,8 +590,42 @@ def direct_run(
         updates.append(record)
         if best is None or candidate.objective_key < best.objective_key:
             best = candidate
-    found_best = best is not None
+    beam_search_found = best is not None
+    beam_polish_details = {}
+    if (
+        enable_work_transfer
+        and strict_local_transactions
+        and move_time == 0
+        and time.perf_counter() < deadline
+    ):
+        polish_source = best if best is not None else source
+        polished, polished_evaluated = solver._refine_same_horizon_trajectory(
+            W, M, S, polish_source, deadline, seed + 900_001,
+            move_time=0, continuity=True, result_box=beam_polish_details,
+            enable_work_transfer=True,
+            protect_source_continuity=protect_source_continuity,
+            strict_local_transactions=True,
+            source_hash=source_hash,
+            enable_multi_relay=enable_multi_relay,
+        )
+        attempts += polished_evaluated
+        verify_candidate(W, M, S, polished, move_time)
+        formal = beam_polish_details.get("formal_best", polished)
+        if best is None or formal.objective_key < best.objective_key:
+            best = formal
+        if best is None:
+            best = polished
+    found_best = beam_search_found or (
+        best is not None and best is not source
+        and best.objective_key < source.objective_key
+    )
     reported_best = best if found_best else source
+    formal_best = beam_polish_details.get("formal_best", reported_best)
+    continuity_best = beam_polish_details.get("continuity_best", formal_best)
+    operational_best = beam_polish_details.get("operational_best", continuity_best)
+    for polished_candidate in (formal_best, continuity_best, operational_best):
+        if polished_candidate is not None:
+            verify_candidate(W, M, S, polished_candidate, move_time)
     if plot_dir is not None and mode == "beam":
         plot_dir.mkdir(parents=True, exist_ok=True)
         source_json = plot_dir / "source.json"
@@ -601,7 +659,27 @@ def direct_run(
         "calls": calls, "evaluated": attempts,
         "status": "FOUND" if found_best else ("TIMEOUT" if time.perf_counter() >= deadline else "NO_CANDIDATE"),
         "best": summarize(reported_best),
+        "formal_best": summarize(formal_best),
+        "continuity_best": summarize(continuity_best),
+        "operational_best": summarize(operational_best),
         "best_is_source": not found_best,
+        "beam_search_found": beam_search_found,
+        "beam_polish_reserve_seconds": round(beam_polish_reserve, 6),
+        "beam_polish": {
+            "evaluated": beam_polish_details.get("stats", {}).get("verified", 0),
+            "stats": beam_polish_details.get("stats"),
+            "stop_reason": beam_polish_details.get("stop_reason"),
+            "formal_best": (
+                summarize(beam_polish_details["formal_best"])
+                if beam_polish_details.get("formal_best") is not None else None
+            ),
+        },
+        "enable_work_transfer": enable_work_transfer,
+        "protect_source_continuity": protect_source_continuity,
+        "strict_local_transactions": strict_local_transactions,
+        "source_hash": source_hash,
+        "use_legacy_seed": use_legacy_seed,
+        "enable_multi_relay": enable_multi_relay,
         "window_results": window_results,
         "strict_improvements": [item for item in updates if item["strict_source_improvement"]],
         "candidate_updates": updates,
@@ -862,6 +940,36 @@ def main():
         default=True,
         help="Run fixed-H block and operational continuity repairs after descent.",
     )
+    parser.add_argument(
+        "--work-transfer",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable explicit local work/position transfer transactions.",
+    )
+    parser.add_argument(
+        "--continuity-protection",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Reject fixed-H candidates that add work revisits or bay fragments.",
+    )
+    parser.add_argument(
+        "--strict-local-transactions",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use only explicit transactions in fixed-H polish; disable legacy decoders.",
+    )
+    parser.add_argument(
+        "--legacy-seed",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Ablation: spend the first descent slice on the old cumulative seed.",
+    )
+    parser.add_argument(
+        "--multi-relay",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable depth-two adjacent multi-crane relay transactions.",
+    )
     parser.add_argument("--source-budget", type=float, default=5.0)
     parser.add_argument(
         "--source-restarts", type=int, default=100_000,
@@ -899,6 +1007,11 @@ def main():
                 "without_step7": args.source_without_step7,
                 "descent": args.descent,
                 "operational_repairs": args.operational_repairs,
+                "work_transfer": args.work_transfer,
+                "continuity_protection": args.continuity_protection,
+                "strict_local_transactions": args.strict_local_transactions,
+                "legacy_seed": args.legacy_seed,
+                "multi_relay": args.multi_relay,
                 },
                 "instances": {}}
     for name, (input_path, source_path) in selected_instances.items():
@@ -981,6 +1094,12 @@ def main():
                                 cumulative_local=not args.independent_windows,
                                 enable_descent=args.descent,
                                 enable_operational_repairs=args.operational_repairs,
+                                enable_work_transfer=args.work_transfer,
+                                protect_source_continuity=args.continuity_protection,
+                                strict_local_transactions=args.strict_local_transactions,
+                                source_hash=sha256(selected_source),
+                                use_legacy_seed=args.legacy_seed,
+                                enable_multi_relay=args.multi_relay,
                                 plot_dir=(
                                     args.out / "window_plots" / name
                                     / f"seed_{seed}" / f"budget_{budget:g}s" / mode

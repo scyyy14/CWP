@@ -809,6 +809,700 @@ def _candidate_from_history_with_frozen_work(
     )
 
 
+def _candidate_from_rows_and_work_plan(
+    W: Sequence[int],
+    M: int,
+    history: Sequence[tuple[int, ...]],
+    work_plan: dict[tuple[int, int], int | None],
+) -> _CandidateSchedule:
+    """Build a zero-time candidate from an explicit position/work ledger.
+
+    This is deliberately separate from :func:`_candidate_from_history`.  The
+    latter is a useful construction decoder, but it is allowed to assign the
+    next unfinished bay greedily at a position.  A Step 8 transaction must
+    never do that: every cell in the local transaction has an explicit
+    ``work_bay`` (or ``None`` for idle/offrail), and the complete ledger is
+    checked before a candidate is returned.
+    """
+    if len(history) < 2:
+        raise RuntimeError("显式工作事务至少需要一个时间槽。")
+    horizon = len(history) - 1
+    rows = [tuple(int(value) for value in row) for row in history]
+    if any(len(row) != M for row in rows):
+        raise RuntimeError("显式工作事务的桥吊数量不一致。")
+    expected_keys = {
+        (t, q) for t in range(horizon) for q in range(M)
+    }
+    if set(work_plan) != expected_keys:
+        raise RuntimeError("显式工作账本必须覆盖每个时间槽和桥吊。")
+    for row in rows:
+        if any(right - left < 2 for left, right in zip(row, row[1:])):
+            raise RuntimeError("显式工作事务违反桥吊安全间距。")
+
+    owners: list[set[int]] = [set() for _ in W]
+    loads = [0] * M
+    movement_directions: list[list[int]] = [[] for _ in range(M)]
+    slots: list[Slot] = []
+    for t in range(horizon):
+        positions = rows[t]
+        next_positions = rows[t + 1]
+        for q, (start_bay, end_bay) in enumerate(
+            zip(positions, next_positions)
+        ):
+            bay = work_plan[(t, q)]
+            if bay is not None:
+                bay = int(bay)
+                if not 1 <= bay <= len(W):
+                    raise RuntimeError("显式工作账本包含非法贝位。")
+                if start_bay != bay:
+                    raise RuntimeError(
+                        "显式工作账本与桥吊位置不一致："
+                        f"t={t}, Q{q + 1}, position={start_bay}, work={bay}。"
+                    )
+                if bay in {
+                    other.work_bay for other in slots
+                    if other.time == t and other.state == "work"
+                }:
+                    raise RuntimeError(f"t={t} 同一贝位被重复作业。")
+                owners[bay - 1].add(q)
+                loads[q] += 1
+                slots.append(Slot(t, q + 1, "work", bay, bay, bay))
+            elif 1 <= start_bay <= len(W):
+                slots.append(Slot(t, q + 1, "idle", start_bay, start_bay, None))
+            else:
+                slots.append(Slot(t, q + 1, "offrail", start_bay, start_bay, None))
+
+    if loads is None or any(
+        sum(
+            slot.state == "work" and slot.work_bay == bay
+            for slot in slots
+        ) != required
+        for bay, required in enumerate(W, 1)
+    ):
+        raise RuntimeError("显式工作账本没有守恒全部作业量。")
+    # ``verify_solution`` counts visible zero-time moves only between two
+    # emitted work slots.  A final row is an end boundary, not another
+    # visible slot, so a move into row H is intentionally not counted here.
+    for before_row, after_row in zip(rows, rows[1:horizon]):
+        for q, (before, after) in enumerate(zip(before_row, after_row)):
+            if before != after:
+                movement_directions[q].append(1 if after > before else -1)
+    movement_count = sum(
+        before != after
+        for before_row, after_row in zip(rows, rows[1:horizon])
+        for before, after in zip(before_row, after_row)
+    )
+    reversal_count = sum(
+        previous != current
+        for directions in movement_directions
+        for previous, current in zip(directions, directions[1:])
+    )
+    target_weights = [min(q + 1, M - q) for q in range(M)]
+    return _CandidateSchedule(
+        slots=slots,
+        makespan=horizon,
+        assignment_count=sum(len(item) for item in owners),
+        split_bay_count=sum(len(item) > 1 for item in owners),
+        load_deviation=_load_deviation(loads, target_weights, sum(W)),
+        reversal_count=reversal_count,
+        movement_count=movement_count,
+        loads=loads,
+        owners=owners,
+        move_time=0,
+    )
+
+
+def _normalize_work_transfer_regions(
+    regions: Sequence[dict[str, Any]],
+    horizon: int,
+    M: int,
+) -> tuple[list[dict[str, Any]], set[tuple[int, int]]]:
+    """Validate the strict Step 8 local-transaction range contract."""
+    if not regions:
+        raise RuntimeError("工作事务没有声明局部区域。")
+    by_segment: dict[int, tuple[int, int]] = {}
+    normalized: list[dict[str, Any]] = []
+    for raw in regions:
+        try:
+            q = int(raw["crane"]) - 1
+            start = int(raw["start"])
+            end = int(raw["end_exclusive"])
+            segment = int(raw.get("segment", 0))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("工作事务区域字段不完整。") from exc
+        if not 0 <= q < M:
+            raise RuntimeError("工作事务包含非法桥吊。")
+        if not 0 <= start < end <= horizon:
+            raise RuntimeError("工作事务时间区域超出有效范围。")
+        if end - start > 8:
+            raise RuntimeError("单个工作事务区域不能超过8个时间槽。")
+        old = by_segment.get(segment)
+        if old is not None and old != (start, end):
+            raise RuntimeError("同一事务段的桥吊区域必须使用相同时间边界。")
+        by_segment[segment] = (start, end)
+        normalized.append({
+            "crane": q + 1,
+            "start": start,
+            "end_exclusive": end,
+            "length": end - start,
+            "segment": segment,
+        })
+    if len(by_segment) > 2:
+        raise RuntimeError("一个工作事务最多包含两个时间区段。")
+    intervals = sorted(by_segment.values())
+    if len(intervals) == 2 and intervals[0][1] > intervals[1][0]:
+        raise RuntimeError("两个工作事务区段不能重叠。")
+    active = sorted({item["crane"] - 1 for item in normalized})
+    if len(active) > 3 or active != list(range(active[0], active[-1] + 1)):
+        raise RuntimeError("工作事务最多使用三台相邻桥吊。")
+    editable = {
+        (t, q)
+        for item in normalized
+        for t in range(item["start"], item["end_exclusive"])
+        for q in (item["crane"] - 1,)
+    }
+    return normalized, editable
+
+
+def _candidate_from_explicit_work_transaction(
+    W: Sequence[int],
+    M: int,
+    history: Sequence[tuple[int, ...]],
+    source: _CandidateSchedule,
+    work_plan: dict[tuple[int, int], int | None],
+    regions: Sequence[dict[str, Any]],
+    *,
+    source_hash: str | None = None,
+    transaction_source_hash: str | None = None,
+) -> _CandidateSchedule:
+    """Apply one complete local work/position transaction.
+
+    ``source_hash`` is the current source artifact hash and
+    ``transaction_source_hash`` is the hash captured when the proposal was
+    generated.  The solver has no filesystem dependency, so the complete
+    source trajectory signature remains the in-memory binding as well.  The
+    returned candidate is still independently verified by the caller with
+    the real ``S``.
+    """
+    if transaction_source_hash != source_hash:
+        raise RuntimeError("工作事务 source_hash 与当前源方案不匹配。")
+    if source.move_time != 0:
+        raise RuntimeError("严格工作事务暂只支持 move_time=0。")
+    if len(history) != source.makespan + 1:
+        raise RuntimeError("工作事务不能改变固定H的时间轴。")
+    normalized, editable = _normalize_work_transfer_regions(
+        regions, source.makespan, M
+    )
+    source_rows = [tuple(row) for row in _candidate_position_rows(source, M)]
+    rows = [tuple(int(value) for value in row) for row in history]
+    if len(rows) != len(source_rows) or any(
+        len(row) != M for row in rows
+    ):
+        raise RuntimeError("工作事务轨迹尺寸不一致。")
+    expected_keys = {
+        (t, q) for t in range(source.makespan) for q in range(M)
+    }
+    if set(work_plan) != expected_keys:
+        raise RuntimeError("工作事务账本没有覆盖完整时间轴。")
+    source_work = {
+        (slot.time, slot.crane - 1): int(slot.work_bay)
+        for slot in source.slots
+        if slot.state == "work" and slot.work_bay is not None
+    }
+
+    # A row is allowed to change only when one of its incident slots belongs
+    # to the declared transaction.  This makes boundary moves explicit while
+    # preserving every field of all outside slots.
+    allowed_rows = {
+        (row_t, q)
+        for slot_t, q in editable
+        for row_t in (slot_t, slot_t + 1)
+    }
+    for t, (before, after) in enumerate(zip(source_rows, rows)):
+        for q, (left, right) in enumerate(zip(before, after)):
+            if left != right and (t, q) not in allowed_rows:
+                raise RuntimeError(
+                    f"位置变化超出声明事务区域：t={t}, Q{q + 1}。"
+                )
+    for q, (left, right) in enumerate(zip(source_rows[-1], rows[-1])):
+        if left != right and (source.makespan - 1, q) not in editable:
+            raise RuntimeError(f"末端边界位置变化未声明：Q{q + 1}。")
+
+    for t in range(source.makespan):
+        for q in range(M):
+            key = (t, q)
+            if key not in editable and work_plan[key] != source_work.get(key):
+                raise RuntimeError(
+                    f"窗口外作业发生变化：t={t}, Q{q + 1}, "
+                    f"source={source_work.get(key)}, new={work_plan[key]}。"
+                )
+
+    candidate = _candidate_from_rows_and_work_plan(W, M, rows, work_plan)
+    source_slot_map = {(slot.time, slot.crane - 1): slot for slot in source.slots}
+    candidate_slot_map = {
+        (slot.time, slot.crane - 1): slot for slot in candidate.slots
+    }
+    for t in range(source.makespan):
+        for q in range(M):
+            if (t, q) in editable:
+                continue
+            before = source_slot_map[(t, q)]
+            after = candidate_slot_map[(t, q)]
+            if (
+                before.state, before.start_bay, before.end_bay, before.work_bay,
+                before.move_id, before.move_step, before.move_steps,
+            ) != (
+                after.state, after.start_bay, after.end_bay, after.work_bay,
+                after.move_id, after.move_step, after.move_steps,
+            ):
+                raise RuntimeError(
+                    f"窗口外槽位字段发生变化：t={t}, Q{q + 1}。"
+                )
+    return candidate
+
+
+def _transaction_rows_work_map(
+    candidate: _CandidateSchedule,
+    M: int,
+) -> tuple[list[tuple[int, ...]], dict[tuple[int, int], int | None]]:
+    rows = [tuple(row) for row in _candidate_position_rows(candidate, M)]
+    work = {
+        (t, q): None
+        for t in range(candidate.makespan)
+        for q in range(M)
+    }
+    for slot in candidate.slots:
+        if slot.state == "work" and slot.work_bay is not None:
+            work[(slot.time, slot.crane - 1)] = int(slot.work_bay)
+    return rows, work
+
+
+def _work_blocks_for_transaction(
+    work_plan: dict[tuple[int, int], int | None],
+    M: int,
+    horizon: int,
+) -> list[dict[str, int]]:
+    blocks: list[dict[str, int]] = []
+    for q in range(M):
+        t = 0
+        while t < horizon:
+            bay = work_plan.get((t, q))
+            if bay is None:
+                t += 1
+                continue
+            start = t
+            t += 1
+            while t < horizon and work_plan.get((t, q)) == bay:
+                t += 1
+            blocks.append({
+                "crane": q,
+                "bay": int(bay),
+                "start": start,
+                "end": t,
+                "length": t - start,
+            })
+    return blocks
+
+
+def _build_relay_transaction(
+    rows: Sequence[tuple[int, ...]],
+    work_plan: dict[tuple[int, int], int | None],
+    chain: Sequence[int],
+    start: int,
+    end: int,
+    *,
+    operator: str,
+    source_signature: tuple[Any, ...],
+    source_hash: str | None = None,
+) -> dict[str, Any] | None:
+    """Construct a one-segment adjacent relay from an explicit work map.
+
+    ``chain`` is either ``[donor, receiver]`` or a three-crane chain with the
+    final crane idle.  Work moves one position to the right or left while the
+    outer donor leaves the work position.  The surrounding context slot is
+    included in the declared region so no outside transition is silently
+    changed.
+    """
+    horizon = len(rows) - 1
+    if not 0 <= start < end <= horizon:
+        return None
+    region_start = start if start == 0 else start - 1
+    region_end = end
+    if region_end - region_start > 8:
+        return None
+    if len(chain) not in (2, 3):
+        return None
+    direction = 1 if chain[-1] > chain[0] else -1
+    if list(chain) != list(range(chain[0], chain[-1] + direction, direction)):
+        return None
+    chain = tuple(chain)
+    if any(q < 0 or q >= len(rows[0]) for q in chain):
+        return None
+
+    physical = chain if direction > 0 else tuple(reversed(chain))
+    bays: list[int] = []
+    if direction > 0:
+        for q in physical[:-1]:
+            values = {work_plan.get((t, q)) for t in range(start, end)}
+            if len(values) != 1 or None in values:
+                return None
+            bays.append(int(next(iter(values))))
+        if any(work_plan.get((t, physical[-1])) is not None for t in range(start, end)):
+            return None
+    else:
+        for q in physical[1:]:
+            values = {work_plan.get((t, q)) for t in range(start, end)}
+            if len(values) != 1 or None in values:
+                return None
+            bays.append(int(next(iter(values))))
+        if any(work_plan.get((t, physical[0])) is not None for t in range(start, end)):
+            return None
+
+    def safe_rows(outer_position: int) -> list[tuple[int, ...]] | None:
+        changed = [list(row) for row in rows]
+        for t in range(start, end):
+            if direction > 0:
+                changed[t][physical[0]] = outer_position
+                for index, bay in enumerate(bays, 1):
+                    changed[t][physical[index]] = bay
+            else:
+                for index, bay in enumerate(bays):
+                    changed[t][physical[index]] = bay
+                changed[t][physical[-1]] = outer_position
+            if any(
+                right - left < 2
+                for left, right in zip(changed[t], changed[t][1:])
+            ):
+                return None
+        return [tuple(row) for row in changed]
+
+    # Prefer a legal outward position, then the closest legal in-rail position.
+    N = max(max(row) for row in rows if row)
+    outer_q = physical[0] if direction > 0 else physical[-1]
+    target_edge = bays[0] if direction > 0 else bays[-1]
+    choices = [-1] + list(range(1, N + 1)) + [N + 2]
+    choices.sort(key=lambda value: (
+        0 if value in (-1, N + 2) else 1,
+        abs(value - target_edge),
+    ))
+    proposed_rows: list[tuple[int, ...]] | None = None
+    chosen_outer = None
+    for outer in choices:
+        candidate_rows = safe_rows(outer)
+        if candidate_rows is not None:
+            proposed_rows = candidate_rows
+            chosen_outer = outer
+            break
+    if proposed_rows is None or chosen_outer is None:
+        return None
+
+    proposed_work = dict(work_plan)
+    if direction > 0:
+        for t in range(start, end):
+            for q in physical[:-1]:
+                proposed_work[(t, q)] = None
+            for index, bay in enumerate(bays, 1):
+                proposed_work[(t, physical[index])] = bay
+    else:
+        for t in range(start, end):
+            for q in physical[1:]:
+                proposed_work[(t, q)] = None
+            for index, bay in enumerate(bays):
+                proposed_work[(t, physical[index])] = bay
+
+    segment = {
+        "crane": chain[0] + 1,
+        "start": region_start,
+        "end_exclusive": region_end,
+        "length": region_end - region_start,
+        "segment": 0,
+    }
+    regions = [dict(segment, crane=q + 1) for q in physical]
+    return {
+        "operator": operator,
+        "history": proposed_rows,
+        "work_plan": proposed_work,
+        "regions": regions,
+        "source_signature": source_signature,
+        "source_hash": source_hash,
+        "details": {
+            "chain": [q + 1 for q in physical],
+            "direction": "right" if direction > 0 else "left",
+            "source_interval": [start, end],
+            "declared_interval": [region_start, region_end],
+            "outer_crane": outer_q + 1,
+            "outer_position": chosen_outer,
+            "transferred_bays": bays,
+            "work_ledger": {
+                "before": [
+                    {"crane": q + 1, "bay": work_plan.get((start, q))}
+                    for q in physical
+                ],
+                "after": [
+                    {"crane": q + 1, "bay": proposed_work.get((start, q))}
+                    for q in physical
+                ],
+            },
+        },
+    }
+
+
+def _work_transfer_transactions(
+    W: Sequence[int],
+    M: int,
+    source: _CandidateSchedule,
+    *,
+    max_candidates: int = 128,
+    source_hash: str | None = None,
+    enable_multi_relay: bool = True,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Enumerate real adjacent work-transfer transactions from one source.
+
+    The generator only proposes blocks whose receiver is idle for the whole
+    interval.  It therefore cannot claim a benefit merely because a receiver
+    has a large trailing idle suffix.  A candidate must still pass the strict
+    decoder and the independent verifier at the caller.
+    """
+    stats: dict[str, Any] = {
+        "generated": 0,
+        "unique": 0,
+        "capacity_rejected": 0,
+        "safety_rejected": 0,
+        "boundary_rejected": 0,
+        "verified": 0,
+        "accepted": 0,
+        "timeout": 0,
+        "operators": {
+            "paired_residual_exchange": 0,
+            "tail_relay": 0,
+            "idle_fill": 0,
+        },
+    }
+    if source.move_time != 0:
+        stats["unsupported"] = "nonzero_move_time"
+        return [], stats
+    rows, work_plan = _transaction_rows_work_map(source, M)
+    horizon = source.makespan
+    blocks = _work_blocks_for_transaction(work_plan, M, horizon)
+    proposals: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+
+    def interval_choices(left: int, right: int) -> list[tuple[int, int]]:
+        if left >= right:
+            return []
+        result: set[tuple[int, int]] = set()
+        max_length = min(8, right - left)
+        for length in (1, 2, 3, 4, 6, 7, 8):
+            if length > max_length:
+                continue
+            for start in (left, right - length, left + (right - left - length) // 2):
+                if left <= start and start + length <= right:
+                    result.add((start, start + length))
+        return sorted(result, key=lambda value: (-(value[1] - value[0]), value[0]))
+
+    def add(operator: str, chain: Sequence[int], left: int, right: int) -> None:
+        if len(proposals) >= max_candidates:
+            return
+        for start, end in interval_choices(left, right):
+            if len(proposals) >= max_candidates:
+                return
+            item = _build_relay_transaction(
+                rows,
+                work_plan,
+                chain,
+                start,
+                end,
+                operator=operator,
+                source_signature=_trajectory_signature(source),
+                source_hash=source_hash,
+            )
+            stats["generated"] += 1
+            stats["operators"][operator] += 1
+            if item is None:
+                stats["safety_rejected"] += 1
+                continue
+            signature = (
+                tuple(item["history"]),
+                tuple(sorted(item["work_plan"].items())),
+            )
+            if signature in seen:
+                stats["unique"] += 0
+                continue
+            seen.add(signature)
+            item["details"]["source_signature"] = list(
+                item["source_signature"]
+            )
+            proposals.append(item)
+            stats["unique"] += 1
+
+    def add_temporal_residual_exchange(
+        q: int,
+        bay: int,
+        left_end: int,
+        right_start: int,
+        right_end: int,
+    ) -> None:
+        """Move a late residual into an idle gap at the same position.
+
+        This is the smallest genuine continuity transaction: it changes the
+        work ledger at two short, explicitly declared segments while keeping
+        the physical trajectory fixed.  It is useful when a crane waits at a
+        bay and then returns to the same bay later; no global decoder can
+        discover this without inventing a new work assignment.
+        """
+        gap_start, gap_end = left_end, right_start
+        gap_length = gap_end - gap_start
+        if not 0 < gap_length <= 8 or right_end - right_start < gap_length:
+            return
+        if any(rows[t][q] != bay for t in range(gap_start, gap_end)):
+            return
+        proposed_work = dict(work_plan)
+        for t in range(gap_start, gap_end):
+            proposed_work[(t, q)] = bay
+        # Shift the late block left by the gap length.  Removing its *tail*
+        # (rather than its first cells) keeps the old right block connected to
+        # the newly filled gap and therefore actually closes the visit.
+        late_tail_start = right_end - gap_length
+        for t in range(late_tail_start, right_end):
+            proposed_work[(t, q)] = None
+        regions = [
+            {
+                "crane": q + 1,
+                "start": gap_start,
+                "end_exclusive": gap_end,
+                "length": gap_length,
+                "segment": 0,
+            },
+            {
+                "crane": q + 1,
+                "start": late_tail_start,
+                "end_exclusive": right_end,
+                "length": gap_length,
+                "segment": 1,
+            },
+        ]
+        signature = (
+            tuple(rows),
+            tuple(sorted(proposed_work.items())),
+        )
+        if signature in seen or len(proposals) >= max_candidates:
+            return
+        seen.add(signature)
+        proposals.append({
+            "operator": "paired_residual_exchange",
+            "history": [tuple(row) for row in rows],
+            "work_plan": proposed_work,
+            "regions": regions,
+            "source_signature": _trajectory_signature(source),
+            "source_hash": source_hash,
+            "details": {
+                "crane": q + 1,
+                "bay": bay,
+                "source_gap": [gap_start, gap_end],
+                "source_late_residual": [late_tail_start, right_end],
+                "declared_segments": [
+                    [gap_start, gap_end],
+                    [late_tail_start, right_end],
+                ],
+                "work_ledger": {
+                    "moved_count": gap_length,
+                    "from": [late_tail_start, right_end],
+                    "to": [gap_start, gap_end],
+                },
+            },
+        })
+        stats["generated"] += 1
+        stats["unique"] += 1
+        stats["operators"]["paired_residual_exchange"] += 1
+
+    # First enumerate same-bay gap closures.  The blocks are built per crane,
+    # so this cannot accidentally merge work from a different crane or bay.
+    blocks_by_crane: dict[int, list[dict[str, int]]] = {
+        q: sorted((item for item in blocks if item["crane"] == q),
+                  key=lambda item: item["start"])
+        for q in range(M)
+    }
+    for q, crane_blocks in blocks_by_crane.items():
+        for left, right in zip(crane_blocks, crane_blocks[1:]):
+            if left["bay"] != right["bay"]:
+                continue
+            add_temporal_residual_exchange(
+                q, left["bay"], left["end"], right["start"], right["end"]
+            )
+
+    # A pair is a real transfer whenever a work block overlaps an adjacent
+    # crane's idle cells.  Classify short early/late pieces separately so the
+    # report can distinguish residual exchanges from generic idle filling.
+    for block in blocks:
+        q = block["crane"]
+        for direction in (-1, 1):
+            receiver = q + direction
+            if not 0 <= receiver < M:
+                continue
+            left, right = block["start"], block["end"]
+            idle_times = [
+                t for t in range(left, right)
+                if work_plan.get((t, receiver)) is None
+            ]
+            if not idle_times:
+                continue
+            start = min(idle_times)
+            end = start
+            while end < right and work_plan.get((end, receiver)) is None:
+                end += 1
+            operator = (
+                "tail_relay"
+                if end == horizon or start >= max(0, horizon - 12)
+                else "paired_residual_exchange"
+                if block["length"] <= 3
+                else "idle_fill"
+            )
+            # The donor is first in the directed chain.  A leftward transfer
+            # is therefore deliberately passed in descending crane order.
+            chain = [q, receiver]
+            add(operator, chain, start, end)
+
+    # A depth-two adjacent relay moves q0's work to q1 and q1's work to an
+    # idle q2 (or the mirror image).  This is the smallest transaction that
+    # can explain a genuine Q1 -> Q2 -> Q3 hand-off.
+    for left_crane in range(M - 2) if enable_multi_relay else ():
+        chain = [left_crane, left_crane + 1, left_crane + 2]
+        overlap = [
+            t for t in range(horizon)
+            if work_plan.get((t, chain[0])) is not None
+            and work_plan.get((t, chain[1])) is not None
+            and work_plan.get((t, chain[2])) is None
+        ]
+        if overlap:
+            start = min(overlap)
+            end = start
+            while end < horizon and (
+                work_plan.get((end, chain[0])) is not None
+                and work_plan.get((end, chain[1])) is not None
+                and work_plan.get((end, chain[2])) is None
+            ):
+                end += 1
+            add("tail_relay", chain, start, end)
+        right_chain = list(reversed(chain))
+        overlap = [
+            t for t in range(horizon)
+            if work_plan.get((t, right_chain[0])) is None
+            and work_plan.get((t, right_chain[1])) is not None
+            and work_plan.get((t, right_chain[2])) is not None
+        ]
+        if overlap:
+            start = min(overlap)
+            end = start
+            while end < horizon and (
+                work_plan.get((end, right_chain[0])) is None
+                and work_plan.get((end, right_chain[1])) is not None
+                and work_plan.get((end, right_chain[2])) is not None
+            ):
+                end += 1
+            add("tail_relay", right_chain, start, end)
+    return proposals, stats
+
+
 def _continuity_block_neighbors(
     W: Sequence[int],
     M: int,
@@ -3181,6 +3875,11 @@ def _refine_same_horizon_trajectory(
     attempt_trace: list[dict[str, Any]] | None = None,
     continuity: bool = False,
     result_box: dict[str, Any] | None = None,
+    enable_work_transfer: bool = False,
+    protect_source_continuity: bool = False,
+    strict_local_transactions: bool = False,
+    source_hash: str | None = None,
+    enable_multi_relay: bool = True,
 ) -> tuple[_CandidateSchedule, int]:
     """Polish a complete shortened trajectory without changing its horizon.
 
@@ -3200,6 +3899,7 @@ def _refine_same_horizon_trajectory(
     continuity_best = candidate
     operational_best = candidate
     baseline = candidate
+    baseline_continuity = _continuity_diagnostics(candidate, M)
     evaluated_total = 0
     polish_started_at = time.perf_counter()
     cycle = 0
@@ -3221,6 +3921,18 @@ def _refine_same_horizon_trajectory(
         "operational_improvements": 0,
         "time_seconds": 0.0,
         "operator": operator_stats,
+        "work_transfer": {
+            "rounds": 0,
+            "generated": 0,
+            "unique": 0,
+            "capacity_rejected": 0,
+            "safety_rejected": 0,
+            "boundary_rejected": 0,
+            "verified": 0,
+            "accepted": 0,
+            "operators": {},
+        },
+        "continuity_rejected": 0,
     }
     stop_reason = "deadline"
 
@@ -3233,6 +3945,7 @@ def _refine_same_horizon_trajectory(
             "decoded": 0,
             "verified": 0,
             "accepted": 0,
+            "continuity_rejected": 0,
         })
 
     def continuity_allowed(proposed: _CandidateSchedule) -> bool:
@@ -3257,6 +3970,7 @@ def _refine_same_horizon_trajectory(
         before_history: Sequence[tuple[int, ...]],
         decode_failed: bool = False,
         declared_regions: list[dict[str, Any]] | None = None,
+        transaction_metadata: dict[str, Any] | None = None,
     ) -> tuple[bool, bool]:
         """Validate and consider one proposal; return (accepted, legal)."""
         nonlocal best, formal_best, continuity_best, operational_best, evaluated_total
@@ -3264,10 +3978,24 @@ def _refine_same_horizon_trajectory(
         counter["generated"] += 1
         continuity_stats["generated"] += 1
         candidate_found = proposed is not None
+        continuity_guard_rejected = False
         candidate_legal = proposed is not None and (
             proposed.makespan == best.makespan
             and _candidate_passes_independent_verifier(W, M, starts, proposed)
         )
+        if candidate_legal and protect_source_continuity and proposed is not None:
+            proposed_continuity = _continuity_diagnostics(proposed, M)
+            if (
+                proposed_continuity["work_revisit_count"]
+                > baseline_continuity["work_revisit_count"]
+                or proposed_continuity["bay_fragmentation"]
+                > baseline_continuity["bay_fragmentation"]
+            ):
+                continuity_guard_rejected = True
+                counter["continuity_rejected"] += 1
+                continuity_stats["continuity_rejected"] += 1
+                proposed = None
+                candidate_legal = False
         if decode_failed:
             counter["capacity_rejected"] += 1
             continuity_stats["capacity_rejected"] += 1
@@ -3359,6 +4087,8 @@ def _refine_same_horizon_trajectory(
                 "candidate_found": candidate_found,
                 "candidate_legal": candidate_legal,
                 "accepted": accepted,
+                "continuity_guard_rejected": continuity_guard_rejected,
+                "transaction": transaction_metadata,
                 "before_objective": list(before_key),
                 "before_smoothness": list(before_smoothness),
                 "after_objective": (
@@ -3386,6 +4116,74 @@ def _refine_same_horizon_trajectory(
         # explainable proposals and are the primary way to remove short
         # hand-offs without relying on isolated random cell edits.
         progress = False
+        if enable_work_transfer:
+            transactions, transaction_stats = _work_transfer_transactions(
+                W, M, best, max_candidates=128, source_hash=source_hash,
+                enable_multi_relay=enable_multi_relay,
+            )
+            work_stats = continuity_stats["work_transfer"]
+            work_stats["rounds"] += 1
+            for key in (
+                "generated", "unique", "capacity_rejected",
+                "safety_rejected", "boundary_rejected", "verified",
+                "accepted",
+            ):
+                work_stats[key] += int(transaction_stats.get(key, 0))
+            for name, count in (transaction_stats.get("operators") or {}).items():
+                work_stats["operators"][name] = (
+                    work_stats["operators"].get(name, 0) + int(count)
+                )
+            for transaction_index, transaction in enumerate(transactions):
+                if time.perf_counter() >= deadline:
+                    break
+                if transaction.get("source_signature") != _trajectory_signature(best):
+                    continuity_stats["work_transfer"]["boundary_rejected"] += 1
+                    continue
+                before_key = best.objective_key
+                before_smoothness = _trajectory_smoothness(best, M)
+                before_history = [
+                    tuple(row) for row in _candidate_position_rows(best, M)
+                ]
+                operator = str(transaction["operator"])
+                metadata = dict(transaction.get("details") or {})
+                metadata.update({
+                    "source_signature": list(transaction["source_signature"]),
+                    "source_hash": source_hash,
+                    "transaction_index": transaction_index,
+                })
+                try:
+                    proposed = _candidate_from_explicit_work_transaction(
+                        W, M, transaction["history"], best,
+                        transaction["work_plan"], transaction["regions"],
+                        source_hash=source_hash,
+                        transaction_source_hash=transaction.get("source_hash"),
+                    )
+                    continuity_stats["work_transfer"]["verified"] += 1
+                except RuntimeError:
+                    proposed = None
+                    continuity_stats["work_transfer"]["safety_rejected"] += 1
+                accepted, legal = record_candidate(
+                    proposed, operator, before_key, before_smoothness,
+                    cycle, transaction_index, before_history,
+                    decode_failed=proposed is None,
+                    declared_regions=transaction["regions"],
+                    transaction_metadata=metadata,
+                )
+                if legal:
+                    continuity_stats["work_transfer"]["accepted"] += int(accepted)
+                if accepted:
+                    progress = True
+            if progress:
+                stale_cycles = 0
+                cycle += 1
+                continue
+        if strict_local_transactions:
+            # In strict mode the explicit transaction engine is the complete
+            # fixed-H neighborhood.  Do not fall through to the historical
+            # position-only decoder after a transaction is rejected.
+            stale_cycles += 1
+            cycle += 1
+            continue
         segment_proposals = _trajectory_segment_neighbors(W, M, starts, best)
         declared_by_proposal: dict[tuple[str, tuple[tuple[int, ...], ...]], list[dict[str, Any]]] = {}
         if continuity:
@@ -3419,6 +4217,8 @@ def _refine_same_horizon_trajectory(
                     proposed = _candidate_from_history_with_frozen_work(
                         W, M, history, best, declared_regions
                     )
+                elif strict_local_transactions:
+                    proposed = None
                 else:
                     proposed = _candidate_from_history(
                         W, M, history, move_time, preserve_horizon=True
@@ -3789,6 +4589,12 @@ def _cumulative_local_trajectory_repair_iterative(
     enable_descent: bool = True,
     enable_operational_repairs: bool = True,
     preserve_horizon: bool = False,
+    enable_work_transfer: bool = False,
+    protect_source_continuity: bool = False,
+    strict_local_transactions: bool = False,
+    source_hash: str | None = None,
+    use_legacy_seed: bool = False,
+    enable_multi_relay: bool = True,
 ) -> tuple[
     _CandidateSchedule | None, int, _CandidateSchedule, _CandidateSchedule | None
 ]:
@@ -3897,6 +4703,11 @@ def _cumulative_local_trajectory_repair_iterative(
             attempt_trace=attempt_trace,
             continuity=True,
             result_box=details,
+            enable_work_transfer=enable_work_transfer,
+            protect_source_continuity=protect_source_continuity,
+            strict_local_transactions=strict_local_transactions,
+            source_hash=source_hash,
+            enable_multi_relay=enable_multi_relay,
         )
         evaluated_total += evaluated
         formal = details.get("formal_best", polished)
@@ -3992,7 +4803,8 @@ def _cumulative_local_trajectory_repair_iterative(
 
     legacy_seed_used = False
     if (
-        enable_descent
+        use_legacy_seed
+        and enable_descent
         and not preserve_horizon
         and current.makespan > safe_lower_bound
         and time.perf_counter() < descent_phase_deadline
@@ -4164,6 +4976,7 @@ def _cumulative_local_trajectory_repair_iterative(
             "horizons_seen": sorted(first_by_h),
             "descent_rounds": len(descent_history),
             "legacy_seed_used": legacy_seed_used,
+            "use_legacy_seed": use_legacy_seed,
             "preserve_horizon": preserve_horizon,
         })
     aggregate_stats = {
@@ -4178,12 +4991,24 @@ def _cumulative_local_trajectory_repair_iterative(
         "formal_improvements": 0,
         "operational_improvements": 0,
         "operator": {},
+        "continuity_rejected": 0,
+        "work_transfer": {
+            "rounds": 0,
+            "generated": 0,
+            "unique": 0,
+            "capacity_rejected": 0,
+            "safety_rejected": 0,
+            "boundary_rejected": 0,
+            "verified": 0,
+            "accepted": 0,
+            "operators": {},
+        },
     }
     if continuity_output is not None:
         for run in continuity_output.get("polish_runs", []):
             stats = run.get("stats") or {}
             for key in aggregate_stats:
-                if key == "operator":
+                if key in {"operator", "work_transfer"}:
                     continue
                 if isinstance(stats.get(key), int):
                     aggregate_stats[key] += stats[key]
@@ -4192,6 +5017,19 @@ def _cumulative_local_trajectory_repair_iterative(
                 for key, value in values.items():
                     if isinstance(value, int):
                         destination[key] = destination.get(key, 0) + value
+            source_work_stats = stats.get("work_transfer") or {}
+            target_work_stats = aggregate_stats["work_transfer"]
+            for key in (
+                "rounds", "generated", "unique", "capacity_rejected",
+                "safety_rejected", "boundary_rejected", "verified",
+                "accepted",
+            ):
+                if isinstance(source_work_stats.get(key), int):
+                    target_work_stats[key] += source_work_stats[key]
+            for name, value in (source_work_stats.get("operators") or {}).items():
+                target_work_stats["operators"][name] = (
+                    target_work_stats["operators"].get(name, 0) + int(value)
+                )
         aggregate_stats["polish_runs"] = len(continuity_output.get("polish_runs", []))
     if continuity_output is not None:
         continuity_output.update({
