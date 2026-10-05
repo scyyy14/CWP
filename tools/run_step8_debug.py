@@ -9,7 +9,9 @@ seeds, and custom source schedules without editing the search harness.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
+import webbrowser
 from pathlib import Path
 
 
@@ -19,6 +21,7 @@ if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
 from evaluate_critical_step import main as evaluate_main  # noqa: E402
+from render_reference_schedule import render  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -46,6 +49,11 @@ def parse_args() -> argparse.Namespace:
         default="shorten",
     )
     parser.add_argument("--local-state-limit", type=int, default=256)
+    parser.add_argument(
+        "--no-show",
+        action="store_true",
+        help="Generate the schedule chart without opening it automatically.",
+    )
     args = parser.parse_args()
     if (args.input is None) != (args.source is None):
         parser.error("--input and --source must be supplied together")
@@ -89,12 +97,51 @@ def build_evaluator_args(args: argparse.Namespace) -> list[str]:
     ]
 
 
+def source_path_for(args: argparse.Namespace) -> Path:
+    if args.source is not None:
+        return args.source.expanduser().resolve()
+    return ROOT / "debug_cases" / args.case / "source_schedule.json"
+
+
+def render_and_show_result(args: argparse.Namespace) -> Path:
+    out = args.out.expanduser().resolve()
+    budget_label = f"{args.budget:g}"
+    artifact_dir = (
+        out / "schedule_artifacts" / "fixed" / f"seed_{args.seed}"
+        / f"budget_{budget_label}s" / "trajectory"
+    )
+    result_json = artifact_dir / "execution_best.json"
+    if not result_json.exists():
+        result_json = artifact_dir / "source.json"
+    if not result_json.exists():
+        result_json = source_path_for(args)
+
+    payload = json.loads(result_json.read_text(encoding="utf-8"))
+    chart_path = out / "step8_best_schedule.svg"
+    title = (
+        "Step 8 best schedule"
+        f" — C{payload.get('makespan', '?')}, K{payload.get('movement_count', '?')}"
+    )
+    render(payload, chart_path, title=title)
+    print(f"Step 8 schedule chart: {chart_path}", flush=True)
+    if not args.no_show:
+        opened = webbrowser.open(chart_path.as_uri(), new=1)
+        if not opened:
+            print(
+                "The chart was generated but the system could not open it; "
+                f"open this file manually: {chart_path}",
+                flush=True,
+            )
+    return chart_path
+
+
 def main() -> None:
     args = parse_args()
     evaluator_args = build_evaluator_args(args)
     print("Step 8 debug command:", " ".join(evaluator_args), flush=True)
     sys.argv = evaluator_args
     evaluate_main()
+    render_and_show_result(args)
 
 
 if __name__ == "__main__":

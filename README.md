@@ -139,4 +139,4 @@ python cwp_solver.py
 - Working directory：本项目根目录；
 - Python interpreter：Python 3.10+ 的项目虚拟环境。
 
-若要只调试最新版第八步，请直接运行 `tools/run_step8_debug.py`，Parameters 留空即可。仓库已包含 H208、H280 两组输入和原排工；切换样例、预算、随机种子或自定义原排工的方法见 [STEP8_DEBUG.md](STEP8_DEBUG.md)。
+若要只调试最新版第八步，请直接运行 `tools/run_step8_debug.py`，Parameters 留空即可；搜索完成后会自动生成并弹出最佳排工图。仓库已包含 H208、H280 两组输入和原排工；切换样例、预算、随机种子或自定义原排工的方法见 [STEP8_DEBUG.md](STEP8_DEBUG.md)。

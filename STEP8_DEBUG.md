@@ -11,13 +11,17 @@
 - Working directory：项目根目录 `CWP`
 - Python interpreter：项目虚拟环境中的 Python 3.10+
 
-留空参数时默认使用仓库内的 H208 原排工，搜索 30 秒，并将结果写入 `experiments/step8_debug/`。主要结果位于：
+留空参数时默认使用仓库内的 H208 原排工，搜索 30 秒，将结果写入 `experiments/step8_debug/`，随后自动生成并弹出最佳排工图。主要结果位于：
 
 ```text
 experiments/step8_debug/schedule_artifacts/fixed/seed_0/budget_30s/trajectory/
 ```
 
-其中 `source.json` 是原排工，`execution_best.json` 是以正式目标 `(全部工作实际完工时间, 移动次数)` 选择的执行方案，`recommended_best.json` 是兼顾完工同步性的推荐方案。
+其中 `source.json` 是原排工，`execution_best.json` 是以正式目标 `(全部工作实际完工时间, 移动次数)` 选择的执行方案，`recommended_best.json` 是兼顾完工同步性的推荐方案。自动弹出的图片同时保存在：
+
+```text
+experiments/step8_debug/step8_best_schedule.svg
+```
 
 ## 在 PyCharm 中改变参数
 
@@ -35,6 +39,7 @@ experiments/step8_debug/schedule_artifacts/fixed/seed_0/budget_30s/trajectory/
 - `--target-mode shorten|same_horizon|auto`：缩短完工时间、固定工期优化或自动选择；
 - `--local-state-limit 整数`：局部循环交换的状态上限；
 - `--out 目录`：输出目录。
+- `--no-show`：仍生成排工图，但不自动弹出，适用于服务器或批量测试。
 
 测试自己的原方案时，同时给出实例输入和原排工 JSON：
 
