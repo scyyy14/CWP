@@ -9,6 +9,7 @@ Matplotlib is used only to draw the final schedule.
 from __future__ import annotations
 
 import argparse
+import bisect
 import functools
 import itertools
 import json
@@ -34,6 +35,67 @@ class Slot:
     move_id: int | None = None
     move_step: int | None = None
     move_steps: int | None = None
+
+
+def _work_completion_time(slots: Sequence[Slot]) -> int:
+    """Return the boundary immediately after the last unit of actual work."""
+    return max(
+        (int(slot.time) + 1 for slot in slots if slot.state == "work"),
+        default=0,
+    )
+
+
+def _movement_count_until_completion(
+    slots: Sequence[Slot],
+    M: int,
+    move_time: int,
+    completion_time: int,
+) -> int:
+    """Count distinct crane relocations that start before all work finishes."""
+    if completion_time <= 0:
+        return 0
+    if move_time == 0:
+        by_time: dict[int, dict[int, Slot]] = {}
+        for slot in slots:
+            if slot.time < completion_time:
+                by_time.setdefault(int(slot.time), {})[int(slot.crane) - 1] = slot
+        return sum(
+            by_time[t - 1][q].end_bay != by_time[t][q].start_bay
+            for t in range(1, completion_time)
+            for q in range(M)
+            if q in by_time.get(t - 1, {}) and q in by_time.get(t, {})
+        )
+    moves = [
+        slot for slot in slots
+        if slot.state == "move" and slot.time < completion_time
+    ]
+    if move_time == 1:
+        return len(moves)
+    return len({(int(slot.crane), int(slot.move_id)) for slot in moves})
+
+
+def _trajectory_reversal_count(
+    slots: Sequence[Slot], M: int, move_time: int,
+) -> int:
+    """Count direction changes in the visible trajectory for either move model."""
+    if move_time != 0:
+        return _count_reversals(slots, M)
+    by_time: dict[int, dict[int, Slot]] = {}
+    for slot in slots:
+        by_time.setdefault(int(slot.time), {})[int(slot.crane) - 1] = slot
+    directions: list[list[int]] = [[] for _ in range(M)]
+    for t in range(1, max(by_time, default=-1) + 1):
+        for q in range(M):
+            before = by_time.get(t - 1, {}).get(q)
+            current = by_time.get(t, {}).get(q)
+            if before is None or current is None or before.end_bay == current.start_bay:
+                continue
+            directions[q].append(1 if current.start_bay > before.end_bay else -1)
+    return sum(
+        previous != current
+        for crane_directions in directions
+        for previous, current in zip(crane_directions, crane_directions[1:])
+    )
 
 
 @dataclass
@@ -74,6 +136,8 @@ class Solution:
     phase_seconds: dict[str, float] = field(default_factory=dict)
     operator_calls: dict[str, int] = field(default_factory=dict)
     move_time: int = 1
+    schedule_horizon: int | None = None
+    schedule_movement_count: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)
@@ -109,16 +173,63 @@ class _CandidateSchedule:
     loads: list[int]
     owners: list[set[int]]
     move_time: int = 1
+    completion_time: int = field(init=False)
+    completion_movement_count: int = field(init=False)
+    normalization_source_horizon: int | None = field(default=None, init=False)
+    normalization_trimmed_slots: int = field(default=0, init=False)
+
+    def __post_init__(self) -> None:
+        self.completion_time = _work_completion_time(self.slots)
+        self.completion_movement_count = _movement_count_until_completion(
+            self.slots, len(self.loads), self.move_time, self.completion_time
+        )
 
     @property
-    def objective_key(self) -> tuple[int, int, int, int]:
-        """User priorities: duration, single-crane bays, moves, central load."""
-        return (
-            self.makespan,
-            self.split_bay_count,
-            self.movement_count,
-            self.load_deviation,
-        )
+    def schedule_horizon(self) -> int:
+        """Length of the stored trajectory, which may include trailing idle."""
+        return self.makespan
+
+    @property
+    def objective_key(self) -> tuple[int, int]:
+        """User priorities: actual work completion time, then crane moves."""
+        return (self.completion_time, self.completion_movement_count)
+
+
+def _normalize_completed_candidate(
+    candidate: _CandidateSchedule,
+) -> _CandidateSchedule:
+    """Drop a zero-time trajectory's all-idle tail without changing its work."""
+    completion = candidate.completion_time
+    if candidate.move_time != 0 or completion >= candidate.makespan:
+        return candidate
+    slots = [slot for slot in candidate.slots if slot.time < completion]
+    movements = _movement_count_until_completion(
+        slots, len(candidate.loads), candidate.move_time, completion
+    )
+    normalized = _CandidateSchedule(
+        slots=slots,
+        makespan=completion,
+        assignment_count=candidate.assignment_count,
+        split_bay_count=candidate.split_bay_count,
+        load_deviation=candidate.load_deviation,
+        reversal_count=_trajectory_reversal_count(
+            slots, len(candidate.loads), candidate.move_time
+        ),
+        movement_count=movements,
+        loads=list(candidate.loads),
+        owners=[set(owner) for owner in candidate.owners],
+        move_time=candidate.move_time,
+    )
+    normalized.normalization_source_horizon = (
+        candidate.normalization_source_horizon
+        if candidate.normalization_source_horizon is not None
+        else candidate.schedule_horizon
+    )
+    normalized.normalization_trimmed_slots = (
+        candidate.normalization_trimmed_slots
+        + candidate.schedule_horizon - completion
+    )
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -247,6 +358,7 @@ def _trajectory_smoothness(
 def _continuity_diagnostics(
     candidate: _CandidateSchedule,
     M: int,
+    starts: Sequence[int] | None = None,
 ) -> dict[str, Any]:
     """Describe real work fragmentation and crane revisits.
 
@@ -320,6 +432,61 @@ def _continuity_diagnostics(
                 })
         bay_gaps_by_bay[str(bay)] = gaps
 
+    # Work-segment diagnostics are crane/bay specific.  A bay-level block
+    # count alone cannot see that a local exchange has moved a one-slot
+    # fragment from one crane to another (the H=208 Q1/Q2 regression did
+    # exactly that), so keep the full segment identity here.
+    work_blocks_by_crane_bay: dict[str, list[dict[str, Any]]] = {}
+    for q in range(M):
+        by_bay: dict[int, list[int]] = {}
+        for (time, crane), bay in work_by_time_crane.items():
+            if crane == q:
+                by_bay.setdefault(int(bay), []).append(int(time))
+        for bay, times in sorted(by_bay.items()):
+            unique = sorted(set(times))
+            start = previous = unique[0]
+            for value in unique[1:] + [None]:
+                if value is not None and value == previous + 1:
+                    previous = value
+                    continue
+                work_blocks_by_crane_bay.setdefault(str(q + 1), []).append({
+                    "crane": q + 1,
+                    "bay": bay,
+                    "start": start,
+                    "end_exclusive": previous + 1,
+                    "length": previous - start + 1,
+                })
+                if value is not None:
+                    start = previous = value
+
+    work_block_count_by_crane_bay: dict[str, dict[str, int]] = {
+        crane: {
+            str(bay): sum(
+                int(block["bay"]) == bay for block in blocks
+            )
+            for bay in sorted({int(block["bay"]) for block in blocks})
+        }
+        for crane, blocks in work_blocks_by_crane_bay.items()
+    }
+    extra_work_blocks_total = sum(
+        max(0, count - 1)
+        for by_bay in work_block_count_by_crane_bay.values()
+        for count in by_bay.values()
+    )
+
+    short_excursions = _short_excursion_details(candidate, M)
+    short_excursion_records = [
+        {
+            "crane": crane + 1,
+            "start": start,
+            "end_exclusive": end + 1,
+            "base_position": base,
+            "excursion_position": excursion,
+            "work_count": work_count,
+            "length": end - start + 1,
+        }
+        for crane, start, end, base, excursion, work_count in short_excursions
+    ]
     if candidate.move_time == 0:
         rows = _candidate_position_rows(candidate, M)
     else:
@@ -333,6 +500,22 @@ def _continuity_diagnostics(
             )]
             for t in range(horizon)
         ]
+
+    movement_arcs_by_crane: dict[str, list[dict[str, int]]] = {}
+    movement_count_by_crane: dict[str, int] = {}
+    for q in range(M):
+        arcs: list[dict[str, int]] = []
+        if rows:
+            for t, (before, after) in enumerate(zip(rows, rows[1:])):
+                if before[q] != after[q]:
+                    arcs.append({
+                        "time": t,
+                        "from": int(before[q]),
+                        "to": int(after[q]),
+                        "direction": 1 if after[q] > before[q] else -1,
+                    })
+        movement_arcs_by_crane[str(q + 1)] = arcs
+        movement_count_by_crane[str(q + 1)] = len(arcs)
 
     crane_position_blocks: list[dict[str, Any]] = []
     crane_work_revisits: list[dict[str, Any]] = []
@@ -370,8 +553,9 @@ def _continuity_diagnostics(
             start = end
         crane_position_blocks.extend(blocks)
         seen_work: dict[int, dict[str, Any]] = {}
+        first_work: dict[int, dict[str, Any]] = {}
         seen_any: dict[int, dict[str, Any]] = {}
-        for block in blocks:
+        for block_index, block in enumerate(blocks):
             position = int(block["position"])
             previous_any = seen_any.get(position)
             if previous_any is not None:
@@ -391,6 +575,19 @@ def _continuity_diagnostics(
             if block["work_count"]:
                 previous_work = seen_work.get(position)
                 if previous_work is not None:
+                    primary_work = first_work[position]
+                    gap = max(
+                        0, int(block["start"])
+                        - int(previous_work["end_exclusive"]),
+                    )
+                    previous_position = (
+                        blocks[block_index - 1]["position"]
+                        if block_index > 0 else None
+                    )
+                    next_position = (
+                        blocks[block_index + 1]["position"]
+                        if block_index + 1 < len(blocks) else None
+                    )
                     work_revisit_count += 1
                     crane_work_revisits.append({
                         "crane": q + 1,
@@ -399,24 +596,195 @@ def _continuity_diagnostics(
                         "end_exclusive": block["end_exclusive"],
                         "length": block["length"],
                         "work_count": block["work_count"],
+                        "gap": gap,
+                        "residual_length": block["work_count"],
+                        "primary_block": {
+                            "start": primary_work["start"],
+                            "end_exclusive": primary_work["end_exclusive"],
+                            "length": primary_work["length"],
+                            "work_count": primary_work["work_count"],
+                        },
+                        "residual_block": {
+                            "start": block["start"],
+                            "end_exclusive": block["end_exclusive"],
+                            "length": block["length"],
+                            "work_count": block["work_count"],
+                        },
                         "previous_block": {
                             "start": previous_work["start"],
                             "end_exclusive": previous_work["end_exclusive"],
                             "length": previous_work["length"],
                             "work_count": previous_work["work_count"],
                         },
+                        "movement_before": (
+                            previous_position is not None
+                            and previous_position != position
+                        ),
+                        "movement_after": (
+                            next_position is not None
+                            and next_position != position
+                        ),
+                        "total_work_on_crane_bay": sum(
+                            int(item["length"])
+                            for item in work_blocks_by_crane_bay.get(
+                                str(q + 1), []
+                            )
+                            if int(item["bay"]) == position
+                        ),
+                        "prefix_completion_end": int(primary_work["start"])
+                        + sum(
+                            int(item["length"])
+                            for item in work_blocks_by_crane_bay.get(
+                                str(q + 1), []
+                            )
+                            if int(item["bay"]) == position
+                        ),
                     })
+                else:
+                    first_work[position] = block
                 seen_work[position] = block
             seen_any[position] = block
+
+    # Attach the adjacent conflict chain to each revisit after all crane
+    # position blocks are available.  This is diagnostic metadata only; the
+    # phase operator still derives its active band from the crane index and
+    # safety closure rather than from a hard-coded Q3/bay13 exception.
+    for revisit in crane_work_revisits:
+        gap_start = int(revisit["primary_block"]["end_exclusive"])
+        gap_end = int(revisit["residual_block"]["start"])
+        residual_end = int(revisit["residual_block"]["end_exclusive"])
+        focus_crane = int(revisit["crane"])
+        interfering_blocks = [
+            {
+                "crane": int(block["crane"]),
+                "start": int(block["start"]),
+                "end_exclusive": int(block["end_exclusive"]),
+                "position": int(block["position"]),
+                "state": block["state"],
+            }
+            for block in crane_position_blocks
+            if int(block["crane"]) != focus_crane
+            and int(block["start"]) < residual_end
+            and int(block["end_exclusive"]) > gap_start
+        ]
+        revisit["interfering_cranes"] = sorted({
+            int(block["crane"]) for block in interfering_blocks
+        })
+        revisit["interfering_blocks"] = interfering_blocks
+        revisit["gap_interval"] = {
+            "start": gap_start,
+            "end_exclusive": gap_end,
+            "length": max(0, gap_end - gap_start),
+        }
+
+    terminal_returns = [
+        item for item in crane_work_revisits
+        if int(item["end_exclusive"]) >= horizon - 8
+    ]
+    required_starts = {int(bay) for bay in (starts or ())}
+    forced_prefix_interruptions: list[dict[str, Any]] = []
+    for revisit in crane_work_revisits:
+        primary = revisit["primary_block"]
+        residual = revisit["residual_block"]
+        crane = int(revisit["crane"])
+        bay = int(revisit["bay"])
+        prefix_start = int(primary["start"])
+        prefix_end = int(primary["end_exclusive"])
+        gap_start = prefix_end
+        gap_end = int(residual["start"])
+        prefix_work = int(primary["work_count"])
+        residual_work = int(residual["work_count"])
+        if (
+            bay not in required_starts
+            or prefix_start != 0
+            or prefix_work > 2
+            or int(revisit["gap"]) > 8
+            or residual_work < 8
+        ):
+            continue
+        interruption_slots = [
+            (time, work_bay)
+            for (time, q), work_bay in work_by_time_crane.items()
+            if q == crane - 1
+            and gap_start <= time < gap_end
+            and work_bay != bay
+        ]
+        if not interruption_slots:
+            continue
+        forced_prefix_interruptions.append({
+            "crane": crane,
+            "forced_bay": bay,
+            "prefix": [prefix_start, prefix_end],
+            "gap": [gap_start, gap_end],
+            "residual": [int(residual["start"]), int(residual["end_exclusive"])],
+            "interrupt_bays": sorted({int(work_bay) for _, work_bay in interruption_slots}),
+            "interrupt_work": len(interruption_slots),
+            "merged_length": int(revisit["total_work_on_crane_bay"]),
+            "movement_penalty": int(bool(revisit.get("movement_before"))),
+        })
+    micro_work_blocks = [
+        block
+        for blocks in work_blocks_by_crane_bay.values()
+        for block in blocks
+        if int(block["length"]) <= 2
+    ]
+    long_revisit_count = sum(
+        int(item["gap"]) >= 8 for item in crane_work_revisits
+    )
+    multi_slot_revisits = [
+        item for item in crane_work_revisits
+        if int(item.get("residual_length", 0)) > 2
+    ]
+    multi_slot_terminal_revisits = [
+        item for item in multi_slot_revisits
+        if int(item["end_exclusive"]) >= horizon - 8
+    ]
+    forced_start_revisits = [
+        item for item in crane_work_revisits
+        if int(item.get("primary_block", {}).get("start", -1)) == 0
+    ]
+    max_crane_movement_count = max(
+        movement_count_by_crane.values(), default=0
+    )
+    return_move_count_by_crane = {
+        str(q + 1): sum(
+            int(item.get("movement_before", False))
+            for item in crane_work_revisits
+            if int(item["crane"]) == q + 1
+        )
+        for q in range(M)
+    }
 
     return {
         "bay_fragmentation": bay_fragmentation,
         "work_blocks_by_bay": work_blocks_by_bay,
         "bay_gaps_by_bay": bay_gaps_by_bay,
+        "work_blocks_by_crane_bay": work_blocks_by_crane_bay,
+        "work_block_count_by_crane_bay": work_block_count_by_crane_bay,
+        "extra_work_blocks_total": extra_work_blocks_total,
+        "micro_work_blocks": micro_work_blocks,
+        "short_excursions": short_excursion_records,
+        "short_excursion_count": len(short_excursion_records),
+        "terminal_returns": terminal_returns,
+        "terminal_return_count": len(terminal_returns),
+        "forced_prefix_interruptions": forced_prefix_interruptions,
+        "forced_prefix_interruption_count": len(forced_prefix_interruptions),
+        "movement_arcs_by_crane": movement_arcs_by_crane,
+        "movement_count_by_crane": movement_count_by_crane,
+        "return_move_count_by_crane": return_move_count_by_crane,
+        "max_crane_movement_count": max_crane_movement_count,
         "crane_position_blocks": crane_position_blocks,
         "position_revisit_count": position_revisit_count,
         "work_revisit_count": work_revisit_count,
         "crane_work_revisits": crane_work_revisits,
+        "multi_slot_revisits": multi_slot_revisits,
+        "multi_slot_terminal_revisits": multi_slot_terminal_revisits,
+        "forced_start_revisits": forced_start_revisits,
+        "max_work_revisit_gap": max(
+            (int(item["gap"]) for item in crane_work_revisits),
+            default=0,
+        ),
+        "long_revisit_count": long_revisit_count,
         "pure_yielding_revisits": pure_yielding_revisits,
         "movement_count": candidate.movement_count,
         "reversal_count": candidate.reversal_count,
@@ -424,7 +792,10 @@ def _continuity_diagnostics(
         "short_excursion": list(_trajectory_smoothness(candidate, M)),
         "continuity_key": [
             work_revisit_count,
+            extra_work_blocks_total,
             bay_fragmentation,
+            len(short_excursion_records),
+            len(terminal_returns),
             candidate.reversal_count,
             candidate.movement_count,
             candidate.load_deviation,
@@ -471,6 +842,8 @@ def _idle_diagnostics(candidate: _CandidateSchedule, M: int) -> dict[str, Any]:
     total_moves = 0
     total_offrail = 0
     max_internal = 0
+    total_internal_blocks = 0
+    max_internal_blocks = 0
     for q, slots in enumerate(by_crane, 1):
         slots = sorted(slots, key=lambda item: item.time)
         work_times = [slot.time for slot in slots if slot.state == "work"]
@@ -488,7 +861,10 @@ def _idle_diagnostics(candidate: _CandidateSchedule, M: int) -> dict[str, Any]:
         max_internal_for_crane = max(
             (item["length"] for item in internal_blocks), default=0
         )
+        internal_block_count = len(internal_blocks)
         total_internal += internal_total
+        total_internal_blocks += internal_block_count
+        max_internal_blocks = max(max_internal_blocks, internal_block_count)
         total_idle += len(idle_times)
         total_moves += len(move_times)
         total_offrail += len(offrail_times)
@@ -501,6 +877,7 @@ def _idle_diagnostics(candidate: _CandidateSchedule, M: int) -> dict[str, Any]:
             "leading_idle": len([t for t in idle_times if first_work is not None and t < first_work]),
             "internal_idle": internal_total,
             "internal_idle_blocks": internal_blocks,
+            "internal_idle_block_count": internal_block_count,
             "max_internal_idle": max_internal_for_crane,
             "trailing_idle": len([t for t in idle_times if last_work is not None and t > last_work]),
             "idle_slots": len(idle_times),
@@ -516,10 +893,101 @@ def _idle_diagnostics(candidate: _CandidateSchedule, M: int) -> dict[str, Any]:
         "per_crane": details,
         "total_idle": total_idle,
         "total_internal_idle": total_internal,
+        "total_internal_idle_blocks": total_internal_blocks,
+        "max_internal_idle_blocks": max_internal_blocks,
         "max_internal_idle": max_internal,
         "total_move_slots": total_moves,
         "total_offrail_slots": total_offrail,
     }
+
+
+def _balanced_schedule_metrics(
+    candidate: _CandidateSchedule, M: int,
+) -> dict[str, Any]:
+    """Describe genuine work-capacity balance without hiding idle time."""
+    completion = int(candidate.completion_time)
+    idle = _idle_diagnostics(candidate, M)
+    per_crane = idle["per_crane"]
+    finishes = [
+        int(item["last_work"]) + 1 if item["last_work"] is not None else 0
+        for item in per_crane
+    ]
+    normalized_idle = [
+        {
+            **item,
+            "trailing_idle": max(0, completion - finishes[index]),
+        }
+        for index, item in enumerate(per_crane)
+    ]
+    loads = [int(value) for value in candidate.loads]
+    total_work = sum(loads)
+    nonwork_capacity = [max(0, completion - load) for load in loads]
+    balance_deviation = sum(
+        (M * load - total_work) ** 2 for load in loads
+    )
+    leading_internal_idle = sum(
+        int(item["leading_idle"]) + int(item["internal_idle"])
+        for item in per_crane
+    )
+    max_trailing_idle = max(
+        (int(item["trailing_idle"]) for item in normalized_idle),
+        default=0,
+    )
+    return {
+        "completion_time": completion,
+        "loads": loads,
+        "finish_times": finishes,
+        "nonwork_capacity_by_crane": nonwork_capacity,
+        "total_nonwork_capacity": sum(nonwork_capacity),
+        "max_nonwork_capacity": max(nonwork_capacity, default=0),
+        "load_balance_deviation": balance_deviation,
+        "finish_gap": max(finishes, default=0) - min(finishes, default=0),
+        "max_trailing_idle": max_trailing_idle,
+        "max_internal_idle": int(idle["max_internal_idle"]),
+        "total_internal_idle_blocks": int(idle["total_internal_idle_blocks"]),
+        "max_internal_idle_blocks": int(idle["max_internal_idle_blocks"]),
+        "leading_plus_internal_idle": leading_internal_idle,
+        "per_crane_idle": normalized_idle,
+        "key": (
+            completion,
+            max(nonwork_capacity, default=0),
+            balance_deviation,
+            max_trailing_idle,
+            max(finishes, default=0) - min(finishes, default=0),
+            int(idle["max_internal_idle"]),
+            int(candidate.completion_movement_count),
+        ),
+    }
+
+
+def _recommended_schedule_rank(
+    candidate: _CandidateSchedule, M: int,
+) -> tuple[int, ...]:
+    """Rank Step 8 output by completion, finish balance and work continuity.
+
+    A repeated ``(crane, bay)`` work block necessarily creates a return move,
+    so eliminate those structural path defects before comparing secondary
+    load-balance improvements.  Synchronized completion is still protected:
+    among candidates with the same revisit burden, a schedule with trailing
+    idle cannot beat one in which all cranes finish together.
+    """
+    balance = _balanced_schedule_metrics(candidate, M)
+    continuity = _continuity_diagnostics(candidate, M)
+    return (
+        int(candidate.completion_time),
+        int(continuity["work_revisit_count"]),
+        int(balance["max_nonwork_capacity"]),
+        int(balance["max_trailing_idle"]),
+        int(balance["finish_gap"]),
+        int(continuity["position_revisit_count"]),
+        int(candidate.reversal_count),
+        int(candidate.completion_movement_count),
+        int(continuity["extra_work_blocks_total"]),
+        int(continuity["max_work_revisit_gap"]),
+        int(balance["max_internal_idle_blocks"]),
+        int(balance["total_internal_idle_blocks"]),
+        int(balance["max_internal_idle"]),
+    )
 
 
 def _candidate_passes_independent_verifier(
@@ -531,10 +999,12 @@ def _candidate_passes_independent_verifier(
     """Validate a private candidate through the public schedule verifier."""
     view = type("_CandidateVerifierView", (), {})()
     view.slots = candidate.slots
-    view.makespan = candidate.makespan
+    view.makespan = candidate.completion_time
+    view.schedule_horizon = candidate.schedule_horizon
     view.crane_loads = candidate.loads
     view.reversal_count = candidate.reversal_count
-    view.movement_count = candidate.movement_count
+    view.movement_count = candidate.completion_movement_count
+    view.schedule_movement_count = candidate.movement_count
     view.move_time = candidate.move_time
     try:
         verify_solution(W, M, starts, view)
@@ -916,6 +1386,9 @@ def _normalize_work_transfer_regions(
     regions: Sequence[dict[str, Any]],
     horizon: int,
     M: int,
+    *,
+    max_segments: int = 2,
+    max_region_length: int = 8,
 ) -> tuple[list[dict[str, Any]], set[tuple[int, int]]]:
     """Validate the strict Step 8 local-transaction range contract."""
     if not regions:
@@ -934,8 +1407,10 @@ def _normalize_work_transfer_regions(
             raise RuntimeError("工作事务包含非法桥吊。")
         if not 0 <= start < end <= horizon:
             raise RuntimeError("工作事务时间区域超出有效范围。")
-        if end - start > 8:
-            raise RuntimeError("单个工作事务区域不能超过8个时间槽。")
+        if end - start > max_region_length:
+            raise RuntimeError(
+                f"单个工作事务区域不能超过{max_region_length}个时间槽。"
+            )
         old = by_segment.get(segment)
         if old is not None and old != (start, end):
             raise RuntimeError("同一事务段的桥吊区域必须使用相同时间边界。")
@@ -947,11 +1422,13 @@ def _normalize_work_transfer_regions(
             "length": end - start,
             "segment": segment,
         })
-    if len(by_segment) > 2:
-        raise RuntimeError("一个工作事务最多包含两个时间区段。")
+    if len(by_segment) > max_segments:
+        raise RuntimeError(
+            f"一个工作事务最多包含{max_segments}个时间区段。"
+        )
     intervals = sorted(by_segment.values())
-    if len(intervals) == 2 and intervals[0][1] > intervals[1][0]:
-        raise RuntimeError("两个工作事务区段不能重叠。")
+    if any(left[1] > right[0] for left, right in zip(intervals, intervals[1:])):
+        raise RuntimeError("工作事务区段不能重叠。")
     active = sorted({item["crane"] - 1 for item in normalized})
     if len(active) > 3 or active != list(range(active[0], active[-1] + 1)):
         raise RuntimeError("工作事务最多使用三台相邻桥吊。")
@@ -974,6 +1451,8 @@ def _candidate_from_explicit_work_transaction(
     *,
     source_hash: str | None = None,
     transaction_source_hash: str | None = None,
+    max_segments: int = 4,
+    max_region_length: int = 8,
 ) -> _CandidateSchedule:
     """Apply one complete local work/position transaction.
 
@@ -991,7 +1470,9 @@ def _candidate_from_explicit_work_transaction(
     if len(history) != source.makespan + 1:
         raise RuntimeError("工作事务不能改变固定H的时间轴。")
     normalized, editable = _normalize_work_transfer_regions(
-        regions, source.makespan, M
+        regions, source.makespan, M,
+        max_segments=max_segments,
+        max_region_length=max_region_length,
     )
     source_rows = [tuple(row) for row in _candidate_position_rows(source, M)]
     rows = [tuple(int(value) for value in row) for row in history]
@@ -1061,6 +1542,72 @@ def _candidate_from_explicit_work_transaction(
     return candidate
 
 
+def _candidate_from_explicit_phase_transaction(
+    W: Sequence[int],
+    M: int,
+    starts: Sequence[int],
+    history: Sequence[tuple[int, ...]],
+    source: _CandidateSchedule,
+    work_plan: dict[tuple[int, int], int | None],
+    active_cranes: Sequence[int],
+    *,
+    source_hash: str | None = None,
+    transaction_source_hash: str | None = None,
+) -> _CandidateSchedule:
+    """Decode a full-horizon, block-level phase transaction.
+
+    Local Step 8 transactions deliberately cap each edited region at eight
+    slots.  A long residual revisit cannot be represented by that contract:
+    its work phases and the safety-conflict chain may span the complete
+    horizon.  This decoder keeps the same explicit work-ledger guarantees but
+    freezes every inactive crane for the whole horizon.
+    """
+    if transaction_source_hash != source_hash:
+        raise RuntimeError("阶段事务 source_hash 与当前源方案不匹配。")
+    if source.move_time != 0:
+        raise RuntimeError("阶段事务暂只支持 move_time=0。")
+    if len(history) != source.makespan + 1:
+        raise RuntimeError("阶段事务不能改变固定H的时间轴。")
+    active = {int(q) for q in active_cranes}
+    if not active or any(q < 0 or q >= M for q in active):
+        raise RuntimeError("阶段事务 active_cranes 非法。")
+    source_rows = [tuple(row) for row in _candidate_position_rows(source, M)]
+    rows = [tuple(int(value) for value in row) for row in history]
+    if len(rows) != len(source_rows) or any(len(row) != M for row in rows):
+        raise RuntimeError("阶段事务轨迹尺寸不一致。")
+    expected_keys = {
+        (t, q) for t in range(source.makespan) for q in range(M)
+    }
+    if set(work_plan) != expected_keys:
+        raise RuntimeError("阶段事务账本没有覆盖完整时间轴。")
+    source_work = {
+        (slot.time, slot.crane - 1): int(slot.work_bay)
+        for slot in source.slots
+        if slot.state == "work" and slot.work_bay is not None
+    }
+    for t in range(source.makespan):
+        for q in range(M):
+            if q in active:
+                continue
+            if rows[t][q] != source_rows[t][q]:
+                raise RuntimeError(
+                    f"阶段事务修改了非 active crane：t={t}, Q{q + 1}。"
+                )
+            if work_plan[(t, q)] != source_work.get((t, q)):
+                raise RuntimeError(
+                    f"阶段事务改变了非 active crane 作业：t={t}, Q{q + 1}。"
+                )
+    # The final row is a boundary row.  It is still frozen for inactive
+    # cranes so an active phase cannot hide a terminal position change.
+    for q in range(M):
+        if q not in active and rows[-1][q] != source_rows[-1][q]:
+            raise RuntimeError(f"阶段事务末端修改了非 active crane：Q{q + 1}。")
+    candidate = _candidate_from_rows_and_work_plan(W, M, rows, work_plan)
+    if not _candidate_passes_independent_verifier(W, M, starts, candidate):
+        raise RuntimeError("阶段事务未通过独立 verifier。")
+    return candidate
+
+
 def _transaction_rows_work_map(
     candidate: _CandidateSchedule,
     M: int,
@@ -1075,6 +1622,447 @@ def _transaction_rows_work_map(
         if slot.state == "work" and slot.work_bay is not None:
             work[(slot.time, slot.crane - 1)] = int(slot.work_bay)
     return rows, work
+
+
+def _forced_prefix_consolidation_exchange(
+    W: Sequence[int],
+    M: int,
+    starts: Sequence[int],
+    source: _CandidateSchedule,
+    *,
+    max_neighbor_phase_permutations: int = 64,
+    max_focus_phase_permutations: int = 16,
+    max_idle_placements: int = 16,
+    state_limit: int = 4_096,
+    max_candidates: int = 32,
+    deadline: float | None = None,
+    source_hash: str | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Merge an interrupted forced-start work prefix using adjacent phases.
+
+    The focus crane's forced-start bay is merged into one indivisible phase.
+    One adjacent crane at a time is allowed to reorder its own complete bay
+    phases to make room; every other crane is frozen.  The event search only
+    branches when a phase can start or wait at its current safe position.
+    """
+    stats: dict[str, Any] = {
+        "status": "SEARCH_COMPLETE",
+        "focus_interruptions": 0,
+        "focuses_started": 0,
+        "focuses_completed": 0,
+        "neighbor_bands_generated": 0,
+        "focus_phase_orders": 0,
+        "neighbor_phase_orders": 0,
+        "idle_placements_tested": 0,
+        "states_expanded": 0,
+        "ledger_closed": 0,
+        "decoded": 0,
+        "verified": 0,
+        "accepted": 0,
+        "rejected_safety": 0,
+        "rejected_ledger": 0,
+        "rejected_burden_migration": 0,
+        "timeout": 0,
+        "state_limit": 0,
+    }
+    if source.move_time != 0:
+        stats.update({"status": "UNSUPPORTED", "reason": "nonzero_move_time"})
+        return [], stats
+    if state_limit <= 0 or max_candidates <= 0:
+        stats.update({"status": "UNKNOWN_STATE_LIMIT", "state_limit": 1})
+        return [], stats
+
+    horizon = source.makespan
+    source_rows, source_work = _transaction_rows_work_map(source, M)
+    report = _continuity_diagnostics(source, M, starts)
+    focus_items = sorted(
+        report["forced_prefix_interruptions"],
+        key=lambda item: (
+            int(item["movement_penalty"]),
+            item["gap"][1] - item["gap"][0],
+            item["prefix"][1] - item["prefix"][0],
+            -(item["residual"][1] - item["residual"][0]),
+            int(item["crane"]),
+            int(item["forced_bay"]),
+        ),
+    )
+    stats["focus_interruptions"] = len(focus_items)
+    if not focus_items:
+        stats["status"] = "NOT_APPLICABLE"
+        return [], stats
+
+    def expired() -> bool:
+        if deadline is not None and time.perf_counter() >= deadline:
+            stats["status"] = "UNKNOWN_DEADLINE"
+            stats["timeout"] += 1
+            return True
+        return False
+
+    def phase_units(crane: int, forced_bay: int | None = None) -> tuple[tuple[int, int], ...]:
+        order: list[int] = []
+        lengths: dict[int, int] = {}
+        for time_index in range(horizon):
+            bay = source_work.get((time_index, crane))
+            if bay is None:
+                continue
+            bay = int(bay)
+            if bay not in lengths:
+                order.append(bay)
+                lengths[bay] = 0
+            lengths[bay] += 1
+        first_bay = source_work.get((0, crane))
+        if first_bay is None:
+            return ()
+        if forced_bay is not None:
+            lengths[forced_bay] = sum(
+                1 for time_index in range(horizon)
+                if source_work.get((time_index, crane)) == forced_bay
+            )
+        order = [int(first_bay), *[bay for bay in order if bay != first_bay]]
+        return tuple((bay, lengths[bay]) for bay in order if lengths.get(bay, 0) > 0)
+
+    def bounded_orders(
+        units: tuple[tuple[int, int], ...], limit: int,
+    ) -> list[tuple[tuple[int, int], ...]]:
+        if not units:
+            return []
+        first, rest = units[0], list(units[1:])
+        start = tuple(rest)
+        queue = [start]
+        seen: set[tuple[tuple[int, int], ...]] = {start}
+        result: list[tuple[tuple[int, int], ...]] = []
+        while queue and len(result) < max(1, limit):
+            permutation = queue.pop(0)
+            result.append((first, *permutation))
+            for index in range(len(permutation) - 1):
+                swapped = list(permutation)
+                swapped[index], swapped[index + 1] = swapped[index + 1], swapped[index]
+                value = tuple(swapped)
+                if value not in seen:
+                    seen.add(value)
+                    queue.append(value)
+        return result
+
+    proposals: list[dict[str, Any]] = []
+    seen_proposals: set[tuple[Any, ...]] = set()
+    focus_state_budget = max(1, state_limit // len(focus_items))
+    for focus in focus_items:
+        if expired():
+            break
+        stats["focuses_started"] += 1
+        focus_q = int(focus["crane"]) - 1
+        focus_bay = int(focus["forced_bay"])
+        neighbor_cranes = [q for q in (focus_q - 1, focus_q + 1) if 0 <= q < M]
+        if not neighbor_cranes:
+            continue
+        focus_orders = bounded_orders(
+            phase_units(focus_q, focus_bay), max_focus_phase_permutations,
+        )
+        if not focus_orders:
+            continue
+        stats["focus_phase_orders"] += len(focus_orders)
+        used_for_focus = 0
+
+        for neighbor_q in neighbor_cranes:
+            if expired() or len(proposals) >= max_candidates:
+                break
+            neighbor_units = phase_units(neighbor_q)
+            neighbor_orders = bounded_orders(
+                neighbor_units, max_neighbor_phase_permutations,
+            )
+            if not neighbor_orders:
+                continue
+            stats["neighbor_bands_generated"] += 1
+            stats["neighbor_phase_orders"] += len(neighbor_orders)
+            active = tuple(sorted((focus_q, neighbor_q)))
+            all_order_pairs = []
+            for focus_order in focus_orders:
+                for neighbor_order in neighbor_orders:
+                    by_crane = {
+                        focus_q: focus_order,
+                        neighbor_q: neighbor_order,
+                    }
+                    all_order_pairs.append(tuple(by_crane[q] for q in active))
+
+            for phase_pair in all_order_pairs:
+                if expired() or len(proposals) >= max_candidates:
+                    break
+                if used_for_focus >= focus_state_budget:
+                    stats["state_limit"] += 1
+                    stats["status"] = "UNKNOWN_STATE_LIMIT"
+                    break
+                phases = {q: phase_pair[index] for index, q in enumerate(active)}
+                first_row = tuple(source_rows[0])
+                valid_start = all(
+                    phases[q]
+                    and int(phases[q][0][0]) == int(first_row[q])
+                    for q in active
+                )
+                if not valid_start:
+                    stats["rejected_safety"] += 1
+                    continue
+                initial_work = dict(source_work)
+                initial_remaining = []
+                initial_indices = []
+                initial_positions = []
+                for q in active:
+                    first_bay, first_length = phases[q][0]
+                    initial_work[(0, q)] = int(first_bay)
+                    initial_indices.append(0)
+                    initial_remaining.append(int(first_length) - 1)
+                    initial_positions.append(int(first_bay))
+
+                # The initial row is fixed by the source and all forced work
+                # remains at its original start bay.
+                if any(
+                    right - left < 2
+                    for left, right in zip(first_row, first_row[1:])
+                ):
+                    stats["rejected_safety"] += 1
+                    continue
+                initial_working = [
+                    value for (time_index, _q), value in initial_work.items()
+                    if time_index == 0 and value is not None
+                ]
+                if len(initial_working) != len(set(initial_working)):
+                    stats["rejected_safety"] += 1
+                    continue
+
+                failed: set[tuple[Any, ...]] = set()
+                memo: dict[tuple[Any, ...], tuple[Any, ...] | None] = {}
+                budget_end = min(state_limit, stats["states_expanded"] + focus_state_budget - used_for_focus)
+
+                def visit(
+                    time_index: int,
+                    phase_indices: tuple[int, ...],
+                    remaining: tuple[int, ...],
+                    positions: tuple[int, ...],
+                    idle_used: int,
+                ) -> tuple[Any, ...] | None:
+                    nonlocal used_for_focus
+                    if expired():
+                        return None
+                    if time_index >= horizon:
+                        if all(
+                            phase_indices[index] == len(phases[q]) - 1
+                            and remaining[index] == 0
+                            for index, q in enumerate(active)
+                        ):
+                            return ()
+                        return None
+                    key = (time_index, phase_indices, remaining, positions, idle_used)
+                    if key in memo:
+                        return memo[key]
+                    if key in failed:
+                        return None
+                    if stats["states_expanded"] >= budget_end:
+                        stats["status"] = "UNKNOWN_STATE_LIMIT"
+                        stats["state_limit"] += 1
+                        return None
+                    stats["states_expanded"] += 1
+                    used_for_focus += 1
+                    pending = 0
+                    for index, q in enumerate(active):
+                        crane_pending = int(remaining[index]) + sum(
+                            int(length)
+                            for _bay, length in phases[q][phase_indices[index] + 1:]
+                        )
+                        pending = max(pending, crane_pending)
+                    if pending > horizon - time_index:
+                        failed.add(key)
+                        return None
+
+                    options_by_crane: list[list[tuple[int, int, int, int | None, int, int]]] = []
+                    for index, q in enumerate(active):
+                        phase_index = phase_indices[index]
+                        slots_left = remaining[index]
+                        if slots_left > 0:
+                            bay = int(phases[q][phase_index][0])
+                            options_by_crane.append([(
+                                phase_index, slots_left - 1, bay, bay, 0, 0,
+                            )])
+                        elif phase_index + 1 < len(phases[q]):
+                            next_bay, next_length = phases[q][phase_index + 1]
+                            options_by_crane.append([
+                                (phase_index + 1, int(next_length) - 1, int(next_bay), int(next_bay), 0, 1),
+                                (phase_index, 0, int(positions[index]), None, 1, 0),
+                            ])
+                        else:
+                            options_by_crane.append([(
+                                phase_index, 0, int(positions[index]), None, 0, 0,
+                            )])
+
+                    choices = list(itertools.product(*options_by_crane))
+                    choices.sort(key=lambda combo: (
+                        -sum(int(option[5]) for option in combo),
+                        sum(int(option[4]) for option in combo),
+                        tuple(int(option[2]) for option in combo),
+                    ))
+                    source_row = source_rows[time_index]
+                    for combo in choices:
+                        next_idle = idle_used + sum(int(option[4]) for option in combo)
+                        if next_idle > max_idle_placements:
+                            continue
+                        row = list(source_row)
+                        work_values = [source_work.get((time_index, q)) for q in range(M)]
+                        next_indices = []
+                        next_remaining = []
+                        next_positions = []
+                        starts_now = 0
+                        for index, (q, option) in enumerate(zip(active, combo)):
+                            phase_index, slots_left, position, work_bay, _wait, started = option
+                            row[q] = int(position)
+                            work_values[q] = work_bay
+                            next_indices.append(int(phase_index))
+                            next_remaining.append(int(slots_left))
+                            next_positions.append(int(position))
+                            starts_now += int(started)
+                        if any(
+                            right - left < 2
+                            for left, right in zip(row, row[1:])
+                        ):
+                            stats["rejected_safety"] += 1
+                            continue
+                        active_working = [bay for bay in work_values if bay is not None]
+                        if len(active_working) != len(set(active_working)):
+                            stats["rejected_safety"] += 1
+                            continue
+                        if any(int(option[4]) for option in combo):
+                            stats["idle_placements_tested"] += 1
+                        suffix = visit(
+                            time_index + 1,
+                            tuple(next_indices),
+                            tuple(next_remaining),
+                            tuple(next_positions),
+                            next_idle,
+                        )
+                        if suffix is not None:
+                            action = (
+                                tuple(int(option[2]) for option in combo),
+                                tuple(option[3] for option in combo),
+                            )
+                            result = (action, *suffix)
+                            memo[key] = result
+                            return result
+                        if stats["status"] in {"UNKNOWN_DEADLINE", "UNKNOWN_STATE_LIMIT"}:
+                            return None
+                    failed.add(key)
+                    memo[key] = None
+                    return None
+
+                suffix = visit(
+                    1,
+                    tuple(initial_indices),
+                    tuple(initial_remaining),
+                    tuple(initial_positions),
+                    0,
+                )
+                if suffix is None:
+                    if stats["status"] in {"UNKNOWN_DEADLINE", "UNKNOWN_STATE_LIMIT"}:
+                        break
+                    continue
+
+                history: list[tuple[int, ...]] = [first_row]
+                work_plan = dict(source_work)
+                for q in active:
+                    work_plan[(0, q)] = int(phases[q][0][0])
+                for offset, (active_positions, active_work) in enumerate(suffix, start=1):
+                    row = list(source_rows[offset])
+                    for index, q in enumerate(active):
+                        row[q] = int(active_positions[index])
+                        work_plan[(offset, q)] = active_work[index]
+                    history.append(tuple(row))
+                final_row = list(source_rows[horizon])
+                if suffix:
+                    for index, q in enumerate(active):
+                        final_row[q] = int(suffix[-1][0][index])
+                history.append(tuple(final_row))
+                signature = (
+                    tuple(history),
+                    tuple(sorted(work_plan.items())),
+                )
+                if signature in seen_proposals:
+                    continue
+                seen_proposals.add(signature)
+
+                moves = sum(
+                    history[time_index][q] != history[time_index - 1][q]
+                    for time_index in range(1, horizon)
+                    for q in range(M)
+                )
+                details = {
+                    "focus": {
+                        "crane": int(focus["crane"]),
+                        "bay": focus_bay,
+                        "prefix": list(focus["prefix"]),
+                        "gap": list(focus["gap"]),
+                        "residual": list(focus["residual"]),
+                        "interrupt_bays": list(focus["interrupt_bays"]),
+                        "interrupt_work": int(focus["interrupt_work"]),
+                    },
+                    "active_cranes": [q + 1 for q in active],
+                    "phase_orders": {
+                        str(q + 1): [
+                            {"bay": int(bay), "length": int(length)}
+                            for bay, length in phases[q]
+                        ]
+                        for q in active
+                    },
+                    "moves": int(moves),
+                    "idle_slots": int(sum(
+                        action[1][index] is None
+                        for action in suffix
+                        for index in range(len(active))
+                    )),
+                    "operator": "forced_prefix_consolidation",
+                    "source_hash": source_hash,
+                    "ledger_closed": True,
+                }
+                proposals.append({
+                    "operator": "forced_prefix_consolidation",
+                    "history": history,
+                    "work_plan": work_plan,
+                    "active_cranes": list(active),
+                    "regions": [{
+                        "crane": q + 1,
+                        "start": 0,
+                        "end_exclusive": horizon,
+                        "length": horizon,
+                        "segment": 0,
+                    } for q in active],
+                    "source_signature": _trajectory_signature(source),
+                    "source_hash": source_hash,
+                    "details": details,
+                })
+                stats["ledger_closed"] += 1
+                stats["focuses_completed"] = max(stats["focuses_completed"], 1)
+                # Once a complete, lower-movement schedule is available, it
+                # is a strict formal improvement at fixed H: phase ordering
+                # preserves each crane's work ledger and bay ownership.  Do
+                # not spend the remaining state budget generating redundant
+                # alternatives before the independent verifier can assess it.
+                if moves < source.movement_count:
+                    stats["status"] = "CANDIDATE_FOUND"
+                    break
+            if stats["status"] in {
+                "UNKNOWN_DEADLINE", "UNKNOWN_STATE_LIMIT", "CANDIDATE_FOUND",
+            }:
+                break
+        if stats["status"] in {
+            "UNKNOWN_DEADLINE", "UNKNOWN_STATE_LIMIT", "CANDIDATE_FOUND",
+        }:
+            break
+
+    proposals.sort(key=lambda item: (
+        int(item["details"]["moves"]),
+        len(item["details"]["phase_orders"]),
+        int(item["details"]["idle_slots"]),
+        tuple(
+            tuple(phase["bay"] for phase in item["details"]["phase_orders"][str(q)])
+            for q in item["details"]["active_cranes"]
+        ),
+    ))
+    return proposals[:max_candidates], stats
 
 
 def _work_blocks_for_transaction(
@@ -1102,6 +2090,2099 @@ def _work_blocks_for_transaction(
                 "length": t - start,
             })
     return blocks
+
+
+def _phase_block_resequence_exchange(
+    W: Sequence[int],
+    M: int,
+    starts: Sequence[int],
+    source: _CandidateSchedule,
+    *,
+    max_active_cranes: int = 4,
+    max_block_permutations: int = 256,
+    state_limit: int = 20_000,
+    max_candidates: int = 64,
+    deadline: float | None = None,
+    source_hash: str | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Search complete work phases for a long crane/bay revisit.
+
+    The ordinary continuity operators edit one or two short windows.  This
+    operator is intentionally phase based: it aggregates each active
+    crane/bay's work into an indivisible phase, enumerates a bounded set of
+    phase orders, and schedules those phases with a small event-level beam.
+    Inactive cranes and their work ledger remain frozen.  The returned
+    proposals are decoded by ``_candidate_from_explicit_phase_transaction``.
+    """
+    stats: dict[str, Any] = {
+        "status": "SEARCH_COMPLETE",
+        "focus_revisits": 0,
+        "multi_slot_revisits": 0,
+        "active_bands_generated": 0,
+        "phase_permutations_generated": 0,
+        "phase_combinations_tested": 0,
+        "states_expanded": 0,
+        "states_pruned_horizon": 0,
+        "states_pruned_safety": 0,
+        "states_pruned_split": 0,
+        "states_pruned_movement": 0,
+        "complete_phase_plans": 0,
+        "decoded": 0,
+        "verified": 0,
+        "accepted": 0,
+        "rejected_burden_migration": 0,
+        "timeout": 0,
+        "state_limit": 0,
+        "operators": {"phase_prefix_completion": 0, "phase_order": 0},
+    }
+    if source.move_time != 0:
+        stats.update({"status": "UNSUPPORTED", "reason": "nonzero_move_time"})
+        return [], stats
+    if source.makespan < 4 or M < 2:
+        stats.update({"status": "UNSUPPORTED", "reason": "horizon_or_crane_count"})
+        return [], stats
+    if state_limit <= 0 or max_candidates <= 0:
+        stats.update({"status": "UNKNOWN_STATE_LIMIT", "state_limit": 1})
+        return [], stats
+
+    rows, source_work = _transaction_rows_work_map(source, M)
+    horizon = source.makespan
+    diagnostics = _continuity_diagnostics(source, M)
+    focus_revisits = sorted(
+        [
+            item for item in diagnostics.get("crane_work_revisits", [])
+            if int(item.get("residual_length", 0)) > 2
+            or int(item.get("gap", 0)) >= 8
+        ],
+        key=lambda item: (
+            -int(item.get("gap", 0)),
+            -int(item.get("residual_length", 0)),
+            int(item.get("crane", 0)),
+            int(item.get("bay", 0)),
+        ),
+    )
+    stats["focus_revisits"] = len(focus_revisits)
+    stats["multi_slot_revisits"] = sum(
+        int(item.get("residual_length", 0)) > 2 for item in focus_revisits
+    )
+    if not focus_revisits:
+        stats["status"] = "NOT_APPLICABLE"
+        return [], stats
+
+    def expired() -> bool:
+        return deadline is not None and time.perf_counter() >= deadline
+
+    def phase_units(q: int, focus_q: int) -> list[tuple[int, int]]:
+        """Build phase units, merging only the focus crane's revisit.
+
+        The active band exists to resolve safety conflicts, not to force every
+        adjacent crane to merge its work.  Non-focus cranes therefore retain
+        their source block boundaries (including an existing split that the
+        current transaction is not trying to repair), while their bounded
+        block order may be permuted to make room for the focus phase.  The
+        focus crane is the only one whose repeated same-bay blocks are
+        aggregated into one indivisible logical phase.
+        """
+        if q != focus_q:
+            blocks: list[tuple[int, int]] = []
+            t = 0
+            while t < horizon:
+                bay = source_work.get((t, q))
+                if bay is None:
+                    t += 1
+                    continue
+                start = t
+                t += 1
+                while t < horizon and source_work.get((t, q)) == bay:
+                    t += 1
+                blocks.append((int(bay), t - start))
+            return blocks
+        order: list[int] = []
+        totals: dict[int, int] = {}
+        for t in range(horizon):
+            bay = source_work.get((t, q))
+            if bay is None:
+                continue
+            bay = int(bay)
+            if bay not in totals:
+                order.append(bay)
+                totals[bay] = 0
+            totals[bay] += 1
+        return [(bay, totals[bay]) for bay in order]
+
+    def phase_orders(q: int, focus_q: int) -> list[tuple[tuple[int, int], ...]]:
+        units = phase_units(q, focus_q)
+        if not units:
+            return []
+        first_bay = source_work.get((0, q))
+        if first_bay is None:
+            return []
+        first_index = next(
+            (index for index, item in enumerate(units)
+             if int(item[0]) == int(first_bay)),
+            None,
+        )
+        if first_index is None:
+            return []
+        first = units[first_index]
+        rest = units[:first_index] + units[first_index + 1:]
+        unique: list[tuple[tuple[int, int], ...]] = []
+        seen: set[tuple[tuple[int, int], ...]] = set()
+        source_order = (first, *rest)
+        for perm in itertools.permutations(rest):
+            value = (first, *perm)
+            if value in seen:
+                continue
+            seen.add(value)
+            unique.append(value)
+        unique.sort(key=lambda item: (
+            0 if item == source_order else 1,
+            sum(abs(index - source_order.index(value))
+                for index, value in enumerate(item)),
+            tuple(bay for bay, _length in item),
+        ))
+        return unique[:max(1, max_block_permutations)]
+
+    def active_band(focus_crane: int) -> tuple[int, ...]:
+        width = max(2, min(max_active_cranes, M))
+        left = max(0, min(focus_crane - 1, M - width))
+        return tuple(range(left, left + width))
+
+    # The event beam uses compact state fields and keeps only a bounded
+    # history per layer.  A state stores full rows because phase transactions
+    # must later be auditable, but the beam itself is capped well below the
+    # state expansion limit.
+    # A narrow beam is intentional here: complete phases have very few
+    # meaningful boundary choices, while keeping hundreds of equivalent wait
+    # states would exhaust the global expansion budget before another phase
+    # permutation is inspected.
+    beam_width = max(16, min(48, state_limit // max(1, horizon // 4)))
+    proposals: list[dict[str, Any]] = []
+    seen_proposals: set[tuple[Any, ...]] = set()
+
+    def pending_work(
+        state: tuple[Any, ...],
+        orders: dict[int, list[tuple[tuple[int, int], ...]]],
+        active_cranes: Sequence[int],
+    ) -> int:
+        """Count both current and not-yet-started phase work.
+
+        ``remaining`` only stores the current phase's tail.  Treating a
+        completed-but-not-advanced phase as zero remaining work makes an idle
+        parking state look better than a state that has actually started the
+        next phase, so the beam would fill with states that never finish the
+        transaction.  Include all future phase lengths in the ranking key.
+        """
+        phase_index = state[1]
+        remaining = state[2]
+        total = 0
+        for q in active_cranes:
+            index = int(phase_index[q])
+            if index < 0:
+                continue
+            total += int(remaining[q])
+            total += sum(
+                int(length)
+                for _bay, length in orders[q][index + 1:]
+            )
+        return total
+
+    for revisit in focus_revisits:
+        if expired():
+            stats["status"] = "UNKNOWN_DEADLINE"
+            stats["timeout"] += 1
+            break
+        focus_q = int(revisit["crane"]) - 1
+        active = active_band(focus_q)
+        if focus_q not in active:
+            continue
+        stats["active_bands_generated"] += 1
+        orders_by_crane: dict[int, list[tuple[tuple[int, int], ...]]] = {}
+        invalid = False
+        for q in active:
+            orders = phase_orders(q, focus_q)
+            if not orders:
+                invalid = True
+                break
+            orders_by_crane[q] = orders
+            stats["phase_permutations_generated"] += len(orders)
+        if invalid:
+            continue
+        order_lists = [orders_by_crane[q] for q in active]
+        total_combinations = math.prod(len(items) for items in order_lists)
+        combination_budget = max(
+            2_000,
+            state_limit // max(1, min(total_combinations, 8)),
+        )
+        combinations = itertools.product(*order_lists)
+        for order_tuple in combinations:
+            if expired():
+                stats["status"] = "UNKNOWN_DEADLINE"
+                stats["timeout"] += 1
+                break
+            if stats["phase_combinations_tested"] >= max_block_permutations:
+                stats["status"] = "UNKNOWN_STATE_LIMIT"
+                stats["state_limit"] += 1
+                break
+            stats["phase_combinations_tested"] += 1
+            orders = {q: order_tuple[index] for index, q in enumerate(active)}
+            stats["operators"]["phase_order"] += 1
+            combination_expanded = 0
+            combination_limited = False
+
+            # Each state is a tuple so it can be safely deduplicated.  The
+            # variable names are: positions, phase index, remaining slots,
+            # last directions, moves, reversals, history, work rows, idle.
+            first_row = tuple(rows[0])
+            first_work = tuple(source_work.get((0, q)) for q in range(M))
+            initial_index = tuple(
+                0 if q in active else -1 for q in range(M)
+            )
+            initial_remaining = tuple(
+                (
+                    int(orders[q][0][1]) - 1
+                    if q in active else 0
+                )
+                for q in range(M)
+            )
+            if any(
+                q in active
+                and int(orders[q][0][0]) != int(first_work[q])
+                for q in active
+            ):
+                stats["states_pruned_safety"] += 1
+                continue
+            initial = (
+                first_row,
+                initial_index,
+                initial_remaining,
+                tuple(0 for _ in range(M)),
+                0,
+                0,
+                (first_row,),
+                (first_work,),
+                0,
+            )
+            beam = [initial]
+            for t in range(1, horizon):
+                if expired():
+                    stats["status"] = "UNKNOWN_DEADLINE"
+                    stats["timeout"] += 1
+                    break
+                next_states: list[tuple[Any, ...]] = []
+                for state in beam:
+                    positions, phase_index, remaining, directions, moves, reversals, history, work_rows, idle = state
+                    per_crane: list[list[tuple[int, bool, int, int]]] = []
+                    for q in active:
+                        idx = int(phase_index[q])
+                        rem = int(remaining[q])
+                        options: list[tuple[int, bool, int, int]] = []
+                        if rem > 0:
+                            bay = int(orders[q][idx][0])
+                            options = [(bay, True, idx, rem - 1)]
+                        else:
+                            next_idx = idx + 1
+                            if next_idx < len(orders[q]):
+                                next_bay = int(orders[q][next_idx][0])
+                                options.append((next_bay, True, next_idx,
+                                                int(orders[q][next_idx][1]) - 1))
+                            # Keep the event beam small.  A completed phase
+                            # may wait at its current position; the source
+                            # position is the only extra parking choice.  The
+                            # next phase itself is the only other move.  This
+                            # avoids enumerating every bay as a fake parking
+                            # state while retaining the useful Q4/Q5 relay.
+                            parking = {
+                                int(positions[q]),
+                                int(rows[t][q]),
+                            }
+                            for position in sorted(parking):
+                                options.append((position, False, idx, 0))
+                        dedup_options: list[tuple[int, bool, int, int]] = []
+                        seen_options: set[tuple[int, bool, int, int]] = set()
+                        for option in options:
+                            if option not in seen_options:
+                                seen_options.add(option)
+                                dedup_options.append(option)
+                        per_crane.append(dedup_options)
+                    for choices in itertools.product(*per_crane):
+                        if stats["states_expanded"] >= state_limit:
+                            stats["status"] = "UNKNOWN_STATE_LIMIT"
+                            stats["state_limit"] += 1
+                            break
+                        if combination_expanded >= combination_budget:
+                            combination_limited = True
+                            break
+                        stats["states_expanded"] += 1
+                        combination_expanded += 1
+                        proposed_row = list(rows[t])
+                        # Non-active cranes are frozen to the source ledger at
+                        # this absolute time; carrying the previous row would
+                        # silently duplicate or erase their work.
+                        proposed_work = [
+                            source_work.get((t, q)) for q in range(M)
+                        ]
+                        next_index = list(phase_index)
+                        next_remaining = list(remaining)
+                        next_directions = list(directions)
+                        next_moves = int(moves)
+                        next_reversals = int(reversals)
+                        next_idle = int(idle)
+                        for q, (position, is_work, idx, rem) in zip(active, choices):
+                            proposed_row[q] = int(position)
+                            proposed_work[q] = int(orders[q][idx][0]) if is_work else None
+                            next_index[q] = int(idx)
+                            next_remaining[q] = int(rem)
+                            if proposed_row[q] != positions[q]:
+                                direction = 1 if proposed_row[q] > positions[q] else -1
+                                next_moves += 1
+                                if next_directions[q] and next_directions[q] != direction:
+                                    next_reversals += 1
+                                next_directions[q] = direction
+                            if not is_work:
+                                next_idle += 1
+                        if any(
+                            right - left < 2
+                            for left, right in zip(proposed_row, proposed_row[1:])
+                        ):
+                            stats["states_pruned_safety"] += 1
+                            continue
+                        working = [bay for bay in proposed_work if bay is not None]
+                        if len(working) != len(set(working)):
+                            stats["states_pruned_safety"] += 1
+                            continue
+                        # Moves are the second formal priority, but a local
+                        # phase may temporarily add moves to bring work
+                        # forward.  Keep such states eligible for complete
+                        # (C, K) comparison; the explicit state/combination
+                        # budgets, not a source-relative move cap, bound this
+                        # exploratory neighborhood.
+                        next_states.append((
+                            tuple(proposed_row), tuple(next_index),
+                            tuple(next_remaining), tuple(next_directions),
+                            next_moves, next_reversals,
+                            (*history, tuple(proposed_row)),
+                            (*work_rows, tuple(proposed_work)),
+                            next_idle,
+                        ))
+                    if stats["status"] == "UNKNOWN_STATE_LIMIT":
+                        break
+                    if combination_limited:
+                        break
+                if stats["status"] == "UNKNOWN_DEADLINE":
+                    break
+                if stats["status"] == "UNKNOWN_STATE_LIMIT":
+                    break
+                if combination_limited:
+                    break
+                if not next_states:
+                    stats["states_pruned_horizon"] += 1
+                    beam = []
+                    break
+                dedup: dict[tuple[Any, ...], tuple[Any, ...]] = {}
+                for state in next_states:
+                    key = (
+                        state[0], state[1], state[2], state[3],
+                    )
+                    old = dedup.get(key)
+                    if old is None or (
+                        state[4], state[5], state[8]
+                    ) < (old[4], old[5], old[8]):
+                        dedup[key] = state
+                beam = sorted(
+                    dedup.values(),
+                    key=lambda state: (
+                        pending_work(state, orders, active),
+                        state[4], state[5], sum(state[2]), state[8], state[0],
+                    ),
+                )[:beam_width]
+            if stats["status"] in {"UNKNOWN_DEADLINE", "UNKNOWN_STATE_LIMIT"}:
+                break
+            if combination_limited:
+                continue
+            for state in beam:
+                positions, phase_index, remaining, directions, moves, reversals, history, work_rows, idle = state
+                if any(int(value) != 0 for value in remaining):
+                    continue
+                if any(
+                    q in active and int(phase_index[q]) != len(orders[q]) - 1
+                    for q in active
+                ):
+                    continue
+                stats["complete_phase_plans"] += 1
+                final_history = (*history, tuple(positions))
+                plan = {
+                    (t, q): work_rows[t][q]
+                    for t in range(horizon)
+                    for q in range(M)
+                }
+                signature = (
+                    tuple(final_history),
+                    tuple(sorted(plan.items())),
+                )
+                if signature in seen_proposals:
+                    continue
+                seen_proposals.add(signature)
+                details = {
+                    "focus": {
+                        "crane": int(revisit["crane"]),
+                        "bay": int(revisit["bay"]),
+                        "primary_block": dict(revisit["primary_block"]),
+                        "residual_block": dict(revisit["residual_block"]),
+                        "residual_length": int(revisit.get("residual_length", 0)),
+                    },
+                    "active_cranes": [q + 1 for q in active],
+                    "phase_orders": {
+                        str(q + 1): [
+                            {"bay": int(bay), "length": int(length)}
+                            for bay, length in orders[q]
+                        ]
+                        for q in active
+                    },
+                    "moves": int(moves),
+                    "reversals": int(reversals),
+                    "idle": int(idle),
+                    "operator": "phase_block_resequence",
+                }
+                proposals.append({
+                    "operator": "phase_block_resequence",
+                    "history": [tuple(row) for row in final_history],
+                    "work_plan": plan,
+                    "active_cranes": list(active),
+                    "regions": [{
+                        "crane": q + 1,
+                        "start": 0,
+                        "end_exclusive": horizon,
+                        "length": horizon,
+                        "segment": 0,
+                    } for q in active],
+                    "source_signature": _trajectory_signature(source),
+                    "source_hash": source_hash,
+                    "details": details,
+                })
+                if len(proposals) >= max_candidates:
+                    break
+            if len(proposals) >= max_candidates:
+                break
+        if len(proposals) >= max_candidates:
+            break
+
+    proposals.sort(key=lambda item: (
+        int(item["details"]["focus"]["residual_length"]),
+        int(item["details"]["moves"]),
+        int(item["details"]["reversals"]),
+        int(item["details"]["idle"]),
+    ))
+    return proposals[:max_candidates], stats
+
+
+def _phase_closure_relay_search(
+    W: Sequence[int],
+    M: int,
+    starts: Sequence[int],
+    source: _CandidateSchedule,
+    *,
+    state_limit: int = 50_000,
+    max_candidates: int = 32,
+    max_phase_orders: int = 128,
+    max_variants_per_crane: int = 12_000,
+    deadline: float | None = None,
+    source_hash: str | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Search complete work phases with event-time starts and a growing band.
+
+    Every `(crane, bay)` is represented as one indivisible phase, so a source
+    revisit can only survive if the crane visits that bay in separate phases
+    created by an explicit later operator.  The first phase remains the
+    forced t=0 phase.  Internal phase gaps and terminal idle are enumerated as
+    event offsets, not as per-slot wait states.  The active band starts at the
+    focus crane and expands one adjacent crane at a time; cranes outside the
+    band retain their complete source trajectory.
+
+    This operator preserves the source work owner for every bay.  It does not
+    transfer work between cranes; such transfers remain the responsibility
+    of the explicit work-transfer operators.  Every returned transaction has
+    a complete per-slot work ledger and is independently verified by the
+    caller.
+    """
+    stats: dict[str, Any] = {
+        "status": "SEARCH_COMPLETE",
+        "focus_revisits": 0,
+        "activity_bands_tested": 0,
+        "activity_chain_expansions": [],
+        "phase_orders_generated": 0,
+        "event_schedules_generated": 0,
+        "states_expanded": 0,
+        "complete_phase_plans": 0,
+        "ledger_closed": 0,
+        "decoded": 0,
+        "verified": 0,
+        "accepted": 0,
+        "rejected_safety": 0,
+        "rejected_horizon": 0,
+        "rejected_ledger": 0,
+        "timeout": 0,
+        "state_limit": 0,
+        "max_activity_width": 0,
+    }
+    if source.move_time != 0:
+        stats.update({"status": "UNSUPPORTED", "reason": "nonzero_move_time"})
+        return [], stats
+    if state_limit <= 0 or max_candidates <= 0:
+        stats.update({"status": "UNKNOWN_STATE_LIMIT", "state_limit": 1})
+        return [], stats
+
+    horizon = source.makespan
+    source_rows, source_work = _transaction_rows_work_map(source, M)
+    diagnostics = _continuity_diagnostics(source, M, starts)
+    focuses = [dict(item) for item in diagnostics.get("crane_work_revisits", [])]
+    focuses.sort(key=lambda item: (
+        -max(1, int(item.get("total_work_on_crane_bay", 0))
+             - int(item.get("residual_length", 0))),
+        -int(item.get("residual_length", 0)),
+        -int(item.get("gap", 0)),
+        int(item.get("crane", 0)),
+        int(item.get("bay", 0)),
+    ))
+    stats["focus_revisits"] = len(focuses)
+    if not focuses:
+        stats["status"] = "NOT_APPLICABLE"
+        return [], stats
+
+    source_positions = [
+        tuple(row[q] for row in source_rows) for q in range(M)
+    ]
+    source_first_time: list[dict[int, int]] = [dict() for _ in range(M)]
+    source_bay_counts: list[dict[int, int]] = [dict() for _ in range(M)]
+    source_bay_order: list[list[int]] = [[] for _ in range(M)]
+    for (t, q), bay in source_work.items():
+        if bay is None:
+            continue
+        bay = int(bay)
+        if bay not in source_first_time[q]:
+            source_first_time[q][bay] = int(t)
+            source_bay_order[q].append(bay)
+        source_bay_counts[q][bay] = source_bay_counts[q].get(bay, 0) + 1
+
+    def expired() -> bool:
+        if deadline is not None and time.perf_counter() >= deadline:
+            stats["status"] = "UNKNOWN_DEADLINE"
+            stats["timeout"] += 1
+            return True
+        return False
+
+    def phase_orders(q: int) -> list[tuple[tuple[int, int], ...]]:
+        order = source_bay_order[q]
+        if not order:
+            return [()]
+        first_bay = source_work.get((0, q))
+        if first_bay is None or int(first_bay) != order[0]:
+            return []
+        first = (int(first_bay), source_bay_counts[q][int(first_bay)])
+        rest = [
+            (bay, source_bay_counts[q][bay])
+            for bay in order if bay != int(first_bay)
+        ]
+        permutations = list(itertools.islice(itertools.permutations(rest), max_phase_orders))
+        permutations.sort(key=lambda values: (
+            0 if values == tuple(rest) else 1,
+            sum(
+                abs(index - rest.index(value))
+                for index, value in enumerate(values)
+            ),
+            tuple(bay for bay, _length in values),
+        ))
+        return [(first, *value) for value in permutations]
+
+    def idle_vectors(slack: int, phase_count: int):
+        """Yield distinct internal idle placements by event offsets.
+
+        Terminal idle is implicit in the fixed horizon and cannot change
+        phase starts, so it must not be enumerated as a free event.
+        """
+        bins = max(0, phase_count - 1)
+        current = [0] * bins
+
+        def distribute(index: int, remaining: int):
+            if index == bins:
+                if remaining == 0:
+                    yield tuple(current)
+                return
+            if index == bins - 1:
+                current[index] = remaining
+                yield tuple(current)
+                return
+            for value in range(remaining + 1):
+                current[index] = value
+                yield from distribute(index + 1, remaining - value)
+
+        # Enumerate exact compositions for each total internal idle.  The
+        # trailing slack is implicit in the horizon.
+        for total in range(max(0, slack) + 1):
+            if bins == 0:
+                yield ()
+            else:
+                yield from distribute(0, total)
+
+    variants_by_crane: dict[int, list[dict[str, Any]]] = {}
+    for q in range(M):
+        phases_list = phase_orders(q)
+        stats["phase_orders_generated"] += len(phases_list)
+        variants: list[dict[str, Any]] = []
+        load = sum(source_bay_counts[q].values())
+        slack = max(0, horizon - load)
+        for phases in phases_list:
+            if not phases:
+                continue
+            for gaps in idle_vectors(slack, len(phases)):
+                phase_starts = []
+                time_cursor = 0
+                for index, (_bay, length) in enumerate(phases):
+                    phase_starts.append(time_cursor)
+                    time_cursor += int(length)
+                    if index < len(phases) - 1:
+                        time_cursor += int(gaps[index])
+                if time_cursor > horizon:
+                    stats["rejected_horizon"] += 1
+                    continue
+                movement_count = sum(
+                    int(phases[index - 1][0] != phases[index][0])
+                    for index in range(1, len(phases))
+                    if phase_starts[index] < horizon
+                )
+                source_deviation = sum(
+                    abs(int(phase_starts[index]) - int(source_first_time[q].get(bay, phase_starts[index])))
+                    for index, (bay, _length) in enumerate(phases)
+                )
+                variants.append({
+                    "phases": tuple((int(bay), int(length)) for bay, length in phases),
+                    "gaps": tuple(int(value) for value in gaps),
+                    "starts": tuple(int(value) for value in phase_starts),
+                    "moves": movement_count,
+                    "source_deviation": source_deviation,
+                    "idle": sum(int(value) for value in gaps),
+                })
+        variants.sort(key=lambda item: (
+            item["moves"], item["source_deviation"], item["idle"],
+            item["starts"], tuple(bay for bay, _length in item["phases"]),
+        ))
+        variants_by_crane[q] = variants[:max_variants_per_crane]
+
+    def materialize(q: int, variant: dict[str, Any]):
+        positions = [0] * (horizon + 1)
+        work = [None] * horizon
+        phases = variant["phases"]
+        phase_starts = variant["starts"]
+        for index, (bay, length) in enumerate(phases):
+            start_t = phase_starts[index]
+            end_t = start_t + length
+            next_start = (
+                phase_starts[index + 1]
+                if index + 1 < len(phases) else horizon + 1
+            )
+            if end_t > horizon or next_start > horizon + 1:
+                return None
+            for t in range(start_t, min(next_start, horizon + 1)):
+                positions[t] = bay
+            for t in range(start_t, end_t):
+                if work[t] is not None:
+                    return None
+                work[t] = bay
+        if any(position <= 0 for position in positions):
+            return None
+        return tuple(positions), tuple(work)
+
+    focus_orders_cache = {
+        q: variants_by_crane[q] for q in range(M)
+    }
+    proposals: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    first_conflict_by_band: dict[tuple[int, ...], dict[str, Any]] = {}
+
+    for focus in focuses:
+        if expired() or len(proposals) >= max_candidates:
+            break
+        focus_q = int(focus["crane"]) - 1
+        focus_bay = int(focus["bay"])
+        for width in range(2, M + 1):
+            left_min = max(0, focus_q - width + 1)
+            left_max = min(focus_q, M - width)
+            bands = [tuple(range(left, left + width))
+                     for left in range(left_min, left_max + 1)]
+            for band in bands:
+                if expired() or len(proposals) >= max_candidates:
+                    break
+                stats["activity_bands_tested"] += 1
+                stats["max_activity_width"] = max(
+                    stats["max_activity_width"], len(band)
+                )
+                # The chain grows outward from the focus.  This order resolves
+                # its nearest safety conflicts before more distant cranes.
+                order = [focus_q]
+                for distance in range(1, M):
+                    for q in (focus_q - distance, focus_q + distance):
+                        if q in band and q not in order:
+                            order.append(q)
+                order.extend(q for q in band if q not in order)
+                expansion = {
+                    "focus": {"crane": focus_q + 1, "bay": focus_bay},
+                    "active_cranes": [q + 1 for q in band],
+                    "ordered_chain": [q + 1 for q in order],
+                    "width": len(band),
+                    "resolved_conflicts": [],
+                }
+                resolved: dict[int, tuple[int, ...]] = {
+                    q: source_positions[q] for q in range(M) if q not in band
+                }
+                selected: dict[int, tuple[tuple[int, ...], tuple[int | None, ...], dict[str, Any]]] = {}
+                failed = False
+                local_nodes = 0
+
+                def extend(depth: int) -> None:
+                    nonlocal local_nodes, failed
+                    if expired() or len(proposals) >= max_candidates:
+                        return
+                    if stats["states_expanded"] >= state_limit:
+                        stats["status"] = "UNKNOWN_STATE_LIMIT"
+                        stats["state_limit"] += 1
+                        failed = True
+                        return
+                    if depth >= len(order):
+                        stats["complete_phase_plans"] += 1
+                        history = [list(row) for row in source_rows]
+                        work_plan = dict(source_work)
+                        phase_report = {}
+                        for q, (positions, work, variant) in selected.items():
+                            for t, bay in enumerate(positions):
+                                history[t][q] = int(bay)
+                            for t, bay in enumerate(work):
+                                work_plan[(t, q)] = None if bay is None else int(bay)
+                            phase_report[str(q + 1)] = {
+                                "phases": [
+                                    {"bay": int(bay), "length": int(length),
+                                     "start": int(variant["starts"][index])}
+                                    for index, (bay, length) in enumerate(variant["phases"])
+                                ],
+                                "gaps": list(variant["gaps"]),
+                            }
+                        if any(
+                            sum(value == bay for (time_index, _q), value in work_plan.items()
+                                if time_index < horizon) != int(required)
+                            for bay, required in enumerate(W, 1)
+                        ):
+                            stats["rejected_ledger"] += 1
+                            return
+                        stats["ledger_closed"] += 1
+                        signature = (
+                            tuple(tuple(row) for row in history),
+                            tuple(sorted(work_plan.items())),
+                        )
+                        if signature in seen:
+                            return
+                        seen.add(signature)
+                        try:
+                            candidate = _candidate_from_rows_and_work_plan(
+                                W, M, history, work_plan
+                            )
+                        except RuntimeError:
+                            stats["rejected_safety"] += 1
+                            return
+                        if not _candidate_passes_independent_verifier(
+                            W, M, starts, candidate
+                        ):
+                            stats["rejected_safety"] += 1
+                            return
+                        stats["decoded"] += 1
+                        stats["verified"] += 1
+                        candidate_diagnostics = _continuity_diagnostics(
+                            candidate, M, starts
+                        )
+                        focus_remains = any(
+                            int(item["crane"]) == focus_q + 1
+                            and int(item["bay"]) == focus_bay
+                            for item in candidate_diagnostics.get(
+                                "crane_work_revisits", []
+                            )
+                        )
+                        if (
+                            candidate.objective_key > source.objective_key
+                            or focus_remains
+                        ):
+                            return
+                        stats["event_schedules_generated"] += 1
+                        if candidate.objective_key < source.objective_key:
+                            stats["accepted"] += 1
+                        regions = [{
+                            "crane": q + 1,
+                            "start": 0,
+                            "end_exclusive": horizon,
+                            "length": horizon,
+                            "segment": 0,
+                        } for q in band]
+                        proposals.append({
+                            "operator": "phase_closure_relay",
+                            "history": [tuple(row) for row in history],
+                            "work_plan": work_plan,
+                            "active_cranes": list(band),
+                            "regions": regions,
+                            "source_signature": _trajectory_signature(source),
+                            "source_hash": source_hash,
+                            "details": {
+                                "focus": {
+                                    "crane": focus_q + 1,
+                                    "bay": focus_bay,
+                                    "blocks": focus.get("blocks", []),
+                                    "gap": focus.get("gap", 0),
+                                },
+                                "active_cranes": [q + 1 for q in band],
+                                "activity_chain_expansions": [
+                                    *stats["activity_chain_expansions"], expansion,
+                                ],
+                                "phase_schedule": phase_report,
+                                "candidate_objective": list(candidate.objective_key),
+                                "candidate_revisit_count": candidate_diagnostics.get(
+                                    "work_revisit_count", 0
+                                ),
+                                "candidate_movement_count": candidate.completion_movement_count,
+                                "work_ledger": {
+                                    "source_by_bay": [
+                                        sum(value == bay for value in source_work.values())
+                                        for bay in range(1, len(W) + 1)
+                                    ],
+                                    "transaction_by_bay": [
+                                        sum(value == bay for value in work_plan.values())
+                                        for bay in range(1, len(W) + 1)
+                                    ],
+                                    "closed": True,
+                                    "work_transfer": False,
+                                },
+                                "event_level": True,
+                            },
+                        })
+                        return
+
+                    q = order[depth]
+                    for variant in focus_orders_cache[q]:
+                        if expired() or len(proposals) >= max_candidates:
+                            return
+                        if stats["states_expanded"] >= state_limit:
+                            stats["status"] = "UNKNOWN_STATE_LIMIT"
+                            stats["state_limit"] += 1
+                            failed = True
+                            return
+                        stats["states_expanded"] += 1
+                        local_nodes += 1
+                        materialized = materialize(q, variant)
+                        if materialized is None:
+                            stats["rejected_horizon"] += 1
+                            continue
+                        positions, work = materialized
+                        if positions[0] != int(starts[q]):
+                            stats["rejected_safety"] += 1
+                            continue
+                        conflict = None
+                        for left_q in range(M - 1):
+                            right_q = left_q + 1
+                            left_positions = (
+                                positions if left_q == q else resolved.get(left_q)
+                            )
+                            right_positions = (
+                                positions if right_q == q else resolved.get(right_q)
+                            )
+                            if left_positions is None or right_positions is None:
+                                continue
+                            for t, (left_pos, right_pos) in enumerate(zip(
+                                left_positions, right_positions
+                            )):
+                                if int(right_pos) - int(left_pos) < 2:
+                                    conflict = {
+                                        "time": t,
+                                        "left_crane": left_q + 1,
+                                        "right_crane": right_q + 1,
+                                        "left_position": int(left_pos),
+                                        "right_position": int(right_pos),
+                                        "trigger_crane": q + 1,
+                                    }
+                                    break
+                            if conflict:
+                                break
+                        if conflict is not None:
+                            stats["rejected_safety"] += 1
+                            if len(expansion["resolved_conflicts"]) < 8:
+                                expansion["resolved_conflicts"].append(conflict)
+                            continue
+                        selected[q] = (positions, work, variant)
+                        resolved[q] = positions
+                        extend(depth + 1)
+                        del resolved[q]
+                        del selected[q]
+                        if stats["status"] in {"UNKNOWN_DEADLINE", "UNKNOWN_STATE_LIMIT"}:
+                            return
+
+                extend(0)
+                expansion["states_expanded"] = local_nodes
+                stats["activity_chain_expansions"].append(expansion)
+                if failed and stats["status"] in {"UNKNOWN_DEADLINE", "UNKNOWN_STATE_LIMIT"}:
+                    break
+            if stats["status"] in {"UNKNOWN_DEADLINE", "UNKNOWN_STATE_LIMIT"}:
+                break
+        if stats["status"] in {"UNKNOWN_DEADLINE", "UNKNOWN_STATE_LIMIT"}:
+            break
+
+    proposals.sort(key=lambda item: (
+        tuple(item["details"]["candidate_objective"]),
+        int(item["details"]["candidate_revisit_count"]),
+        tuple(item["details"]["active_cranes"]),
+    ))
+    return proposals[:max_candidates], stats
+
+
+def _candidate_from_explicit_cross_crane_phase_transaction(
+    W: Sequence[int],
+    M: int,
+    starts: Sequence[int],
+    history: Sequence[tuple[int, ...]],
+    source: _CandidateSchedule,
+    work_plan: dict[tuple[int, int], int | None],
+    active_cranes: Sequence[int],
+    *,
+    source_hash: str | None = None,
+    transaction_source_hash: str | None = None,
+) -> _CandidateSchedule:
+    """Decode one atomic phase transaction that may change work owners.
+
+    The older phase decoder already freezes every inactive crane and checks the
+    complete explicit ledger.  Keeping this small named entry point separate
+    makes the new operator's contract visible to callers and prevents it from
+    silently falling back to the short-window work-transfer decoder.
+    """
+    return _candidate_from_explicit_phase_transaction(
+        W, M, starts, history, source, work_plan, active_cranes,
+        source_hash=source_hash,
+        transaction_source_hash=transaction_source_hash,
+    )
+
+
+def _cross_crane_phase_relay_search(
+    W: Sequence[int],
+    M: int,
+    starts: Sequence[int],
+    source: _CandidateSchedule,
+    *,
+    state_limit: int = 50_000,
+    max_candidates: int = 32,
+    max_assignment_variants: int = 256,
+    deadline: float | None = None,
+    source_hash: str | None = None,
+    include_idle_capacity: bool = False,
+    idle_capacity_only: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Search one atomic cross-crane phase/ownership transaction.
+
+    ``_phase_closure_relay_search`` keeps each phase bound to its source
+    crane.  This operator starts from the same complete source work blocks but
+    treats their owner as a decision: a focus block may be assigned to an
+    adjacent (or two-hop) crane, while all work outside the active band stays
+    frozen.  A small dynamic program then chooses legal safe configurations for
+    every event row, so donor displacement and receiver movement are solved in
+    the same transaction rather than in two independent local edits.
+
+    The operator is deliberately bounded.  It is a neighborhood expander, not
+    a claim of global optimality: a timeout or state limit is reported as
+    ``UNKNOWN_*`` and never as infeasibility.
+    """
+    stats: dict[str, Any] = {
+        "status": "SEARCH_COMPLETE",
+        "focus_revisits": 0,
+        "idle_capacity_focuses": 0,
+        "idle_capacity_chain_focuses": 0,
+        "partial_transfer_focuses": 0,
+        "focuses_without_revisits": 0,
+        "activity_bands_tested": 0,
+        "assignment_variants_generated": 0,
+        "retimed_plans_generated": 0,
+        "retimed_plans_solved": 0,
+        "owner_change_branches": 0,
+        "two_hop_relay_branches": 0,
+        "complete_phase_plans": 0,
+        "ledger_closed": 0,
+        "states_expanded": 0,
+        "decoded": 0,
+        "verified": 0,
+        "accepted": 0,
+        "rejected_overlap": 0,
+        "rejected_eligibility": 0,
+        "rejected_safety": 0,
+        "rejected_ledger": 0,
+        "rejected_horizon": 0,
+        "timeout": 0,
+        "state_limit": 0,
+        "max_activity_width": 0,
+        "activity_chain_expansions": [],
+    }
+    if source.move_time != 0:
+        stats.update({"status": "UNSUPPORTED", "reason": "nonzero_move_time"})
+        return [], stats
+    if state_limit <= 0 or max_candidates <= 0:
+        stats.update({"status": "UNKNOWN_STATE_LIMIT", "state_limit": 1})
+        return [], stats
+
+    horizon = int(source.makespan)
+    source_rows, source_work = _transaction_rows_work_map(source, M)
+    diagnostics = _continuity_diagnostics(source, M, starts)
+    focuses = (
+        [] if idle_capacity_only else
+        [dict(item) for item in diagnostics.get("crane_work_revisits", [])]
+    )
+    revisit_focus_count = len(focuses)
+    N = len(W)
+    eligibility = _bay_eligibility(N, M, [])
+    legal_configurations = _legal_configurations(N, M)
+    if not legal_configurations:
+        stats.update({"status": "NOT_APPLICABLE", "reason": "no_safe_configuration"})
+        return [], stats
+
+    # Convert the source work map into maximal same-crane/same-bay phases.
+    source_blocks: list[dict[str, int]] = []
+    blocks_by_crane: dict[int, list[dict[str, int]]] = {
+        q: [] for q in range(M)
+    }
+    for q in range(M):
+        t = 0
+        while t < horizon:
+            bay = source_work.get((t, q))
+            if bay is None:
+                t += 1
+                continue
+            start_t = t
+            bay = int(bay)
+            while t < horizon and source_work.get((t, q)) == bay:
+                t += 1
+            block = {
+                "id": len(source_blocks),
+                "source_owner": q,
+                "bay": bay,
+                "start": start_t,
+                "end": t,
+                "length": t - start_t,
+            }
+            source_blocks.append(block)
+            blocks_by_crane[q].append(block)
+
+    # The old relay neighborhood had no entry point when a crane finished
+    # early without revisiting a bay.  Add generic donor/receiver foci from
+    # actual loads and eligible source blocks; quantities are integer units,
+    # and a long source phase is split at the selected transfer boundary.
+    if include_idle_capacity:
+        source_loads = [
+            sum(value is not None for (_t, owner), value in source_work.items()
+                if owner == q)
+            for q in range(M)
+        ]
+        remaining_capacity = [
+            max(0, horizon - load) for load in source_loads
+        ]
+        idle_focuses: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+        for block in source_blocks:
+            donor = int(block["source_owner"])
+            mandatory_prefix = int(
+                int(block["start"]) == 0 and int(block["bay"]) in set(starts)
+            )
+            transferable_capacity = max(
+                0, int(block["length"]) - mandatory_prefix
+            )
+            for receiver in sorted(eligibility[int(block["bay"]) - 1]):
+                # Idle-capacity balancing is a local diffusion operator.  A
+                # direct hand-off to a distant crane forces the active band to
+                # span every intervening crane, consumes the bounded search on
+                # mostly infeasible full-width variants, and is exactly the
+                # kind of global rewrite that ``local_only`` must avoid.
+                # Longer transfers are therefore composed from several
+                # independently verified adjacent-crane transactions.
+                if (
+                    abs(receiver - donor) != 1
+                    or source_loads[donor] <= source_loads[receiver]
+                ):
+                    continue
+                capacity = remaining_capacity[receiver]
+                ideal = min(
+                    transferable_capacity, capacity,
+                    max(1, (source_loads[donor] - source_loads[receiver]) // 2),
+                )
+                if ideal <= 0:
+                    continue
+                quantities = {ideal}
+                for delta in (-1, 1):
+                    neighbor = ideal + delta
+                    if 1 <= neighbor <= min(transferable_capacity, capacity):
+                        quantities.add(neighbor)
+                if ideal < int(block["length"]) and ideal < capacity:
+                    quantities.add(min(transferable_capacity, capacity))
+                for transfer in sorted(quantities):
+                    projected = list(source_loads)
+                    projected[donor] -= transfer
+                    projected[receiver] += transfer
+                    balance_deviation = sum(
+                        (M * load - sum(source_loads)) ** 2
+                        for load in projected
+                    )
+                    max_idle = horizon - min(projected, default=0)
+                    rank = (
+                        max_idle, balance_deviation,
+                        abs(source_loads[donor] - source_loads[receiver]),
+                        -int(transfer), int(block["start"]),
+                        donor, receiver, int(block["bay"]),
+                    )
+                    sides = (
+                        ("suffix",) if transfer == int(block["length"])
+                        else ("suffix",) if mandatory_prefix
+                        else ("prefix", "suffix")
+                    )
+                    for side in sides:
+                        focus = {
+                            "focus_type": "idle_capacity",
+                            "crane": donor + 1,
+                            "bay": int(block["bay"]),
+                            "focus_source_block_id": int(block["id"]),
+                            "transfer_length": int(transfer),
+                            "transfer_side": side,
+                            "target_owner": int(receiver),
+                            "projected_max_nonwork_capacity": int(max_idle),
+                            "projected_load_balance_deviation": int(balance_deviation),
+                            "blocks": [{
+                                "start": int(block["start"]),
+                                "end_exclusive": int(block["end"]),
+                            }],
+                            "gap": max(0, horizon - source_loads[donor]),
+                        }
+                        idle_focuses.append((rank + (side,), focus))
+                        # When the receiver cannot enter the donor's bay
+                        # because the upstream crane leaves no parking gap,
+                        # a two-crane hand-off is structurally impossible even
+                        # though the receiver has ample idle capacity.  Add a
+                        # three-crane atomic relay: the upstream crane gives
+                        # the same quantity to the donor while the donor gives
+                        # it to the receiver.  Net load of the middle crane is
+                        # unchanged and no infeasible intermediate schedule is
+                        # ever published.
+                        direction = receiver - donor
+                        upstream = donor - direction
+                        if 0 <= upstream < M:
+                            relay_options = []
+                            for relay_block in blocks_by_crane[upstream]:
+                                relay_mandatory = int(
+                                    int(relay_block["start"]) == 0
+                                    and int(relay_block["bay"]) in set(starts)
+                                )
+                                relay_capacity = max(
+                                    0,
+                                    int(relay_block["length"])
+                                    - relay_mandatory,
+                                )
+                                if (
+                                    donor in eligibility[
+                                        int(relay_block["bay"]) - 1
+                                    ]
+                                    and relay_capacity >= transfer
+                                ):
+                                    relay_options.append(relay_block)
+                            if relay_options:
+                                relay_block = min(
+                                    relay_options,
+                                    key=lambda item: (
+                                        int(any(
+                                            int(existing["bay"])
+                                            == int(item["bay"])
+                                            for existing in blocks_by_crane[
+                                                donor
+                                            ]
+                                        )),
+                                        -direction * int(item["bay"]),
+                                        -int(item["start"]),
+                                        -int(item["length"]),
+                                    ),
+                                )
+                                chain_projected = list(source_loads)
+                                chain_projected[upstream] -= transfer
+                                chain_projected[receiver] += transfer
+                                chain_deviation = sum(
+                                    (M * load - sum(source_loads)) ** 2
+                                    for load in chain_projected
+                                )
+                                chain_max_idle = horizon - min(
+                                    chain_projected, default=0
+                                )
+                                chain_focus = {
+                                    **focus,
+                                    "relay_source_block_id": int(
+                                        relay_block["id"]
+                                    ),
+                                    "relay_target_owner": donor,
+                                    "relay_transfer_length": int(transfer),
+                                    "relay_transfer_side": "suffix",
+                                    "projected_max_nonwork_capacity": int(
+                                        chain_max_idle
+                                    ),
+                                    "projected_load_balance_deviation": int(
+                                        chain_deviation
+                                    ),
+                                }
+                                chain_rank = (
+                                    chain_max_idle,
+                                    chain_deviation,
+                                    -int(transfer),
+                                    int(block["start"]),
+                                    donor,
+                                    receiver,
+                                    int(block["bay"]),
+                                    "chain",
+                                    side,
+                                )
+                                idle_focuses.append(
+                                    (chain_rank, chain_focus)
+                                )
+        idle_focuses.sort(key=lambda item: item[0])
+        focuses.extend(focus for _rank, focus in idle_focuses[:64])
+        stats["idle_capacity_focuses"] = min(64, len(idle_focuses))
+        stats["idle_capacity_chain_focuses"] = sum(
+            "relay_source_block_id" in focus
+            for _rank, focus in idle_focuses[:64]
+        )
+        stats["partial_transfer_focuses"] = sum(
+            int(focus["transfer_length"])
+            < next(
+                int(block["length"]) for block in source_blocks
+                if int(block["id"]) == int(focus["focus_source_block_id"])
+            )
+            for _rank, focus in idle_focuses[:64]
+        )
+        stats["focuses_without_revisits"] = int(
+            idle_capacity_only and not diagnostics.get("crane_work_revisits")
+        )
+    focuses.sort(key=lambda item: (
+        0 if item.get("focus_type") == "idle_capacity" else 1,
+        int(item.get("projected_max_nonwork_capacity", 0)),
+        int(item.get("projected_load_balance_deviation", 0)),
+        -int(item.get("transfer_length", 0)),
+        -int(item.get("residual_length", item.get("work_count", 0))),
+        -int(item.get("gap", 0)),
+        int(item.get("crane", 0)),
+        int(item.get("bay", 0)),
+    ))
+    stats["focus_revisits"] = revisit_focus_count
+    if not focuses:
+        stats["status"] = "NOT_APPLICABLE"
+        return [], stats
+
+    def expired() -> bool:
+        if deadline is not None and time.perf_counter() >= deadline:
+            stats["status"] = "UNKNOWN_DEADLINE"
+            stats["timeout"] += 1
+            return True
+        return False
+
+    def block_is_focus(block: dict[str, int], focus: dict[str, Any]) -> bool:
+        focus_task_ids = {
+            int(value) for value in focus.get("focus_task_ids", [])
+        }
+        if focus_task_ids and int(block["id"]) in focus_task_ids:
+            return True
+        source_focus_ids = {
+            int(value) for value in (
+                focus.get("focus_source_block_id"),
+                focus.get("relay_source_block_id"),
+            )
+            if value is not None
+        }
+        if source_focus_ids and int(block["id"]) in source_focus_ids:
+            return True
+        if block["source_owner"] != int(focus.get("crane", 0)) - 1:
+            return False
+        if block["bay"] != int(focus.get("bay", 0)):
+            return False
+        if "focus_task_id" in focus:
+            return block["id"] == int(focus["focus_task_id"])
+        primary = focus.get("primary_block") or {}
+        residual = focus.get("residual_block") or {}
+        return (
+            block["start"] == int(residual.get("start", -1))
+            and block["end"] == int(residual.get("end_exclusive", -1))
+        ) or (
+            block["start"] == int(primary.get("start", -1))
+            and block["end"] == int(primary.get("end_exclusive", -1))
+        )
+
+    proposals: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    tested_bands: set[tuple[Any, ...]] = set()
+
+    def owner_choices(block: dict[str, int], band: tuple[int, ...]) -> list[int]:
+        source_owner = block["source_owner"]
+        bay = block["bay"]
+        allowed = set(band) & eligibility[bay - 1]
+        # Keep the neighborhood local, but include a two-hop choice when the
+        # focus chain needs one relay through an intermediate crane.
+        if block_is_focus(block, current_focus[0]):
+            requested_owner = (
+                current_focus[0].get("focus_task_targets", {}).get(
+                    int(block["id"])
+                )
+            )
+            if requested_owner is None:
+                requested_owner = current_focus[0].get("target_owner")
+            if requested_owner is not None:
+                allowed &= {int(requested_owner)}
+            elif current_focus[0].get("focus_type") != "idle_capacity":
+                allowed &= {q for q in band if abs(q - source_owner) <= 2}
+        elif current_focus[0].get("focus_type") == "idle_capacity":
+            # Load-balance transactions change only the explicitly split
+            # relay slices.  Other ownership changes belong to a later local
+            # transaction and would unnecessarily enlarge this neighborhood.
+            return [source_owner]
+        elif current_focus[0].get("focus_type") != "idle_capacity":
+            allowed &= {q for q in band if abs(q - source_owner) <= 2}
+        max_hops = M if current_focus[0].get("focus_type") == "idle_capacity" else 2
+        choices = [source_owner]
+        choices.extend(
+            q for q in sorted(allowed)
+            if q != source_owner and abs(q - source_owner) <= max_hops
+        )
+        return list(dict.fromkeys(choices))
+
+    current_focus: list[dict[str, Any]] = [{}]
+
+    def assignment_variants(
+        band: tuple[int, ...], focus: dict[str, Any],
+        tasks: list[dict[str, int]],
+    ) -> list[tuple[int, ...]]:
+        current_focus[0] = focus
+        if not tasks:
+            return []
+        by_id = {block["id"]: block for block in tasks}
+        focus_ids = [block["id"] for block in tasks if block_is_focus(block, focus)]
+        if not focus_ids:
+            return []
+        base = tuple(block["source_owner"] for block in tasks)
+        local_choices = {
+            block["id"]: owner_choices(block, band)
+            for block in tasks
+        }
+        local_seen: set[tuple[int, ...]] = set()
+        variants: list[tuple[int, ...]] = [base]
+        forced_targets = {
+            int(task_id): int(target)
+            for task_id, target in focus.get(
+                "focus_task_targets", {}
+            ).items()
+        }
+        # First branch only moves the focus phase.  Additional branches move a
+        # nearby phase too, which is the minimum useful representation of a
+        # two-hop hand-off around a safety conflict.
+        related = sorted(
+            (block for block in tasks if block["id"] not in focus_ids),
+            key=lambda block: (
+                min(
+                    abs(block["start"] - by_id[fid]["start"])
+                    for fid in focus_ids
+                ),
+                block["start"],
+                block["source_owner"],
+            ),
+        )[:8]
+
+        def add_variant(values: dict[int, int]) -> None:
+            if len(variants) >= max_assignment_variants:
+                return
+            result = tuple(values.get(block["id"], block["source_owner"]) for block in tasks)
+            if result == base or result in local_seen:
+                return
+            # Do not manufacture a third owner for the same bay in this
+            # bounded phase neighborhood; a later transaction can introduce a
+            # second band if needed.
+            owners_by_bay: dict[int, set[int]] = {}
+            for block, owner in zip(tasks, result):
+                owners_by_bay.setdefault(block["bay"], set()).add(owner)
+            if any(len(owners) > 2 for owners in owners_by_bay.values()):
+                return
+            local_seen.add(result)
+            variants.append(result)
+
+        if len(forced_targets) > 1:
+            add_variant(forced_targets)
+            return variants
+
+        for focus_id in focus_ids:
+            for target in local_choices[focus_id]:
+                if target == by_id[focus_id]["source_owner"]:
+                    continue
+                stats["owner_change_branches"] += 1
+                if abs(target - by_id[focus_id]["source_owner"]) == 2:
+                    stats["two_hop_relay_branches"] += 1
+                add_variant({focus_id: target})
+                for other in related:
+                    if other["id"] == focus_id:
+                        continue
+                    for other_target in local_choices[other["id"]]:
+                        if other_target == other["source_owner"]:
+                            continue
+                        add_variant({
+                            focus_id: target,
+                            other["id"]: other_target,
+                        })
+        return variants
+
+    def tasks_for_focus(
+        band: tuple[int, ...], focus: dict[str, Any]
+    ) -> list[dict[str, int]]:
+        tasks = [
+            dict(block) for block in source_blocks
+            if block["source_owner"] in band
+        ]
+        if focus.get("focus_type") != "idle_capacity":
+            return tasks
+        focus_task_ids: list[int] = []
+        focus_task_targets: dict[int, int] = {}
+
+        def split_transfer(
+            source_id: int,
+            requested_transfer: int,
+            side: str,
+            target_owner: int,
+        ) -> bool:
+            source_block = next(
+                (block for block in tasks if block["id"] == source_id),
+                None,
+            )
+            if source_block is None:
+                return False
+            transfer = min(
+                int(source_block["length"]), int(requested_transfer)
+            )
+            if transfer <= 0:
+                return False
+            mandatory_prefix = int(
+                int(source_block["start"]) == 0
+                and int(source_block["bay"]) in set(starts)
+            )
+            if transfer == int(source_block["length"]):
+                transferable_id = int(source_block["id"])
+            else:
+                next_id = max(
+                    (int(task["id"]) for task in tasks), default=-1
+                ) + 1
+                original_start = int(source_block["start"])
+                original_end = int(source_block["end"])
+                if side == "prefix":
+                    transfer_start = original_start + mandatory_prefix
+                    transfer_end = transfer_start + transfer
+                else:
+                    transfer_start = original_end - transfer
+                    transfer_end = original_end
+                segments: list[dict[str, int]] = []
+                segment_id = next_id
+                for left, right in (
+                    (original_start, transfer_start),
+                    (transfer_end, original_end),
+                ):
+                    if right <= left:
+                        continue
+                    segments.append({
+                        **source_block,
+                        "id": segment_id,
+                        "start": left,
+                        "end": right,
+                        "length": right - left,
+                    })
+                    segment_id += 1
+                transferable = {
+                    **source_block,
+                    "id": segment_id,
+                    "start": transfer_start,
+                    "end": transfer_end,
+                    "length": transfer,
+                }
+                position = next(
+                    i for i, task in enumerate(tasks)
+                    if task["id"] == source_id
+                )
+                tasks[position:position + 1] = [
+                    *segments, transferable
+                ]
+                transferable_id = int(transferable["id"])
+            focus_task_ids.append(transferable_id)
+            focus_task_targets[transferable_id] = int(target_owner)
+            return True
+
+        if not split_transfer(
+            int(focus["focus_source_block_id"]),
+            int(focus["transfer_length"]),
+            str(focus.get("transfer_side", "suffix")),
+            int(focus["target_owner"]),
+        ):
+            return []
+        focus["focus_task_id"] = focus_task_ids[0]
+        relay_source_id = focus.get("relay_source_block_id")
+        if relay_source_id is not None and not split_transfer(
+            int(relay_source_id),
+            int(focus.get("relay_transfer_length", focus["transfer_length"])),
+            str(focus.get("relay_transfer_side", "suffix")),
+            int(focus["relay_target_owner"]),
+        ):
+            return []
+        focus["focus_task_ids"] = list(focus_task_ids)
+        focus["focus_task_targets"] = dict(focus_task_targets)
+        return tasks
+
+    def solve_positions(
+        band: tuple[int, ...],
+        assigned_owners: tuple[int, ...],
+        tasks: list[dict[str, int]],
+        retimed_work_plan: dict[tuple[int, int], int | None] | None = None,
+    ) -> tuple[list[tuple[int, ...]], dict[tuple[int, int], int | None]] | None:
+        work_plan = (
+            dict(retimed_work_plan)
+            if retimed_work_plan is not None
+            else dict(source_work)
+        )
+        occupied: dict[tuple[int, int], int] = {}
+        # Rewrite the complete active-band ledger atomically.  Overlap is
+        # rejected before any position search, so no partial transfer leaks.
+        if retimed_work_plan is None:
+            for task in tasks:
+                for t in range(task["start"], task["end"]):
+                    work_plan[(t, task["source_owner"])] = None
+            for task, new_owner in zip(tasks, assigned_owners):
+                bay = task["bay"]
+                for t in range(task["start"], task["end"]):
+                    key = (t, new_owner)
+                    old_task = occupied.get(key)
+                    if old_task is not None and old_task != task["id"]:
+                        stats["rejected_overlap"] += 1
+                        return None
+                    occupied[key] = task["id"]
+                    work_plan[key] = bay
+
+        # The active-band ledger must be exactly the source ledger by bay.
+        for bay, required in enumerate(W, 1):
+            if sum(value == bay for value in work_plan.values()) != int(required):
+                stats["rejected_ledger"] += 1
+                return None
+        for (t, q), bay in work_plan.items():
+            if bay is not None and q not in eligibility[int(bay) - 1]:
+                stats["rejected_eligibility"] += 1
+                return None
+
+        # Build fixed work positions.  Idle cells are deliberately left free;
+        # the row DP can move a donor away and a receiver into the transferred
+        # phase in the same atomic transaction.
+        fixed_work: list[dict[int, int]] = [dict() for _ in range(horizon)]
+        for (t, q), bay in work_plan.items():
+            if bay is not None:
+                fixed_work[t][q] = int(bay)
+
+        options_cache: dict[tuple[Any, ...], list[tuple[int, ...]]] = {}
+
+        def row_options(t: int) -> list[tuple[int, ...]]:
+            key = (
+                tuple(sorted(fixed_work[t].items())),
+                tuple((q, source_rows[t][q]) for q in range(M) if q not in band),
+                t == 0,
+            )
+            cached = options_cache.get(key)
+            if cached is not None:
+                return cached
+            result: list[tuple[int, ...]] = []
+            for config in legal_configurations:
+                if t == 0 and config != source_rows[0]:
+                    continue
+                if any(config[q] != position for q, position in key[1]):
+                    continue
+                if any(config[q] != bay for q, bay in fixed_work[t].items()):
+                    continue
+                result.append(config)
+            options_cache[key] = result
+            return result
+
+        first_options = row_options(0)
+        if not first_options:
+            stats["rejected_safety"] += 1
+            return None
+        # ``parents[t][row] = previous_row``.  Movement into the terminal
+        # boundary row H is not counted in K, matching the candidate metric.
+        parents: list[dict[tuple[int, ...], tuple[int, ...] | None]] = [
+            {source_rows[0]: None}
+        ]
+        costs: dict[tuple[int, ...], tuple[int, int]] = {
+            source_rows[0]: (0, 0)
+        }
+        for t in range(1, horizon + 1):
+            if expired():
+                return None
+            options = row_options(t if t < horizon else horizon - 1)
+            # The final row has no work cell; it only needs to remain safe and
+            # keep inactive cranes frozen.  Use the same work constraints as
+            # the preceding boundary when the last slot is active.
+            if t == horizon:
+                options = [
+                    config for config in legal_configurations
+                    if all(
+                        config[q] == source_rows[t][q]
+                        for q in range(M) if q not in band
+                    )
+                    and all(
+                        config[q] == bay
+                        for q, bay in fixed_work[horizon - 1].items()
+                    )
+                ]
+            current: dict[tuple[int, ...], tuple[int, int]] = {}
+            current_parents: dict[tuple[int, ...], tuple[int, ...] | None] = {}
+            for row in options:
+                best_item: tuple[tuple[int, int], tuple[int, ...] | None] | None = None
+                for previous, (move_cost, source_distance) in costs.items():
+                    transition = sum(
+                        before != after
+                        for before, after in zip(previous, row)
+                    )
+                    # The edge into row H is a terminal boundary and is not a
+                    # completed move when the last work ends at H.
+                    counted = transition if t < horizon else 0
+                    item = (
+                        move_cost + counted,
+                        source_distance + sum(
+                            abs(int(row[q]) - int(source_rows[t][q]))
+                            for q in band
+                        ),
+                    )
+                    if best_item is None or item < best_item[0]:
+                        best_item = (item, previous)
+                if best_item is None:
+                    continue
+                current[row] = best_item[0]
+                current_parents[row] = best_item[1]
+            stats["states_expanded"] += len(current)
+            if stats["states_expanded"] >= state_limit:
+                stats["status"] = "UNKNOWN_STATE_LIMIT"
+                stats["state_limit"] += 1
+                return None
+            if not current:
+                stats["rejected_safety"] += 1
+                return None
+            costs = current
+            parents.append(current_parents)
+
+        final_row = min(costs, key=lambda row: costs[row])
+        history: list[tuple[int, ...]] = [final_row]
+        for t in range(horizon, 0, -1):
+            previous = parents[t].get(history[-1])
+            if previous is None:
+                break
+            history.append(previous)
+        history.reverse()
+        if len(history) != horizon + 1:
+            stats["rejected_safety"] += 1
+            return None
+        return history, work_plan
+
+    def retimed_work_plans(
+        band: tuple[int, ...],
+        tasks: list[dict[str, int]],
+        assigned_owners: tuple[int, ...],
+        focus: dict[str, Any],
+        max_variants: int = 24,
+    ) -> list[dict[tuple[int, int], int | None]]:
+        """Create a few event-time phase orders for one owner assignment."""
+        by_crane: dict[int, list[dict[str, int]]] = {q: [] for q in band}
+        for task, owner in zip(tasks, assigned_owners):
+            by_crane.setdefault(owner, []).append(task)
+        focus_ids = {
+            block["id"] for block in tasks
+            if block_is_focus(block, focus)
+        }
+        order_options: dict[int, list[list[dict[str, int]]]] = {}
+        for q in band:
+            crane_tasks = list(by_crane.get(q, []))
+            crane_tasks.sort(key=lambda item: (item["start"], item["source_owner"], item["id"]))
+            if not crane_tasks:
+                order_options[q] = [[]]
+                continue
+            forced_first = [
+                task for task in crane_tasks
+                if task["source_owner"] == q and task["start"] == 0
+            ]
+            options: list[list[dict[str, int]]] = [list(crane_tasks)]
+            for focus_task in crane_tasks:
+                if focus_task["id"] not in focus_ids:
+                    continue
+                for index in range(len(crane_tasks)):
+                    candidate_order = [
+                        task for task in crane_tasks if task["id"] != focus_task["id"]
+                    ]
+                    candidate_order.insert(index, focus_task)
+                    if forced_first and candidate_order[0]["id"] != forced_first[0]["id"]:
+                        continue
+                    if not any(
+                        [task["id"] for task in candidate_order]
+                        == [task["id"] for task in old]
+                        for old in options
+                    ):
+                        options.append(candidate_order)
+                    if len(options) >= 8:
+                        break
+                if len(options) >= 8:
+                    break
+            order_options[q] = options
+
+        combinations: list[dict[int, list[dict[str, int]]]] = []
+
+        def combine(index: int, selected: dict[int, list[dict[str, int]]]) -> None:
+            if len(combinations) >= max_variants:
+                return
+            if index >= len(band):
+                combinations.append({q: list(value) for q, value in selected.items()})
+                return
+            q = band[index]
+            for option in order_options.get(q, [[]]):
+                selected[q] = option
+                combine(index + 1, selected)
+                if len(combinations) >= max_variants:
+                    return
+            selected.pop(q, None)
+
+        combine(0, {})
+        plans: list[dict[tuple[int, int], int | None]] = []
+        seen_plans: set[tuple[tuple[tuple[int, int], int | None], ...]] = set()
+        for combination in combinations:
+            placements: list[tuple[dict[str, int], int, int]] = []
+            placed_work: dict[tuple[int, int], int] = {}
+            valid = True
+            for q in band:
+                cursor = 0
+                crane_tasks = combination.get(q, [])
+                # Keep an original t=0 phase at t=0; this preserves the
+                # mandatory opening work while allowing later relay phases to
+                # move earlier or later as one event-time block.
+                for task in crane_tasks:
+                    start_t = cursor
+                    if task["source_owner"] == q and task["start"] == 0:
+                        if cursor != 0:
+                            valid = False
+                            break
+                        start_t = 0
+                    else:
+                        # Keep the transferred slice inside its source-side
+                        # local time window, but let the receiver's existing
+                        # phases slide left into the newly available idle
+                        # capacity.  Freezing every phase at its old start
+                        # left an artificial gap between the transferred
+                        # suffix and an existing same-bay receiver phase (for
+                        # example Q4@bay13), turning one useful hand-off into
+                        # two work blocks and an avoidable return move.
+                        is_idle_balance = (
+                            focus.get("focus_type") == "idle_capacity"
+                        )
+                        release = (
+                            max(cursor, min(task["start"], horizon))
+                            if not is_idle_balance or task["id"] in focus_ids
+                            else cursor
+                        )
+                        start_t = release
+                        # Compact to the earliest locally safe interval.  A
+                        # simple left shift can collide with a frozen neighbor
+                        # (H208 Q2 remains at bay 9 while Q3 would like to move
+                        # to bay 10).  Scan only this phase's bounded window and
+                        # insert exactly the wait forced by neighboring work.
+                        while (
+                            is_idle_balance
+                            and start_t + int(task["length"]) <= horizon
+                        ):
+                            interval_safe = True
+                            for t in range(
+                                start_t, start_t + int(task["length"])
+                            ):
+                                for other in range(M):
+                                    if other == q:
+                                        continue
+                                    other_bay = (
+                                        placed_work.get((t, other))
+                                        if other in band else source_rows[t][other]
+                                    )
+                                    if other_bay is None:
+                                        continue
+                                    if (
+                                        other < q
+                                        and int(task["bay"]) - int(other_bay) < 2
+                                    ) or (
+                                        other > q
+                                        and int(other_bay) - int(task["bay"]) < 2
+                                    ):
+                                        interval_safe = False
+                                        break
+                                if not interval_safe:
+                                    break
+                            if interval_safe:
+                                break
+                            start_t += 1
+                    end_t = start_t + task["length"]
+                    if end_t > horizon:
+                        valid = False
+                        break
+                    placements.append((task, start_t, end_t))
+                    for t in range(start_t, end_t):
+                        placed_work[(t, q)] = int(task["bay"])
+                    cursor = end_t
+                if not valid:
+                    break
+            if not valid:
+                continue
+            plan = dict(source_work)
+            for task in tasks:
+                for t in range(task["start"], task["end"]):
+                    plan[(t, task["source_owner"])] = None
+            occupied: set[tuple[int, int]] = set()
+            for task, start_t, end_t in placements:
+                owner = next(
+                    q for q, values in combination.items()
+                    if any(item["id"] == task["id"] for item in values)
+                )
+                for t in range(start_t, end_t):
+                    key = (t, owner)
+                    if key in occupied:
+                        valid = False
+                        break
+                    occupied.add(key)
+                    plan[key] = task["bay"]
+                if not valid:
+                    break
+            if not valid:
+                continue
+            signature = tuple(sorted(plan.items()))
+            if signature in seen_plans:
+                continue
+            seen_plans.add(signature)
+            plans.append(plan)
+            if len(plans) >= max_variants:
+                break
+        return plans
+
+    for focus in focuses:
+        if expired() or len(proposals) >= max_candidates:
+            break
+        focus_q = int(focus.get("crane", 0)) - 1
+        # Load diffusion is intentionally a two-crane neighborhood.  Once the
+        # donor and its adjacent receiver are in the band, adding more cranes
+        # turns a local repair into a much larger reschedule and multiplies
+        # infeasible assignment combinations.  If another pair also needs
+        # work, the outer polish loop performs a separate verified relay.
+        widths = (
+            (3,) if (
+                focus.get("focus_type") == "idle_capacity"
+                and "relay_source_block_id" in focus
+            ) else (2,) if focus.get("focus_type") == "idle_capacity"
+            else range(2, M + 1)
+        )
+        for width in widths:
+            left_min = max(0, focus_q - width + 1)
+            left_max = min(focus_q, M - width)
+            for left in range(left_min, left_max + 1):
+                band = tuple(range(left, left + width))
+                focus_signature = (
+                    focus.get("focus_type", "revisit"), focus_q,
+                    int(focus.get("bay", 0)),
+                    int(focus.get("transfer_length", 0)),
+                    int(focus.get("target_owner", -1)),
+                    focus.get("transfer_side", ""),
+                    int(focus.get("focus_source_block_id", -1)),
+                    int(focus.get("relay_source_block_id", -1)),
+                )
+                band_key = (focus_signature, band)
+                if band_key in tested_bands:
+                    continue
+                tested_bands.add(band_key)
+                stats["activity_bands_tested"] += 1
+                stats["max_activity_width"] = max(
+                    stats["max_activity_width"], len(band)
+                )
+                tasks = tasks_for_focus(band, focus)
+                if focus.get("focus_type") == "idle_capacity":
+                    target_owner = int(focus["target_owner"])
+                    if target_owner not in band:
+                        continue
+                variants = assignment_variants(band, focus, tasks)
+                expansion = {
+                    "focus": {"crane": focus_q + 1, "bay": int(focus.get("bay", 0))},
+                    "active_cranes": [q + 1 for q in band],
+                    "task_count": len(tasks),
+                    "assignment_variants": len(variants),
+                    "verified_candidates": 0,
+                }
+                for assigned_owners in variants:
+                    if expired() or len(proposals) >= max_candidates:
+                        break
+                    if stats["assignment_variants_generated"] >= max_assignment_variants:
+                        stats["status"] = "UNKNOWN_STATE_LIMIT"
+                        stats["state_limit"] += 1
+                        break
+                    stats["assignment_variants_generated"] += 1
+                    if all(
+                        owner == task["source_owner"]
+                        for owner, task in zip(assigned_owners, tasks)
+                    ):
+                        continue
+                    retimed_plans = retimed_work_plans(
+                        band, tasks, assigned_owners, focus
+                    )
+                    stats["retimed_plans_generated"] += len(retimed_plans)
+                    # For load balancing, try the locally compacted event
+                    # plans before the unchanged timestamps.  The unchanged
+                    # plan is legal but often leaves a gap between a handed-
+                    # off suffix and the receiver's existing same-bay phase,
+                    # consuming the candidate cap with fragmented variants.
+                    plans_to_try: list[
+                        dict[tuple[int, int], int | None] | None
+                    ] = (
+                        [*retimed_plans, None]
+                        if focus.get("focus_type") == "idle_capacity"
+                        else [None, *retimed_plans]
+                    )
+                    for retimed_plan in plans_to_try:
+                        if expired() or len(proposals) >= max_candidates:
+                            break
+                        solved = solve_positions(
+                            band, assigned_owners, tasks, retimed_plan
+                        )
+                        if solved is None:
+                            continue
+                        if retimed_plan is not None:
+                            stats["retimed_plans_solved"] += 1
+                        history, work_plan = solved
+                        stats["complete_phase_plans"] += 1
+                        stats["ledger_closed"] += 1
+                        signature = (
+                            tuple(history), tuple(sorted(work_plan.items()))
+                        )
+                        if signature in seen:
+                            continue
+                        seen.add(signature)
+                        try:
+                            candidate = _candidate_from_rows_and_work_plan(
+                                W, M, history, work_plan
+                            )
+                        except RuntimeError:
+                            stats["rejected_safety"] += 1
+                            continue
+                        stats["decoded"] += 1
+                        if not _candidate_passes_independent_verifier(W, M, starts, candidate):
+                            stats["rejected_safety"] += 1
+                            continue
+                        stats["verified"] += 1
+                        expansion["verified_candidates"] += 1
+                        owner_changes = [
+                            {
+                                "bay": task["bay"],
+                                "start": task["start"],
+                                "end_exclusive": task["end"],
+                                "length": task["length"],
+                                "from_crane": task["source_owner"] + 1,
+                                "to_crane": owner + 1,
+                            }
+                            for task, owner in zip(tasks, assigned_owners)
+                            if owner != task["source_owner"]
+                        ]
+                        candidate_balance = _balanced_schedule_metrics(candidate, M)
+                        operator_name = (
+                            "idle_capacity_rebalance"
+                            if focus.get("focus_type") == "idle_capacity"
+                            else "cross_crane_phase_relay"
+                        )
+                        proposals.append({
+                        "operator": operator_name,
+                        "history": [tuple(row) for row in history],
+                        "work_plan": work_plan,
+                        "active_cranes": list(band),
+                        "regions": [
+                            {
+                                "crane": q + 1,
+                                "start": 0,
+                                "end_exclusive": horizon,
+                                "length": horizon,
+                                "segment": 0,
+                            }
+                            for q in band
+                        ],
+                        "source_signature": _trajectory_signature(source),
+                        "source_hash": source_hash,
+                        "details": {
+                            "focus": {
+                                "type": focus.get("focus_type", "revisit"),
+                                "crane": focus_q + 1,
+                                "bay": int(focus.get("bay", 0)),
+                                "blocks": focus.get("blocks", []),
+                                "gap": int(focus.get("gap", 0)),
+                                "target_crane": (
+                                    int(focus["target_owner"]) + 1
+                                    if focus.get("target_owner") is not None else None
+                                ),
+                                "transfer_length": focus.get("transfer_length"),
+                                "transfer_side": focus.get("transfer_side"),
+                                "atomic_chain": bool(
+                                    focus.get("relay_source_block_id")
+                                    is not None
+                                ),
+                            },
+                            "active_cranes": [q + 1 for q in band],
+                            "owner_changes": owner_changes,
+                            "owner_change_count": len(owner_changes),
+                            "two_hop_relay": any(
+                                abs(item["from_crane"] - item["to_crane"]) == 2
+                                for item in owner_changes
+                            ),
+                            "candidate_objective": list(candidate.objective_key),
+                            "candidate_movement_count": candidate.completion_movement_count,
+                            "candidate_balance": {
+                                **candidate_balance,
+                                "key": list(candidate_balance["key"]),
+                            },
+                            "work_ledger": {
+                                "source_by_bay": [
+                                    sum(value == bay for value in source_work.values())
+                                    for bay in range(1, N + 1)
+                                ],
+                                "transaction_by_bay": [
+                                    sum(value == bay for value in work_plan.values())
+                                    for bay in range(1, N + 1)
+                                ],
+                                "closed": True,
+                                "work_transfer": True,
+                            },
+                            "event_level": True,
+                        },
+                        })
+                        if candidate.objective_key <= source.objective_key:
+                            stats["accepted"] += 1
+                stats["activity_chain_expansions"].append(expansion)
+                if stats["status"] == "UNKNOWN_STATE_LIMIT":
+                    break
+            if stats["status"] == "UNKNOWN_STATE_LIMIT":
+                break
+        if stats["status"] == "UNKNOWN_STATE_LIMIT":
+            break
+
+    proposals.sort(key=lambda item: (
+        (
+            tuple(item["details"]["candidate_balance"]["key"])
+            if item["operator"] == "idle_capacity_rebalance"
+            else tuple(item["details"]["candidate_objective"])
+        ),
+        int(item["details"].get("owner_change_count", 0)),
+        tuple(item["active_cranes"]),
+    ))
+    if proposals and stats["status"] == "UNKNOWN_STATE_LIMIT":
+        # The bounded assignment cap stopped enumeration after complete,
+        # independently verified candidates were already produced.  Expose
+        # that useful result as a candidate-found status; only an empty
+        # capped search remains UNKNOWN.
+        stats["status"] = "CANDIDATE_FOUND"
+    return proposals[:max_candidates], stats
 
 
 def _build_relay_transaction(
@@ -1503,6 +4584,426 @@ def _work_transfer_transactions(
     return proposals, stats
 
 
+def _paired_window_cyclic_work_exchange(
+    W: Sequence[int],
+    M: int,
+    source: _CandidateSchedule,
+    *,
+    max_candidates: int = 64,
+    state_limit: int = 256,
+    source_hash: str | None = None,
+    deadline: float | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Propose bounded early/late relay cycles for short work residuals.
+
+    This first implementation targets a one-slot residual after a long gap.
+    It moves the residual into the next slot after its primary block, relays
+    the displaced work through two or three adjacent cranes, and closes the
+    work ledger in a separate tail window.  A second tail variant lets the
+    residual crane take over its neighbor's continuous tail block, which can
+    remove the unnecessary return move while keeping every edited slot
+    explicit.  Both windows are at most eight slots and at most three adjacent
+    cranes participate.
+
+    The generator is intentionally finite and conservative.  An empty result
+    or a state limit is UNKNOWN for this proposal family, never proof that a
+    longer-horizon schedule is impossible.
+    """
+    stats: dict[str, Any] = {
+        "status": "SEARCH_COMPLETE",
+        "generated": 0,
+        "unique": 0,
+        "expanded_states": 0,
+        "early_window_states": 0,
+        "late_window_states": 0,
+        "capacity_rejected": 0,
+        "safety_rejected": 0,
+        "boundary_rejected": 0,
+        "ledger_rejected": 0,
+        "verified": 0,
+        "accepted": 0,
+        "timeout": 0,
+        "state_limit": 0,
+        "operators": {
+            "residual_absorb": 0,
+            "cyclic_exchange": 0,
+            "block_boundary_shift": 0,
+            "pre_tail_compensation": 0,
+        },
+    }
+    if source.move_time != 0:
+        stats.update({"status": "UNSUPPORTED", "reason": "nonzero_move_time"})
+        return [], stats
+    if source.makespan < 4:
+        stats.update({"status": "UNSUPPORTED", "reason": "horizon_too_short"})
+        return [], stats
+
+    rows, source_work = _transaction_rows_work_map(source, M)
+    horizon = source.makespan
+    diagnostics = _continuity_diagnostics(source, M)
+    proposals: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+
+    def expired() -> bool:
+        return deadline is not None and time.perf_counter() >= deadline
+
+    revisits = sorted(
+        diagnostics["crane_work_revisits"],
+        key=lambda item: (
+            -int(item.get("gap", 0)),
+            int(item.get("residual_length", 0)),
+            int(item["crane"]),
+            int(item["bay"]),
+        ),
+    )
+    for revisit in revisits:
+        if expired() or len(proposals) >= max_candidates:
+            stats["timeout"] += int(expired())
+            if expired() or len(proposals) >= max_candidates:
+                stats["status"] = "UNKNOWN"
+                stats["limit_reason"] = "deadline" if expired() else "proposal_limit"
+            break
+        q = int(revisit["crane"]) - 1
+        target_bay = int(revisit["bay"])
+        primary = revisit["primary_block"]
+        residual = revisit["residual_block"]
+        early_time = int(primary["end_exclusive"])
+        residual_time = int(residual["start"])
+        residual_length = int(
+            revisit.get("residual_length", residual["length"])
+        )
+        # Moving multi-slot residuals needs a wider early window and is left
+        # to other operators; the intended failure is an isolated one-slot
+        # tail completion.
+        if residual_length != 1 or early_time >= horizon - 8:
+            stats["capacity_rejected"] += 1
+            continue
+        tail_start = residual_time
+        tail_end = horizon
+        if not 0 <= early_time < early_time + 1 <= horizon:
+            stats["boundary_rejected"] += 1
+            continue
+        if not 0 <= tail_start < tail_end <= horizon or tail_end - tail_start > 8:
+            stats["boundary_rejected"] += 1
+            continue
+        if early_time + 1 > tail_start:
+            stats["boundary_rejected"] += 1
+            continue
+
+        # Try relay chains extending to either side of the residual crane.
+        chains: list[tuple[int, ...]] = []
+        for direction in (-1, 1):
+            for length in (2, 3):
+                chain = tuple(q + direction * step for step in range(length))
+                if any(not 0 <= crane < M for crane in chain):
+                    continue
+                if sorted(chain) != list(range(min(chain), max(chain) + 1)):
+                    continue
+                if chain not in chains:
+                    chains.append(chain)
+
+        for chain in chains:
+            if expired() or len(proposals) >= max_candidates:
+                stats["timeout"] += int(expired())
+                if expired() or len(proposals) >= max_candidates:
+                    stats["status"] = "UNKNOWN"
+                    stats["limit_reason"] = "deadline" if expired() else "proposal_limit"
+                break
+            if stats["expanded_states"] >= max(1, state_limit):
+                stats["state_limit"] += 1
+                stats["status"] = "UNKNOWN"
+                break
+            stats["expanded_states"] += 1
+            stats["early_window_states"] += 1
+            stats["late_window_states"] += 1
+            old_bays = [source_work.get((early_time, crane)) for crane in chain]
+            if any(bay is None for bay in old_bays):
+                stats["capacity_rejected"] += 1
+                continue
+            if chain[0] != q or old_bays[0] == target_bay:
+                # A cyclic relay must start at the crane that owns the
+                # residual; reversed chains are only useful when they do.
+                stats["boundary_rejected"] += 1
+                continue
+            old_bays = [int(bay) for bay in old_bays]
+            new_bays = [target_bay, *old_bays[:-1]]
+            if len(set(new_bays)) != len(new_bays):
+                stats["capacity_rejected"] += 1
+                continue
+
+            # Tail takeover is possible when the next crane continuously
+            # works the displaced bay through H and the residual crane was
+            # already positioned at that bay immediately before the tail.
+            tail_receiver = chain[1] if len(chain) >= 2 else None
+            receiver_bay = (
+                source_work.get((tail_start, tail_receiver))
+                if tail_receiver is not None else None
+            )
+            tail_takeover = bool(
+                tail_receiver is not None
+                and receiver_bay is not None
+                and rows[tail_start - 1][q] == receiver_bay
+                and all(
+                    source_work.get((t, tail_receiver)) == receiver_bay
+                    for t in range(tail_start, tail_end)
+                )
+            )
+            # The terminal crane's old bay becomes the only uncompensated
+            # early delta.  Find a same-position idle cell in the late window
+            # to close it without relying on a greedy decoder.  If the
+            # terminal crane is also the tail receiver, the takeover itself
+            # creates that idle capacity at the first late slot.
+            final_crane = chain[-1]
+            final_bay = old_bays[-1]
+            compensation_options = [
+                (t, (t, t + 1), "tail")
+                for t in range(tail_start, tail_end)
+                if rows[t][final_crane] == final_bay
+                and source_work.get((t, final_crane)) is None
+                and all(
+                    source_work.get((t, other)) != final_bay
+                    for other in range(M) if other != final_crane
+                )
+            ]
+            # A compensation slot immediately before the terminal window can
+            # absorb a displaced bay while the crane is already waiting at
+            # that bay.  This is the important Q2@bay9 case: it removes the
+            # late one-slot return instead of creating a third work block.
+            pre_tail_options = [
+                (t, (t, t + 1), "pre_tail")
+                for t in range(early_time + 1, tail_start)
+                if rows[t][final_crane] == final_bay
+                and source_work.get((t, final_crane)) is None
+                and all(
+                    source_work.get((t, other)) != final_bay
+                    for other in range(M) if other != final_crane
+                )
+            ]
+            # Prefer the first contiguous waiting slot.  Later slots leave a
+            # needless idle hole inside the same-position residual block and
+            # would recreate a third crane/bay work segment.
+            if pre_tail_options:
+                pre_tail_options = [
+                    min(pre_tail_options, key=lambda item: (
+                        item[0], -(item[1][1] - item[1][0])
+                    ))
+                ]
+            # Use the earliest pre-tail slot as the primary closure.  Keeping
+            # one option per relay variant also makes the bounded transaction
+            # accounting deterministic; the tail option remains the fallback
+            # when no compatible waiting slot exists.
+            compensation_options = (
+                pre_tail_options
+                if pre_tail_options
+                else compensation_options[:1]
+            )
+            if (
+                tail_takeover
+                and final_crane == tail_receiver
+                and final_bay != receiver_bay
+            ):
+                compensation_options.insert(0, (tail_start, (tail_start, tail_start + 1), "tail"))
+            if not compensation_options:
+                stats["capacity_rejected"] += 1
+                continue
+
+            variants = [False, True] if tail_takeover else [False]
+            for use_tail_takeover in variants:
+                for compensation_time, compensation_interval, compensation_kind in compensation_options:
+                    if expired() or len(proposals) >= max_candidates:
+                        stats["timeout"] += int(expired())
+                        break
+                    stats["generated"] += 1
+                    stats["operators"]["residual_absorb"] += 1
+                    stats["operators"]["cyclic_exchange"] += 1
+                    stats["operators"]["pre_tail_compensation"] += int(
+                        compensation_kind == "pre_tail"
+                    )
+                    history = [list(row) for row in rows]
+                    work_plan = dict(source_work)
+
+                    # At the early slot, each crane takes the preceding
+                    # crane's original bay.  This makes the relay a closed
+                    # local chain instead of losing displaced work.
+                    for index, crane in enumerate(chain):
+                        history[early_time][crane] = new_bays[index]
+                        work_plan[(early_time, crane)] = new_bays[index]
+
+                    # The original late residual is removed.  With a tail
+                    # takeover, its crane remains on the neighboring work
+                    # bay and the neighbor is parked at a safe pre-tail
+                    # position.
+                    work_plan[(residual_time, q)] = None
+                    hold_position = None
+                    if use_tail_takeover:
+                        assert tail_receiver is not None and receiver_bay is not None
+                        hold_choices = list(
+                            range(1, max(max(row) for row in rows) + 1)
+                        )
+                        # Keep the receiver at its pre-tail position when it
+                        # is the terminal crane.  Returning to the
+                        # compensated bay after bay10 is pure positional
+                        # noise (the regression had 9->7->9->10->9).
+                        preferred_hold = int(rows[tail_start - 1][tail_receiver])
+                        hold_choices.sort(key=lambda position: (
+                            position != preferred_hold,
+                            abs(position - preferred_hold),
+                            position,
+                        ))
+                        for proposed_hold in hold_choices:
+                            safe_hold = True
+                            for t in range(tail_start, tail_end):
+                                check_row = list(history[t])
+                                check_row[q] = int(receiver_bay)
+                                check_row[tail_receiver] = proposed_hold
+                                if any(
+                                    right - left < 2
+                                    for left, right in zip(check_row, check_row[1:])
+                                ):
+                                    safe_hold = False
+                                    break
+                            if safe_hold:
+                                hold_position = proposed_hold
+                                break
+                        if hold_position is None:
+                            stats["safety_rejected"] += 1
+                            continue
+                        for t in range(tail_start, tail_end):
+                            history[t][q] = int(receiver_bay)
+                            history[t][tail_receiver] = hold_position
+                            work_plan[(t, q)] = int(receiver_bay)
+                            work_plan[(t, tail_receiver)] = None
+
+                    # If the tail donor is itself the terminal crane, its
+                    # compensation slot replaces that donor's removed tail
+                    # work.  The slot may be in the pre-tail waiting window.
+                    work_plan[(compensation_time, final_crane)] = final_bay
+
+                # A final ledger precheck catches impossible template matches
+                # before the more expensive strict transaction decoder.
+                def interval_delta(start: int, end: int) -> dict[int, int]:
+                    delta = {bay: 0 for bay in range(1, len(W) + 1)}
+                    for t in range(start, end):
+                        for crane in chain:
+                            old_bay = source_work.get((t, crane))
+                            new_bay = work_plan.get((t, crane))
+                            if old_bay is not None:
+                                delta[int(old_bay)] -= 1
+                            if new_bay is not None:
+                                delta[int(new_bay)] += 1
+                    return {bay: change for bay, change in delta.items() if change}
+
+                intervals = [
+                    (early_time, early_time + 1),
+                    *(
+                        [compensation_interval]
+                        if compensation_kind == "pre_tail" else []
+                    ),
+                    (tail_start, tail_end),
+                ]
+                early_delta = interval_delta(early_time, early_time + 1)
+                late_delta = {bay: 0 for bay in range(1, len(W) + 1)}
+                for interval_start, interval_end in intervals[1:]:
+                    delta = interval_delta(interval_start, interval_end)
+                    for bay, change in delta.items():
+                        late_delta[bay] += change
+                late_delta = {
+                    bay: change for bay, change in late_delta.items() if change
+                }
+                closed_delta = {
+                    bay: early_delta.get(bay, 0) + late_delta.get(bay, 0)
+                    for bay in set(early_delta) | set(late_delta)
+                }
+                closed_delta = {
+                    bay: change for bay, change in closed_delta.items() if change
+                }
+                if closed_delta:
+                    stats["ledger_rejected"] += 1
+                    continue
+                totals = [0] * len(W)
+                for bay in work_plan.values():
+                    if bay is not None:
+                        totals[int(bay) - 1] += 1
+                if totals != [int(value) for value in W]:
+                    stats["ledger_rejected"] += 1
+                    continue
+
+                safe = all(
+                    right - left >= 2
+                    for row in history
+                    for left, right in zip(row, row[1:])
+                )
+                if not safe:
+                    stats["safety_rejected"] += 1
+                    continue
+
+                regions = [
+                    {
+                        "crane": crane + 1,
+                        "start": start,
+                        "end_exclusive": end,
+                        "length": end - start,
+                        "segment": segment,
+                    }
+                    for segment, (start, end) in enumerate(intervals)
+                    for crane in sorted(chain)
+                ]
+                signature = (
+                    tuple(tuple(row) for row in history),
+                    tuple(sorted(work_plan.items())),
+                )
+                if signature in seen:
+                    continue
+                seen.add(signature)
+                proposals.append({
+                    "operator": "paired_window_cyclic_exchange",
+                    "history": [tuple(row) for row in history],
+                    "work_plan": work_plan,
+                    "regions": regions,
+                    "source_signature": _trajectory_signature(source),
+                    "source_hash": source_hash,
+                    "details": {
+                        "crane": q + 1,
+                        "bay": target_bay,
+                        "primary_block": dict(primary),
+                        "residual_block": dict(residual),
+                        "gap": int(revisit["gap"]),
+                        "chain": [crane + 1 for crane in chain],
+                        "early_window": list(intervals[0]),
+                        "late_window": [list(item) for item in intervals[1:]],
+                        "relay_from_bays": old_bays,
+                        "relay_to_bays": new_bays,
+                        "compensation_bay": final_bay,
+                        "compensation_crane": final_crane + 1,
+                        "compensation_time": compensation_time,
+                        "compensation_kind": compensation_kind,
+                        "tail_takeover": use_tail_takeover,
+                        "tail_hold_position": hold_position,
+                        "tail_receiver": (
+                            tail_receiver + 1
+                            if use_tail_takeover and tail_receiver is not None
+                            else None
+                        ),
+                        "ledger_delta": {
+                            "early": {
+                                str(bay): change
+                                for bay, change in sorted(early_delta.items())
+                            },
+                            "late": {
+                                str(bay): change
+                                for bay, change in sorted(late_delta.items())
+                            },
+                            "closed": closed_delta,
+                        },
+                    },
+                })
+                stats["unique"] += 1
+                stats["operators"]["block_boundary_shift"] += int(
+                    use_tail_takeover
+                )
+    return proposals, stats
+
+
 def _continuity_block_neighbors(
     W: Sequence[int],
     M: int,
@@ -1755,17 +5256,21 @@ def _continuity_block_neighbors(
 def _continuity_rank(
     candidate: _CandidateSchedule,
     M: int,
-) -> tuple[int, int, int, int, int]:
+) -> tuple[int, ...]:
     """Rank a candidate only after the formal acceptance constraints pass."""
     report = _continuity_diagnostics(candidate, M)
-    return tuple(int(value) for value in report["continuity_key"])
+    return (
+        candidate.completion_time,
+        candidate.completion_movement_count,
+        *(int(value) for value in report["continuity_key"]),
+    )
 
 
 def _operational_rank(
     candidate: _CandidateSchedule,
     M: int,
-) -> tuple[int, int, int, int, int, int, int, int]:
-    """Rank equal-horizon candidates by operational nuisance costs.
+) -> tuple[int, ...]:
+    """Rank schedules by the user objective before operational diagnostics.
 
     This is deliberately separate from ``objective_key``.  It is used to
     publish a useful operational alternative while the formal result keeps
@@ -1774,13 +5279,43 @@ def _operational_rank(
     continuity = _continuity_diagnostics(candidate, M)
     idle = _idle_diagnostics(candidate, M)
     return (
-        int(candidate.movement_count),
+        int(candidate.completion_time),
+        int(candidate.completion_movement_count),
         int(candidate.reversal_count),
         int(continuity["work_revisit_count"]),
+        int(continuity["extra_work_blocks_total"]),
         int(continuity["bay_fragmentation"]),
         int(idle["max_internal_idle"]),
         int(idle["total_internal_idle"]),
         int(candidate.split_bay_count),
+        int(candidate.load_deviation),
+    )
+
+
+def _execution_rank(
+    candidate: _CandidateSchedule,
+    M: int,
+) -> tuple[int, ...]:
+    """Rank schedules by actual completion and moves, then diagnostics.
+
+    Continuity diagnostics only break ties after both user priorities.
+    """
+    continuity = _continuity_diagnostics(candidate, M)
+    idle = _idle_diagnostics(candidate, M)
+    return (
+        int(candidate.completion_time),
+        int(candidate.completion_movement_count),
+        int(continuity["long_revisit_count"]),
+        int(continuity["work_revisit_count"]),
+        int(continuity["extra_work_blocks_total"]),
+        int(continuity["bay_fragmentation"]),
+        int(continuity["short_excursion_count"]),
+        int(continuity["terminal_return_count"]),
+        int(continuity["max_crane_movement_count"]),
+        int(continuity["max_work_revisit_gap"]),
+        int(candidate.reversal_count),
+        int(idle["max_internal_idle"]),
+        int(idle["total_internal_idle"]),
         int(candidate.load_deviation),
     )
 
@@ -3876,6 +7411,14 @@ def _refine_same_horizon_trajectory(
     continuity: bool = False,
     result_box: dict[str, Any] | None = None,
     enable_work_transfer: bool = False,
+    enable_fragmentation_repair: bool = False,
+    enable_cyclic_exchange: bool = True,
+    enable_phase_resequence: bool = False,
+    enable_phase_closure: bool = True,
+    enable_cross_crane_phase_relay: bool = False,
+    enable_idle_capacity_rebalance: bool = False,
+    enable_forced_prefix_consolidation: bool = True,
+    local_state_limit: int = 64,
     protect_source_continuity: bool = False,
     strict_local_transactions: bool = False,
     source_hash: str | None = None,
@@ -3898,8 +7441,10 @@ def _refine_same_horizon_trajectory(
     formal_best = candidate
     continuity_best = candidate
     operational_best = candidate
+    execution_best = candidate
+    balanced_best = candidate
     baseline = candidate
-    baseline_continuity = _continuity_diagnostics(candidate, M)
+    baseline_continuity = _continuity_diagnostics(candidate, M, starts)
     evaluated_total = 0
     polish_started_at = time.perf_counter()
     cycle = 0
@@ -3907,6 +7452,12 @@ def _refine_same_horizon_trajectory(
     pool: dict[tuple[Any, ...], _CandidateSchedule] = {
         _trajectory_signature(candidate): candidate
     }
+    paired_transactions: list[dict[str, Any]] = []
+    phase_transactions: list[dict[str, Any]] = []
+    phase_closure_transactions: list[dict[str, Any]] = []
+    cross_crane_phase_transactions: list[dict[str, Any]] = []
+    idle_capacity_transactions: list[dict[str, Any]] = []
+    forced_prefix_transactions: list[dict[str, Any]] = []
     operator_stats: dict[str, dict[str, int]] = {}
     continuity_stats = {
         "generated": 0,
@@ -3919,6 +7470,9 @@ def _refine_same_horizon_trajectory(
         "unique_complete": 0,
         "formal_improvements": 0,
         "operational_improvements": 0,
+        "execution_improvements": 0,
+        "balanced_improvements": 0,
+        "pure_sync_delay_rejected": 0,
         "time_seconds": 0.0,
         "operator": operator_stats,
         "work_transfer": {
@@ -3932,7 +7486,147 @@ def _refine_same_horizon_trajectory(
             "accepted": 0,
             "operators": {},
         },
+        "paired_window_cyclic": {
+            "status": "NOT_RUN",
+            "rounds": 0,
+            "generated": 0,
+            "unique": 0,
+            "expanded_states": 0,
+            "early_window_states": 0,
+            "late_window_states": 0,
+            "capacity_rejected": 0,
+            "safety_rejected": 0,
+            "boundary_rejected": 0,
+            "ledger_rejected": 0,
+            "verified": 0,
+            "accepted": 0,
+            "timeout": 0,
+            "state_limit": 0,
+            "operators": {},
+        },
+        "phase_block_resequence": {
+            "status": "NOT_RUN",
+            "rounds": 0,
+            "focus_revisits": 0,
+            "multi_slot_revisits": 0,
+            "active_bands_generated": 0,
+            "phase_permutations_generated": 0,
+            "phase_combinations_tested": 0,
+            "states_expanded": 0,
+            "states_pruned_horizon": 0,
+            "states_pruned_safety": 0,
+            "states_pruned_split": 0,
+            "states_pruned_movement": 0,
+            "complete_phase_plans": 0,
+            "decoded": 0,
+            "verified": 0,
+            "accepted": 0,
+            "rejected_burden_migration": 0,
+            "timeout": 0,
+            "state_limit": 0,
+            "operators": {},
+        },
+        "phase_closure_relay": {
+            "status": "NOT_RUN",
+            "rounds": 0,
+            "focus_revisits": 0,
+            "activity_bands_tested": 0,
+            "phase_orders_generated": 0,
+            "event_schedules_generated": 0,
+            "states_expanded": 0,
+            "complete_phase_plans": 0,
+            "ledger_closed": 0,
+            "decoded": 0,
+            "verified": 0,
+            "accepted": 0,
+            "rejected_safety": 0,
+            "rejected_horizon": 0,
+            "rejected_ledger": 0,
+            "timeout": 0,
+            "state_limit": 0,
+            "max_activity_width": 0,
+            "activity_chain_expansions": [],
+        },
+        "cross_crane_phase_relay": {
+            "status": "NOT_RUN",
+            "rounds": 0,
+            "focus_revisits": 0,
+            "activity_bands_tested": 0,
+            "assignment_variants_generated": 0,
+            "retimed_plans_generated": 0,
+            "retimed_plans_solved": 0,
+            "owner_change_branches": 0,
+            "two_hop_relay_branches": 0,
+            "complete_phase_plans": 0,
+            "ledger_closed": 0,
+            "states_expanded": 0,
+            "decoded": 0,
+            "verified": 0,
+            "accepted": 0,
+            "rejected_overlap": 0,
+            "rejected_eligibility": 0,
+            "rejected_safety": 0,
+            "rejected_ledger": 0,
+            "rejected_horizon": 0,
+            "timeout": 0,
+            "state_limit": 0,
+            "max_activity_width": 0,
+            "activity_chain_expansions": [],
+        },
+        "idle_capacity_rebalance": {
+            "status": "NOT_RUN",
+            "rounds": 0,
+            "focus_revisits": 0,
+            "idle_capacity_focuses": 0,
+            "idle_capacity_chain_focuses": 0,
+            "partial_transfer_focuses": 0,
+            "focuses_without_revisits": 0,
+            "activity_bands_tested": 0,
+            "assignment_variants_generated": 0,
+            "retimed_plans_generated": 0,
+            "retimed_plans_solved": 0,
+            "owner_change_branches": 0,
+            "two_hop_relay_branches": 0,
+            "complete_phase_plans": 0,
+            "ledger_closed": 0,
+            "states_expanded": 0,
+            "decoded": 0,
+            "verified": 0,
+            "accepted": 0,
+            "rejected_overlap": 0,
+            "rejected_eligibility": 0,
+            "rejected_safety": 0,
+            "rejected_ledger": 0,
+            "rejected_horizon": 0,
+            "timeout": 0,
+            "state_limit": 0,
+            "max_activity_width": 0,
+            "activity_chain_expansions": [],
+            "status_counts": {},
+        },
+        "forced_prefix_consolidation": {
+            "status": "NOT_RUN",
+            "rounds": 0,
+            "focus_interruptions": 0,
+            "focuses_started": 0,
+            "focuses_completed": 0,
+            "neighbor_bands_generated": 0,
+            "focus_phase_orders": 0,
+            "neighbor_phase_orders": 0,
+            "idle_placements_tested": 0,
+            "states_expanded": 0,
+            "ledger_closed": 0,
+            "decoded": 0,
+            "verified": 0,
+            "accepted": 0,
+            "rejected_safety": 0,
+            "rejected_ledger": 0,
+            "rejected_burden_migration": 0,
+            "timeout": 0,
+            "state_limit": 0,
+        },
         "continuity_rejected": 0,
+        "continuity_component_rejected": 0,
     }
     stop_reason = "deadline"
 
@@ -3948,6 +7642,13 @@ def _refine_same_horizon_trajectory(
             "continuity_rejected": 0,
         })
 
+    def work_ledger(candidate: _CandidateSchedule) -> list[int]:
+        ledger = [0] * len(W)
+        for slot in candidate.slots:
+            if slot.state == "work" and slot.work_bay is not None:
+                ledger[int(slot.work_bay) - 1] += 1
+        return ledger
+
     def continuity_allowed(proposed: _CandidateSchedule) -> bool:
         return (
             proposed.makespan == baseline.makespan
@@ -3960,10 +7661,154 @@ def _refine_same_horizon_trajectory(
             and proposed.movement_count <= baseline.movement_count + 2
         )
 
+    def continuity_component_guard(
+        proposed: _CandidateSchedule,
+        operator: str,
+        source_candidate: _CandidateSchedule | None = None,
+        focus: dict[str, Any] | None = None,
+    ) -> tuple[bool, str | None]:
+        """Reject a local repair that exports a new fragmentation burden.
+
+        The paired relay is allowed one replacement micro excursion while it
+        removes at least one complete work block, but it may not create the
+        two extra Q2@bay9 blocks seen in the old H=208 result.  This keeps the
+        search exploratory without accepting a pure burden migration.
+        """
+        if not continuity or operator not in {
+            "paired_window_cyclic_exchange",
+            "phase_block_resequence",
+            "phase_closure_relay",
+            "cross_crane_phase_relay",
+            "idle_capacity_rebalance",
+            "forced_prefix_consolidation",
+        }:
+            return True, None
+        # A cross-crane relay may create a receiver-side block because that is
+        # its intended ownership-change mechanism.  Idle-capacity balancing is
+        # stricter: load equality is never allowed to reintroduce the same
+        # crane/same-bay revisits and terminal returns that Step 8 removed.
+        if operator == "cross_crane_phase_relay":
+            return True, None
+        before = _continuity_diagnostics(
+            source_candidate if source_candidate is not None else baseline,
+            M,
+            starts,
+        )
+        after = _continuity_diagnostics(proposed, M, starts)
+        guard_source = source_candidate if source_candidate is not None else baseline
+        if operator == "idle_capacity_rebalance":
+            atomic_chain = bool((focus or {}).get("atomic_chain"))
+            if after["work_revisit_count"] > before["work_revisit_count"]:
+                return False, "new_work_revisit"
+            if after["extra_work_blocks_total"] > before["extra_work_blocks_total"]:
+                return False, "new_extra_work_block"
+            if after["terminal_return_count"] > before["terminal_return_count"]:
+                return False, "new_terminal_return"
+            movement_allowance = 3 if atomic_chain else 1
+            reversal_allowance = 3 if atomic_chain else 0
+            if (
+                proposed.movement_count
+                > guard_source.movement_count + movement_allowance
+            ):
+                return False, "movement_regression"
+            if (
+                proposed.reversal_count
+                > guard_source.reversal_count + reversal_allowance
+            ):
+                return False, "new_reversal"
+            return True, None
+        if proposed.objective_key < guard_source.objective_key:
+            return True, None
+        before_counts = before.get("work_block_count_by_crane_bay", {})
+        after_counts = after.get("work_block_count_by_crane_bay", {})
+        if operator in {
+            "phase_block_resequence", "phase_closure_relay",
+            "forced_prefix_consolidation",
+        } and focus:
+            focus_crane = str(int(focus.get("crane", 0)))
+            focus_bay = str(int(focus.get("bay", 0)))
+            before_focus_count = int(
+                before_counts.get(focus_crane, {}).get(focus_bay, 0)
+            )
+            after_focus_count = int(
+                after_counts.get(focus_crane, {}).get(focus_bay, 0)
+            )
+            if after_focus_count >= before_focus_count:
+                return False, "focus_work_block_not_reduced"
+        for crane, by_bay in after_counts.items():
+            for bay, count in by_bay.items():
+                old_count = int(before_counts.get(crane, {}).get(bay, 0))
+                allowance = 1 if operator == "paired_window_cyclic_exchange" else 0
+                if int(count) > old_count + allowance:
+                    return False, f"new_work_block:{crane}:{bay}"
+        if operator == "forced_prefix_consolidation":
+            if after["forced_prefix_interruption_count"] >= before["forced_prefix_interruption_count"]:
+                return False, "forced_prefix_not_consolidated"
+            if after["extra_work_blocks_total"] > before["extra_work_blocks_total"]:
+                return False, "new_extra_work_block"
+            baseline_candidate = source_candidate if source_candidate is not None else baseline
+            if proposed.split_bay_count > baseline_candidate.split_bay_count:
+                return False, "new_split_bay"
+            if proposed.movement_count > baseline_candidate.movement_count:
+                return False, "movement_regression"
+            if after["terminal_return_count"] > before["terminal_return_count"]:
+                return False, "new_terminal_return"
+            if after["short_excursion_count"] > before["short_excursion_count"]:
+                return False, "new_short_excursion"
+        if operator in {"phase_block_resequence", "phase_closure_relay"}:
+            if after["extra_work_blocks_total"] > before["extra_work_blocks_total"]:
+                return False, "new_extra_work_block"
+            baseline_candidate = source_candidate if source_candidate is not None else baseline
+            if proposed.split_bay_count > baseline_candidate.split_bay_count:
+                return False, "new_split_bay"
+            if proposed.movement_count > baseline_candidate.movement_count:
+                return False, "movement_regression"
+            # A phase transaction may remove the focus revisit only by
+            # reordering the adjacent band.  It must not turn an existing
+            # non-focus revisit into a longer gap or create a new terminal
+            # return (for example, moving Q2@bay9 to the end of the horizon
+            # while fixing Q3@bay13).
+            before_gap_by_pair = {
+                (int(item["crane"]), int(item["bay"])):
+                int(item.get("gap", 0))
+                for item in before.get("crane_work_revisits", [])
+            }
+            for item in after.get("crane_work_revisits", []):
+                pair = (int(item["crane"]), int(item["bay"]))
+                if int(item.get("gap", 0)) > before_gap_by_pair.get(pair, -1):
+                    return False, f"burden_migration_gap:{pair[0]}:{pair[1]}"
+            before_terminal_pairs = {
+                (int(item["crane"]), int(item["bay"]))
+                for item in before.get("terminal_returns", [])
+            }
+            after_terminal_pairs = {
+                (int(item["crane"]), int(item["bay"]))
+                for item in after.get("terminal_returns", [])
+            }
+            if after_terminal_pairs - before_terminal_pairs:
+                crane, bay = sorted(after_terminal_pairs - before_terminal_pairs)[0]
+                return False, f"burden_migration_terminal:{crane}:{bay}"
+        if after["terminal_return_count"] > before["terminal_return_count"]:
+            return False, "new_terminal_return"
+        excursion_allowance = 0 if operator in {
+            "phase_block_resequence", "phase_closure_relay",
+        } else 1
+        if after["short_excursion_count"] > before["short_excursion_count"] + excursion_allowance:
+            return False, "new_short_excursion"
+        if operator in {"phase_block_resequence", "phase_closure_relay"} and any(
+            int(after["movement_count_by_crane"].get(str(crane), 0))
+            > int(before["movement_count_by_crane"].get(str(crane), 0)) + 1
+            for crane in range(1, M + 1)
+        ):
+            return False, "crane_movement_regression"
+        if after["max_crane_movement_count"] > before["max_crane_movement_count"]:
+            return False, "crane_movement_regression"
+        return True, None
+
     def record_candidate(
         proposed: _CandidateSchedule | None,
         operator: str,
-        before_key: tuple[int, int, int, int],
+        before_key: tuple[int, int],
         before_smoothness: tuple[int, int, int],
         cycle_number: int,
         segment_index: int,
@@ -3971,26 +7816,59 @@ def _refine_same_horizon_trajectory(
         decode_failed: bool = False,
         declared_regions: list[dict[str, Any]] | None = None,
         transaction_metadata: dict[str, Any] | None = None,
+        snapshot_source_candidate: _CandidateSchedule | None = None,
     ) -> tuple[bool, bool]:
         """Validate and consider one proposal; return (accepted, legal)."""
-        nonlocal best, formal_best, continuity_best, operational_best, evaluated_total
+        nonlocal best, formal_best, continuity_best, operational_best, execution_best, balanced_best, evaluated_total
+        source_candidate = snapshot_source_candidate or best
         counter = operator_counter(operator)
         counter["generated"] += 1
         continuity_stats["generated"] += 1
         candidate_found = proposed is not None
         continuity_guard_rejected = False
+        continuity_component_rejected = False
+        continuity_guard_reason = None
         candidate_legal = proposed is not None and (
             proposed.makespan == best.makespan
             and _candidate_passes_independent_verifier(W, M, starts, proposed)
         )
-        if candidate_legal and protect_source_continuity and proposed is not None:
+        if candidate_legal and proposed is not None:
+            focus = None
+            if transaction_metadata is not None:
+                focus_value = transaction_metadata.get("focus")
+                if isinstance(focus_value, dict):
+                    focus = focus_value
+            component_allowed, component_reason = continuity_component_guard(
+                proposed, operator, source_candidate, focus
+            )
+            if not component_allowed:
+                continuity_component_rejected = True
+                continuity_guard_reason = component_reason
+                counter["continuity_rejected"] += 1
+                continuity_stats["continuity_rejected"] += 1
+                continuity_stats["continuity_component_rejected"] += 1
+                proposed = None
+                candidate_legal = False
+        core_improvement = (
+            proposed is not None
+            and proposed.objective_key < source_candidate.objective_key
+        )
+        if (
+            candidate_legal and protect_source_continuity
+            and proposed is not None and not core_improvement
+        ):
             proposed_continuity = _continuity_diagnostics(proposed, M)
-            if (
-                proposed_continuity["work_revisit_count"]
-                > baseline_continuity["work_revisit_count"]
-                or proposed_continuity["bay_fragmentation"]
-                > baseline_continuity["bay_fragmentation"]
-            ):
+            proposed_burden = (
+                proposed_continuity["max_work_revisit_gap"],
+                proposed_continuity["work_revisit_count"],
+                proposed_continuity["bay_fragmentation"],
+            )
+            baseline_burden = (
+                baseline_continuity["max_work_revisit_gap"],
+                baseline_continuity["work_revisit_count"],
+                baseline_continuity["bay_fragmentation"],
+            )
+            if proposed_burden > baseline_burden:
                 continuity_guard_rejected = True
                 counter["continuity_rejected"] += 1
                 continuity_stats["continuity_rejected"] += 1
@@ -4012,6 +7890,24 @@ def _refine_same_horizon_trajectory(
             continuity_stats["verified"] += 1
         accepted = False
         if proposed is not None:
+            proposed_balance = _balanced_schedule_metrics(proposed, M)
+            source_balance = _balanced_schedule_metrics(source_candidate, M)
+            balance_improvement = proposed_balance["key"] < _balanced_schedule_metrics(
+                balanced_best, M
+            )["key"]
+            pure_sync_delay = bool(
+                proposed_balance["completion_time"]
+                == source_balance["completion_time"]
+                and proposed_balance["loads"] == source_balance["loads"]
+                and proposed_balance["finish_gap"] < source_balance["finish_gap"]
+                and proposed_balance["leading_plus_internal_idle"]
+                > source_balance["leading_plus_internal_idle"]
+            )
+            if pure_sync_delay:
+                continuity_stats["pure_sync_delay_rejected"] += 1
+            elif balance_improvement:
+                balanced_best = proposed
+                continuity_stats["balanced_improvements"] += 1
             signature = _trajectory_signature(proposed)
             if signature in pool:
                 counter["deduplicated"] += 1
@@ -4026,14 +7922,14 @@ def _refine_same_horizon_trajectory(
                     worst_signature, worst_candidate = max(
                         pool.items(),
                         key=lambda item: (
-                            _operational_rank(item[1], M),
+                            _execution_rank(item[1], M),
                             item[1].objective_key,
                         ),
                     )
                     if (
-                        _operational_rank(proposed, M), proposed.objective_key
+                        _execution_rank(proposed, M), proposed.objective_key
                     ) < (
-                        _operational_rank(worst_candidate, M),
+                        _execution_rank(worst_candidate, M),
                         worst_candidate.objective_key,
                     ):
                         del pool[worst_signature]
@@ -4051,19 +7947,30 @@ def _refine_same_horizon_trajectory(
                 )
                 operational_improvement = (
                     continuity
-                    and proposed.makespan == baseline.makespan
                     and _operational_rank(proposed, M)
                     < _operational_rank(operational_best, M)
+                )
+                execution_improvement = (
+                    continuity
+                    and _execution_rank(proposed, M)
+                    < _execution_rank(execution_best, M)
                 )
                 accepted = (
                     formal_improvement
                     or formal_tie_smoother
                     or continuity_improvement
                     or operational_improvement
+                    or execution_improvement
+                    or (
+                        operator == "idle_capacity_rebalance"
+                        and balance_improvement
+                    )
                 )
                 if formal_improvement:
                     formal_best = proposed
                     continuity_stats["formal_improvements"] += 1
+                    if balanced_best.completion_time > formal_best.completion_time:
+                        balanced_best = proposed
                 if continuity and continuity_allowed(proposed) and (
                     _continuity_rank(proposed, M) < _continuity_rank(continuity_best, M)
                 ):
@@ -4071,10 +7978,134 @@ def _refine_same_horizon_trajectory(
                 if continuity and operational_improvement:
                     operational_best = proposed
                     continuity_stats["operational_improvements"] += 1
+                if execution_improvement:
+                    execution_best = proposed
+                    continuity_stats["execution_improvements"] += 1
                 if accepted:
                     best = proposed
                     counter["accepted"] += 1
                     continuity_stats["accepted"] += 1
+                    if operator == "paired_window_cyclic_exchange":
+                        paired_transactions.append({
+                            "before": source_candidate,
+                            "after": proposed,
+                            "details": dict(transaction_metadata or {}),
+                            "regions": list(declared_regions or []),
+                        })
+                    if operator == "phase_block_resequence":
+                        before_diagnostics = _continuity_diagnostics(
+                            source_candidate, M
+                        )
+                        after_diagnostics = _continuity_diagnostics(
+                            proposed, M
+                        )
+                        before_ledger = work_ledger(source_candidate)
+                        after_ledger = work_ledger(proposed)
+                        phase_transactions.append({
+                            "before": source_candidate,
+                            "after": proposed,
+                            "details": {
+                                **dict(transaction_metadata or {}),
+                                "verifier": "independent",
+                                "verifier_passed": True,
+                                "ledger_delta": {
+                                    str(bay + 1): after_ledger[bay] - before_ledger[bay]
+                                    for bay in range(len(W))
+                                },
+                                "ledger_delta_all_zero": (
+                                    before_ledger == after_ledger
+                                ),
+                                "before_blocks": before_diagnostics.get(
+                                    "work_blocks_by_crane_bay", {}
+                                ),
+                                "after_blocks": after_diagnostics.get(
+                                    "work_blocks_by_crane_bay", {}
+                                ),
+                                "before_movement_arcs": before_diagnostics.get(
+                                    "movement_arcs_by_crane", {}
+                                ),
+                                "after_movement_arcs": after_diagnostics.get(
+                                    "movement_arcs_by_crane", {}
+                                ),
+                            },
+                            "regions": list(declared_regions or []),
+                        })
+                    if operator == "phase_closure_relay":
+                        before_diagnostics = _continuity_diagnostics(
+                            source_candidate, M
+                        )
+                        after_diagnostics = _continuity_diagnostics(
+                            proposed, M
+                        )
+                        before_ledger = work_ledger(source_candidate)
+                        after_ledger = work_ledger(proposed)
+                        phase_closure_transactions.append({
+                            "before": source_candidate,
+                            "after": proposed,
+                            "details": {
+                                **dict(transaction_metadata or {}),
+                                "verifier": "independent",
+                                "verifier_passed": True,
+                                "ledger_delta": {
+                                    str(bay + 1): after_ledger[bay] - before_ledger[bay]
+                                    for bay in range(len(W))
+                                },
+                                "ledger_delta_all_zero": (
+                                    before_ledger == after_ledger
+                                ),
+                                "before_blocks": before_diagnostics.get(
+                                    "work_blocks_by_crane_bay", {}
+                                ),
+                                "after_blocks": after_diagnostics.get(
+                                    "work_blocks_by_crane_bay", {}
+                                ),
+                                "before_movement_arcs": before_diagnostics.get(
+                                    "movement_arcs_by_crane", {}
+                                ),
+                                "after_movement_arcs": after_diagnostics.get(
+                                    "movement_arcs_by_crane", {}
+                                ),
+                            },
+                            "regions": list(declared_regions or []),
+                        })
+                    if operator == "cross_crane_phase_relay":
+                        before_diagnostics = _continuity_diagnostics(
+                            source_candidate, M
+                        )
+                        after_diagnostics = _continuity_diagnostics(
+                            proposed, M
+                        )
+                        before_ledger = work_ledger(source_candidate)
+                        after_ledger = work_ledger(proposed)
+                        cross_crane_phase_transactions.append({
+                            "before": source_candidate,
+                            "after": proposed,
+                            "details": {
+                                **dict(transaction_metadata or {}),
+                                "verifier": "independent",
+                                "verifier_passed": True,
+                                "ledger_delta": {
+                                    str(bay + 1): after_ledger[bay] - before_ledger[bay]
+                                    for bay in range(len(W))
+                                },
+                                "ledger_delta_all_zero": (
+                                    before_ledger == after_ledger
+                                ),
+                                "before_blocks": before_diagnostics.get(
+                                    "work_blocks_by_crane_bay", {}
+                                ),
+                                "after_blocks": after_diagnostics.get(
+                                    "work_blocks_by_crane_bay", {}
+                                ),
+                                "before_movement_arcs": before_diagnostics.get(
+                                    "movement_arcs_by_crane", {}
+                                ),
+                                "after_movement_arcs": after_diagnostics.get(
+                                    "movement_arcs_by_crane", {}
+                                ),
+                            },
+                            "regions": list(declared_regions or []),
+                        })
         if attempt_trace is not None:
             attempt_trace.append({
                 "cycle": cycle_number,
@@ -4088,6 +8119,8 @@ def _refine_same_horizon_trajectory(
                 "candidate_legal": candidate_legal,
                 "accepted": accepted,
                 "continuity_guard_rejected": continuity_guard_rejected,
+                "continuity_component_rejected": continuity_component_rejected,
+                "continuity_guard_reason": continuity_guard_reason,
                 "transaction": transaction_metadata,
                 "before_objective": list(before_key),
                 "before_smoothness": list(before_smoothness),
@@ -4116,6 +8149,113 @@ def _refine_same_horizon_trajectory(
         # explainable proposals and are the primary way to remove short
         # hand-offs without relying on isolated random cell edits.
         progress = False
+        if continuity and enable_forced_prefix_consolidation:
+            proposal_source = best
+            prefix_transactions, prefix_output = _forced_prefix_consolidation_exchange(
+                W, M, starts, proposal_source,
+                max_neighbor_phase_permutations=64,
+                max_focus_phase_permutations=16,
+                max_idle_placements=16,
+                state_limit=4_096,
+                max_candidates=32,
+                source_hash=source_hash,
+                deadline=deadline,
+            )
+            prefix_stats = continuity_stats["forced_prefix_consolidation"]
+            prefix_output_status = prefix_output.get("status", "UNKNOWN")
+            # A successful earlier round is commonly followed by a no-op
+            # round because the forced prefix has already been consolidated.
+            # Keep that earlier search outcome instead of replacing it with
+            # NOT_APPLICABLE in the aggregate record.
+            if (
+                prefix_output_status != "NOT_APPLICABLE"
+                or prefix_stats.get("status") in {"NOT_RUN", "UNKNOWN"}
+            ):
+                prefix_stats["status"] = prefix_output_status
+            prefix_stats["rounds"] += 1
+            for key in (
+                "focus_interruptions", "focuses_started", "focuses_completed",
+                "neighbor_bands_generated", "focus_phase_orders",
+                "neighbor_phase_orders", "idle_placements_tested",
+                "states_expanded", "ledger_closed", "rejected_safety",
+                "rejected_ledger", "timeout", "state_limit",
+            ):
+                prefix_stats[key] += int(prefix_output.get(key, 0))
+            for transaction_index, transaction in enumerate(prefix_transactions):
+                if time.perf_counter() >= deadline:
+                    break
+                if transaction.get("source_signature") != _trajectory_signature(proposal_source):
+                    prefix_stats["rejected_burden_migration"] += 1
+                    continue
+                before_key = proposal_source.objective_key
+                before_smoothness = _trajectory_smoothness(proposal_source, M)
+                before_history = [
+                    tuple(row)
+                    for row in _candidate_position_rows(proposal_source, M)
+                ]
+                metadata = dict(transaction.get("details") or {})
+                metadata.update({
+                    "source_hash": source_hash,
+                    "transaction_index": transaction_index,
+                    "state_limit": 4_096,
+                })
+                try:
+                    proposed = _candidate_from_explicit_phase_transaction(
+                        W, M, starts, transaction["history"], proposal_source,
+                        transaction["work_plan"], transaction["active_cranes"],
+                        source_hash=source_hash,
+                        transaction_source_hash=transaction.get("source_hash"),
+                    )
+                    prefix_stats["decoded"] += 1
+                    prefix_stats["verified"] += 1
+                except RuntimeError:
+                    proposed = None
+                    prefix_stats["rejected_safety"] += 1
+                accepted, legal = record_candidate(
+                    proposed, "forced_prefix_consolidation",
+                    before_key, before_smoothness, cycle, transaction_index,
+                    before_history, decode_failed=proposed is None,
+                    declared_regions=transaction["regions"],
+                    transaction_metadata=metadata,
+                    snapshot_source_candidate=proposal_source,
+                )
+                prefix_stats["accepted"] += int(accepted)
+                if not legal and proposed is not None:
+                    prefix_stats["rejected_burden_migration"] += 1
+                if accepted and proposed is not None:
+                    before_diagnostics = _continuity_diagnostics(
+                        proposal_source, M, starts
+                    )
+                    after_diagnostics = _continuity_diagnostics(
+                        proposed, M, starts
+                    )
+                    before_ledger = work_ledger(proposal_source)
+                    after_ledger = work_ledger(proposed)
+                    forced_prefix_transactions.append({
+                        "before": proposal_source,
+                        "after": proposed,
+                        "details": {
+                            **metadata,
+                            "verifier": "independent",
+                            "verifier_passed": True,
+                            "ledger_delta": {
+                                str(bay + 1): after_ledger[bay] - before_ledger[bay]
+                                for bay in range(len(W))
+                            },
+                            "ledger_delta_all_zero": before_ledger == after_ledger,
+                            "before_blocks": before_diagnostics["work_blocks_by_crane_bay"],
+                            "after_blocks": after_diagnostics["work_blocks_by_crane_bay"],
+                            "before_movement_arcs": before_diagnostics["movement_arcs_by_crane"],
+                            "after_movement_arcs": after_diagnostics["movement_arcs_by_crane"],
+                        },
+                        "regions": list(transaction["regions"]),
+                    })
+                if accepted:
+                    progress = True
+            if progress:
+                stale_cycles = 0
+                cycle += 1
+                continue
         if enable_work_transfer:
             transactions, transaction_stats = _work_transfer_transactions(
                 W, M, best, max_candidates=128, source_hash=source_hash,
@@ -4171,6 +8311,422 @@ def _refine_same_horizon_trajectory(
                 )
                 if legal:
                     continuity_stats["work_transfer"]["accepted"] += int(accepted)
+                if accepted:
+                    progress = True
+            if progress:
+                stale_cycles = 0
+                cycle += 1
+                continue
+        if continuity and enable_cross_crane_phase_relay:
+            # The unified operator must see the current source after every
+            # accepted transaction.  It is deliberately separate from the
+            # short-window work-transfer generator: one proposal contains the
+            # complete active-band ledger and the phase/safety path together.
+            proposal_source = best
+            relay_state_limit = max(50_000, int(local_state_limit) * 256)
+            transactions, transaction_stats = _cross_crane_phase_relay_search(
+                W, M, starts, proposal_source,
+                state_limit=relay_state_limit,
+                max_candidates=32,
+                max_assignment_variants=256,
+                deadline=deadline,
+                source_hash=source_hash,
+            )
+            relay_stats = continuity_stats["cross_crane_phase_relay"]
+            relay_status = transaction_stats.get("status", "UNKNOWN")
+            if (
+                relay_status != "NOT_APPLICABLE"
+                or relay_stats.get("status") in {"NOT_RUN", "UNKNOWN"}
+            ):
+                relay_stats["status"] = relay_status
+            relay_stats["rounds"] += 1
+            for key in (
+                "focus_revisits", "activity_bands_tested",
+                "assignment_variants_generated", "retimed_plans_generated",
+                "retimed_plans_solved", "owner_change_branches",
+                "two_hop_relay_branches", "complete_phase_plans",
+                "ledger_closed", "states_expanded", "decoded", "verified",
+                "accepted", "rejected_overlap", "rejected_eligibility",
+                "rejected_safety", "rejected_ledger", "rejected_horizon",
+                "timeout", "state_limit",
+            ):
+                relay_stats[key] += int(transaction_stats.get(key, 0))
+            relay_stats["max_activity_width"] = max(
+                relay_stats["max_activity_width"],
+                int(transaction_stats.get("max_activity_width", 0)),
+            )
+            relay_stats["activity_chain_expansions"].extend(
+                transaction_stats.get("activity_chain_expansions", [])
+            )
+            for transaction_index, transaction in enumerate(transactions):
+                if time.perf_counter() >= deadline:
+                    break
+                if transaction.get("source_signature") != _trajectory_signature(proposal_source):
+                    relay_stats["rejected_ledger"] += 1
+                    continue
+                before_key = proposal_source.objective_key
+                before_smoothness = _trajectory_smoothness(proposal_source, M)
+                before_history = [
+                    tuple(row)
+                    for row in _candidate_position_rows(proposal_source, M)
+                ]
+                metadata = dict(transaction.get("details") or {})
+                metadata.update({
+                    "source_hash": source_hash,
+                    "transaction_index": transaction_index,
+                    "state_limit": relay_state_limit,
+                })
+                try:
+                    proposed = _candidate_from_explicit_cross_crane_phase_transaction(
+                        W, M, starts, transaction["history"], proposal_source,
+                        transaction["work_plan"], transaction["active_cranes"],
+                        source_hash=source_hash,
+                        transaction_source_hash=transaction.get("source_hash"),
+                    )
+                    relay_stats["decoded"] += 1
+                    relay_stats["verified"] += 1
+                except RuntimeError:
+                    proposed = None
+                    relay_stats["rejected_safety"] += 1
+                accepted, legal = record_candidate(
+                    proposed, "cross_crane_phase_relay",
+                    before_key, before_smoothness, cycle, transaction_index,
+                    before_history, decode_failed=proposed is None,
+                    declared_regions=transaction["regions"],
+                    transaction_metadata=metadata,
+                    snapshot_source_candidate=proposal_source,
+                )
+                relay_stats["accepted"] += int(accepted)
+                if not legal and proposed is not None:
+                    relay_stats["rejected_safety"] += 1
+                if accepted:
+                    progress = True
+            if progress:
+                stale_cycles = 0
+                cycle += 1
+                continue
+        if continuity and enable_idle_capacity_rebalance:
+            proposal_source = (
+                balanced_best
+                if balanced_best.makespan == best.makespan
+                else best
+            )
+            # A first adjacent hand-off changes the useful donor/receiver pair
+            # for the next round.  Keep enough bounded states and assignment
+            # variants for that second local relay instead of letting many
+            # infeasible variants from the first focus starve all later foci.
+            balance_state_limit = max(150_000, int(local_state_limit) * 512)
+            transactions, transaction_stats = _cross_crane_phase_relay_search(
+                W, M, starts, proposal_source,
+                state_limit=balance_state_limit,
+                max_candidates=8,
+                max_assignment_variants=1_024,
+                deadline=deadline,
+                source_hash=source_hash,
+                include_idle_capacity=True,
+                idle_capacity_only=True,
+            )
+            balance_stats = continuity_stats["idle_capacity_rebalance"]
+            balance_status = transaction_stats.get("status", "UNKNOWN")
+            if balance_status != "NOT_APPLICABLE" or balance_stats["status"] == "NOT_RUN":
+                balance_stats["status"] = balance_status
+            balance_stats["rounds"] += 1
+            for key in (
+                "focus_revisits", "idle_capacity_focuses",
+                "idle_capacity_chain_focuses", "partial_transfer_focuses",
+                "focuses_without_revisits", "activity_bands_tested",
+                "assignment_variants_generated", "retimed_plans_generated",
+                "retimed_plans_solved",
+                "owner_change_branches", "two_hop_relay_branches",
+                "complete_phase_plans", "ledger_closed", "states_expanded",
+                "decoded", "verified", "accepted", "rejected_overlap",
+                "rejected_eligibility", "rejected_safety", "rejected_ledger",
+                "rejected_horizon", "timeout", "state_limit",
+            ):
+                balance_stats[key] += int(transaction_stats.get(key, 0))
+            balance_stats["max_activity_width"] = max(
+                balance_stats["max_activity_width"],
+                int(transaction_stats.get("max_activity_width", 0)),
+            )
+            balance_stats["activity_chain_expansions"].extend(
+                transaction_stats.get("activity_chain_expansions", [])
+            )
+            for transaction_index, transaction in enumerate(transactions):
+                if time.perf_counter() >= deadline:
+                    break
+                if transaction.get("source_signature") != _trajectory_signature(proposal_source):
+                    balance_stats["rejected_ledger"] += 1
+                    continue
+                before_key = proposal_source.objective_key
+                before_smoothness = _trajectory_smoothness(proposal_source, M)
+                before_history = [
+                    tuple(row)
+                    for row in _candidate_position_rows(proposal_source, M)
+                ]
+                metadata = dict(transaction.get("details") or {})
+                metadata.update({
+                    "source_hash": source_hash,
+                    "transaction_index": transaction_index,
+                    "state_limit": balance_state_limit,
+                })
+                try:
+                    proposed = _candidate_from_explicit_cross_crane_phase_transaction(
+                        W, M, starts, transaction["history"], proposal_source,
+                        transaction["work_plan"], transaction["active_cranes"],
+                        source_hash=source_hash,
+                        transaction_source_hash=transaction.get("source_hash"),
+                    )
+                    balance_stats["decoded"] += 1
+                    balance_stats["verified"] += 1
+                except RuntimeError:
+                    proposed = None
+                    balance_stats["rejected_safety"] += 1
+                accepted, legal = record_candidate(
+                    proposed, "idle_capacity_rebalance",
+                    before_key, before_smoothness, cycle, transaction_index,
+                    before_history, decode_failed=proposed is None,
+                    declared_regions=transaction["regions"],
+                    transaction_metadata=metadata,
+                    snapshot_source_candidate=proposal_source,
+                )
+                balance_stats["accepted"] += int(accepted)
+                if legal and proposed is not None:
+                    idle_capacity_transactions.append({
+                        "before": proposal_source,
+                        "after": proposed,
+                        "details": metadata,
+                        "regions": list(transaction.get("regions", [])),
+                    })
+                elif not legal and proposed is not None:
+                    balance_stats["rejected_safety"] += 1
+                if accepted:
+                    progress = True
+            if progress:
+                stale_cycles = 0
+                cycle += 1
+                continue
+        if continuity and enable_phase_closure:
+            proposal_source = best
+            closure_state_limit = max(50_000, int(local_state_limit) * 256)
+            transactions, transaction_stats = _phase_closure_relay_search(
+                W, M, starts, proposal_source,
+                state_limit=closure_state_limit,
+                max_candidates=32,
+                max_phase_orders=128,
+                max_variants_per_crane=12_000,
+                deadline=deadline,
+                source_hash=source_hash,
+            )
+            closure_stats = continuity_stats["phase_closure_relay"]
+            closure_stats["status"] = transaction_stats.get("status", "UNKNOWN")
+            closure_stats["rounds"] += 1
+            for key in (
+                "focus_revisits", "activity_bands_tested",
+                "phase_orders_generated", "event_schedules_generated",
+                "states_expanded", "complete_phase_plans", "ledger_closed",
+                "decoded", "verified", "accepted", "rejected_safety",
+                "rejected_horizon", "rejected_ledger", "timeout",
+                "state_limit", "max_activity_width",
+            ):
+                closure_stats[key] += int(transaction_stats.get(key, 0))
+            closure_stats["activity_chain_expansions"].extend(
+                transaction_stats.get("activity_chain_expansions", [])
+            )
+            for transaction_index, transaction in enumerate(transactions):
+                if time.perf_counter() >= deadline:
+                    break
+                if transaction.get("source_signature") != _trajectory_signature(proposal_source):
+                    closure_stats["rejected_ledger"] += 1
+                    continue
+                before_key = proposal_source.objective_key
+                before_smoothness = _trajectory_smoothness(proposal_source, M)
+                before_history = [
+                    tuple(row)
+                    for row in _candidate_position_rows(proposal_source, M)
+                ]
+                metadata = dict(transaction.get("details") or {})
+                metadata.update({
+                    "source_hash": source_hash,
+                    "transaction_index": transaction_index,
+                    "state_limit": closure_state_limit,
+                })
+                try:
+                    proposed = _candidate_from_explicit_phase_transaction(
+                        W, M, starts, transaction["history"],
+                        proposal_source, transaction["work_plan"],
+                        transaction["active_cranes"],
+                        source_hash=source_hash,
+                        transaction_source_hash=transaction.get("source_hash"),
+                    )
+                    closure_stats["decoded"] += 1
+                    closure_stats["verified"] += 1
+                except RuntimeError:
+                    proposed = None
+                    closure_stats["rejected_safety"] += 1
+                accepted, legal = record_candidate(
+                    proposed, "phase_closure_relay",
+                    before_key, before_smoothness, cycle, transaction_index,
+                    before_history, decode_failed=proposed is None,
+                    declared_regions=transaction["regions"],
+                    transaction_metadata=metadata,
+                    snapshot_source_candidate=proposal_source,
+                )
+                closure_stats["accepted"] += int(accepted)
+                if not legal and proposed is not None:
+                    closure_stats["rejected_safety"] += 1
+                if accepted:
+                    progress = True
+            if progress:
+                stale_cycles = 0
+                cycle += 1
+                continue
+        if continuity and enable_phase_resequence:
+            proposal_source = best
+            # The phase beam ranks complete-but-not-yet-started work as
+            # pending, so the H=208 Q3/Q2 conflict chain reaches a legal
+            # full-plan permutation in roughly 50k expansions.  Keep a
+            # deterministic floor above that threshold; tying the phase
+            # budget to the short-window limit (64/256) would otherwise stop
+            # before the first complete transaction and report a misleading
+            # ``UNKNOWN_STATE_LIMIT``.
+            phase_state_limit = max(150_000, int(local_state_limit) * 256)
+            transactions, transaction_stats = _phase_block_resequence_exchange(
+                W, M, starts, proposal_source,
+                max_active_cranes=4,
+                max_block_permutations=256,
+                state_limit=phase_state_limit,
+                max_candidates=32,
+                source_hash=source_hash,
+                deadline=deadline,
+            )
+            phase_stats = continuity_stats["phase_block_resequence"]
+            phase_stats["status"] = transaction_stats.get("status", "UNKNOWN")
+            phase_stats["rounds"] += 1
+            for key in (
+                "focus_revisits", "multi_slot_revisits",
+                "active_bands_generated", "phase_permutations_generated",
+                "phase_combinations_tested", "states_expanded",
+                "states_pruned_horizon", "states_pruned_safety",
+                "states_pruned_split", "states_pruned_movement",
+                "complete_phase_plans", "decoded", "verified", "accepted",
+                "rejected_burden_migration", "timeout", "state_limit",
+            ):
+                phase_stats[key] += int(transaction_stats.get(key, 0))
+            for name, count in (transaction_stats.get("operators") or {}).items():
+                phase_stats["operators"][name] = (
+                    phase_stats["operators"].get(name, 0) + int(count)
+                )
+            for transaction_index, transaction in enumerate(transactions):
+                if time.perf_counter() >= deadline:
+                    break
+                if transaction.get("source_signature") != _trajectory_signature(proposal_source):
+                    phase_stats["rejected_burden_migration"] += 1
+                    continue
+                before_key = proposal_source.objective_key
+                before_smoothness = _trajectory_smoothness(proposal_source, M)
+                before_history = [
+                    tuple(row)
+                    for row in _candidate_position_rows(proposal_source, M)
+                ]
+                metadata = dict(transaction.get("details") or {})
+                metadata.update({
+                    "source_hash": source_hash,
+                    "transaction_index": transaction_index,
+                    "state_limit": phase_state_limit,
+                })
+                try:
+                    proposed = _candidate_from_explicit_phase_transaction(
+                        W, M, starts, transaction["history"],
+                        proposal_source, transaction["work_plan"],
+                        transaction["active_cranes"],
+                        source_hash=source_hash,
+                        transaction_source_hash=transaction.get("source_hash"),
+                    )
+                    phase_stats["decoded"] += 1
+                    phase_stats["verified"] += 1
+                except RuntimeError:
+                    proposed = None
+                    phase_stats["states_pruned_safety"] += 1
+                accepted, legal = record_candidate(
+                    proposed, "phase_block_resequence",
+                    before_key, before_smoothness, cycle, transaction_index,
+                    before_history, decode_failed=proposed is None,
+                    declared_regions=transaction["regions"],
+                    transaction_metadata=metadata,
+                    snapshot_source_candidate=proposal_source,
+                )
+                phase_stats["accepted"] += int(accepted)
+                if not legal and proposed is not None:
+                    phase_stats["rejected_burden_migration"] += 1
+                if accepted:
+                    progress = True
+            if progress:
+                stale_cycles = 0
+                cycle += 1
+                continue
+        if enable_fragmentation_repair and enable_cyclic_exchange:
+            proposal_source = best
+            transactions, transaction_stats = _paired_window_cyclic_work_exchange(
+                W, M, proposal_source,
+                max_candidates=max(1, local_state_limit),
+                state_limit=max(1, local_state_limit),
+                source_hash=source_hash, deadline=deadline,
+            )
+            pair_stats = continuity_stats["paired_window_cyclic"]
+            pair_stats["status"] = transaction_stats.get("status", "UNKNOWN")
+            pair_stats["rounds"] += 1
+            for key in (
+                "generated", "unique", "expanded_states",
+                "early_window_states", "late_window_states",
+                "capacity_rejected", "safety_rejected", "boundary_rejected",
+                "ledger_rejected", "verified", "accepted", "timeout",
+                "state_limit",
+            ):
+                pair_stats[key] += int(transaction_stats.get(key, 0))
+            for name, count in (transaction_stats.get("operators") or {}).items():
+                pair_stats["operators"][name] = (
+                    pair_stats["operators"].get(name, 0) + int(count)
+                )
+            for transaction_index, transaction in enumerate(transactions):
+                if time.perf_counter() >= deadline:
+                    break
+                if transaction.get("source_signature") != _trajectory_signature(proposal_source):
+                    pair_stats["boundary_rejected"] += 1
+                    continue
+                before_key = proposal_source.objective_key
+                before_smoothness = _trajectory_smoothness(proposal_source, M)
+                before_history = [
+                    tuple(row) for row in _candidate_position_rows(proposal_source, M)
+                ]
+                metadata = dict(transaction.get("details") or {})
+                metadata.update({
+                    "source_hash": source_hash,
+                    "transaction_index": transaction_index,
+                    "state_limit": local_state_limit,
+                })
+                try:
+                    proposed = _candidate_from_explicit_work_transaction(
+                        W, M, transaction["history"], proposal_source,
+                        transaction["work_plan"], transaction["regions"],
+                        source_hash=source_hash,
+                        transaction_source_hash=transaction.get("source_hash"),
+                        max_segments=4,
+                        max_region_length=8,
+                    )
+                    pair_stats["verified"] += 1
+                except RuntimeError:
+                    proposed = None
+                    pair_stats["safety_rejected"] += 1
+                accepted, legal = record_candidate(
+                    proposed, "paired_window_cyclic_exchange",
+                    before_key, before_smoothness, cycle, transaction_index,
+                    before_history, decode_failed=proposed is None,
+                    declared_regions=transaction["regions"],
+                    transaction_metadata=metadata,
+                    snapshot_source_candidate=proposal_source,
+                )
+                if legal:
+                    pair_stats["accepted"] += int(accepted)
                 if accepted:
                     progress = True
             if progress:
@@ -4326,6 +8882,15 @@ def _refine_same_horizon_trajectory(
             "formal_best": formal_best,
             "continuity_best": continuity_best,
             "operational_best": operational_best,
+            "execution_best": execution_best,
+            "balanced_best": balanced_best,
+            "balanced_best_metrics": _balanced_schedule_metrics(balanced_best, M),
+            "paired_transactions": paired_transactions,
+            "phase_transactions": phase_transactions,
+            "phase_closure_transactions": phase_closure_transactions,
+            "cross_crane_phase_transactions": cross_crane_phase_transactions,
+            "idle_capacity_transactions": idle_capacity_transactions,
+            "forced_prefix_transactions": forced_prefix_transactions,
             "pool_size": len(pool),
             "stats": continuity_stats,
             "stop_reason": stop_reason,
@@ -4345,6 +8910,11 @@ def _cumulative_local_trajectory_repair(
     continuity_output: dict[str, Any] | None = None,
     *,
     polish_after_first: bool = True,
+    enable_phase_resequence: bool = True,
+    enable_phase_closure: bool = True,
+    enable_cross_crane_phase_relay: bool = False,
+    enable_idle_capacity_rebalance: bool = False,
+    enable_forced_prefix_consolidation: bool = True,
 ) -> tuple[
     _CandidateSchedule | None, int, _CandidateSchedule, _CandidateSchedule | None
 ]:
@@ -4392,6 +8962,11 @@ def _cumulative_local_trajectory_repair(
             attempt_trace=attempt_trace,
             continuity=True,
             result_box=polish_result,
+            enable_phase_resequence=enable_phase_resequence,
+            enable_phase_closure=enable_phase_closure,
+            enable_cross_crane_phase_relay=enable_cross_crane_phase_relay,
+            enable_idle_capacity_rebalance=enable_idle_capacity_rebalance,
+            enable_forced_prefix_consolidation=enable_forced_prefix_consolidation,
         )
         if continuity_output is not None:
             continuity_output.update(polish_result)
@@ -4575,6 +9150,1549 @@ def _cumulative_local_trajectory_repair(
     return None, evaluated_total, current, first_feasible
 
 
+def _congestion_workload_lower_bound(W: Sequence[int], M: int) -> int:
+    """Return the path-congestion lower bound for zero-time crane movement."""
+    bound = max(max(W, default=0), math.ceil(sum(W) / max(1, M)))
+    for left in range(len(W)):
+        work = 0
+        for right in range(left, len(W)):
+            work += int(W[right])
+            capacity = min(M, (right - left + 2) // 2)
+            if capacity > 0:
+                bound = max(bound, math.ceil(work / capacity))
+    return bound
+
+
+def _synchronize_by_compressed_row_groups(
+    W: Sequence[int], M: int, starts: Sequence[int],
+    source: _CandidateSchedule, deadline: float, *,
+    beam_width: int = 12_000,
+) -> tuple[_CandidateSchedule | None, dict[str, Any]]:
+    """Permute complete row groups to remove trailing idle without fragmentation.
+
+    Every distinct safe configuration plus explicit per-crane work row becomes
+    one indivisible block.  The beam remembers closed ``(crane, bay)`` tasks;
+    reopening one is the primary cost, starting another internal idle episode
+    is secondary, and crane moves are tertiary.  Work ownership and amounts
+    never change, so this is a safe synchronization post-process for an
+    already strong low-move schedule.
+    """
+    stats: dict[str, Any] = {
+        "status": "NOT_RUN", "groups": 0, "states": 0,
+        "decoded": 0, "verified": 0, "reopens": None,
+    }
+    if source.move_time != 0 or source.makespan <= 1:
+        stats["status"] = "NOT_APPLICABLE"
+        return None, stats
+    rows = _candidate_position_rows(source, M)
+    work_by_cell: dict[tuple[int, int], int | None] = {
+        (slot.time, slot.crane - 1): (
+            int(slot.work_bay) if slot.state == "work" else None
+        )
+        for slot in source.slots
+    }
+
+    def record_at(time_index: int) -> tuple[Any, ...]:
+        config = tuple(int(value) for value in rows[time_index])
+        work = tuple(work_by_cell[(time_index, q)] for q in range(M))
+        active = frozenset(
+            (q, int(bay)) for q, bay in enumerate(work) if bay is not None
+        )
+        return config, work, active
+
+    opening = record_at(0)
+    grouped: dict[tuple[Any, ...], int] = {}
+    for time_index in range(1, source.makespan):
+        record = record_at(time_index)
+        grouped[record] = grouped.get(record, 0) + 1
+    groups = [
+        {"record": record, "count": count}
+        for record, count in grouped.items()
+    ]
+    stats["groups"] = len(groups)
+    if not groups or len(groups) > 24 or beam_width <= 0:
+        stats["status"] = "NOT_APPLICABLE"
+        return None, stats
+
+    full_mask = (1 << len(groups)) - 1
+    # reopens, reversals, max_crane_moves, moves, idle_starts, mask, last,
+    # closed, last_directions, move_counts, path
+    states: list[tuple[Any, ...]] = [
+        (0, 0, 0, 0, 0, 0, -1, frozenset(), (0,) * M, (0,) * M, tuple())
+    ]
+    for depth in range(len(groups)):
+        if time.perf_counter() >= deadline:
+            stats["status"] = "UNKNOWN_DEADLINE"
+            return None, stats
+        next_states: dict[tuple[Any, ...], tuple[Any, ...]] = {}
+        for (
+            reopens, reversals, max_crane_moves, moves, idle_starts, mask,
+            last, closed, last_directions, move_counts, path,
+        ) in states:
+            previous = opening if last < 0 else groups[last]["record"]
+            for index, group in enumerate(groups):
+                bit = 1 << index
+                if mask & bit:
+                    continue
+                config, work, active = group["record"]
+                if depth == len(groups) - 1 and any(
+                    bay is None for bay in work
+                ):
+                    continue
+                new_closed = closed | (previous[2] - active)
+                directions = tuple(
+                    0 if before == after else (1 if after > before else -1)
+                    for before, after in zip(previous[0], config)
+                )
+                next_directions = tuple(
+                    direction or last_direction
+                    for direction, last_direction
+                    in zip(directions, last_directions)
+                )
+                next_move_counts = tuple(
+                    count + int(before != after)
+                    for count, before, after
+                    in zip(move_counts, previous[0], config)
+                )
+                item = (
+                    reopens + len(active & closed),
+                    reversals + sum(
+                        direction != 0
+                        and last_direction != 0
+                        and direction != last_direction
+                        for direction, last_direction
+                        in zip(directions, last_directions)
+                    ),
+                    max(next_move_counts, default=0),
+                    moves + sum(
+                        before != after
+                        for before, after in zip(previous[0], config)
+                    ),
+                    idle_starts + sum(
+                        before is not None and after is None
+                        for before, after in zip(previous[1], work)
+                    ),
+                    mask | bit,
+                    index,
+                    new_closed,
+                    next_directions,
+                    next_move_counts,
+                    path + (index,),
+                )
+                key = (
+                    item[5], index, new_closed, next_directions,
+                    next_move_counts,
+                )
+                old = next_states.get(key)
+                if old is None or item[:5] < old[:5]:
+                    next_states[key] = item
+        stats["states"] += len(next_states)
+        states = sorted(
+            next_states.values(),
+            key=lambda item: (*item[:5], item[10]),
+        )[:beam_width]
+        if not states:
+            stats["status"] = "NO_CANDIDATE"
+            return None, stats
+    complete = [state for state in states if state[5] == full_mask]
+    if not complete:
+        stats["status"] = "NO_CANDIDATE"
+        return None, stats
+    best_state = min(complete, key=lambda item: item[:5])
+    ordered = [opening]
+    for group_index in best_state[10]:
+        ordered.extend(
+            [groups[group_index]["record"]] * groups[group_index]["count"]
+        )
+    history = [record[0] for record in ordered]
+    history.append(history[-1])
+    work_plan = {
+        (time_index, q): record[1][q]
+        for time_index, record in enumerate(ordered)
+        for q in range(M)
+    }
+    try:
+        candidate = _candidate_from_rows_and_work_plan(
+            W, M, history, work_plan
+        )
+    except (RuntimeError, ValueError):
+        stats["status"] = "DECODE_FAILED"
+        return None, stats
+    stats["decoded"] = 1
+    candidate = _normalize_completed_candidate(candidate)
+    if not _candidate_passes_independent_verifier(W, M, starts, candidate):
+        stats["status"] = "VERIFY_FAILED"
+        return None, stats
+    stats.update({
+        "status": "FOUND", "verified": 1,
+        "reopens": int(best_state[0]),
+        "reversals": int(best_state[1]),
+        "max_crane_moves": int(best_state[2]),
+        "idle_starts": int(best_state[4]),
+        "objective": list(candidate.objective_key),
+    })
+    return candidate, stats
+
+
+def _contiguous_phase_schedule_search(
+    W: Sequence[int], M: int, starts: Sequence[int],
+    source: _CandidateSchedule, deadline: float, *, beam_width: int = 8_000,
+    task_counts: Sequence[dict[int, int]] | None = None,
+    profile_vectors: Sequence[Sequence[str]] | None = None,
+) -> tuple[_CandidateSchedule | None, dict[str, Any]]:
+    """Rebuild a schedule with every owned crane/bay task indivisible.
+
+    This operator addresses a limitation of row-group permutation: correlated
+    rows can force a crane to leave a bay and return later.  Here each owned
+    ``(crane, bay)`` workload is a single non-preemptive phase.  The beam may
+    wait or reposition only between phases and every decoded result is passed
+    through the independent verifier.
+    """
+    stats: dict[str, Any] = {
+        "status": "NOT_RUN", "profiles": 0, "states": 0,
+        "decoded": 0, "verified": 0,
+    }
+    if source.move_time != 0 or source.completion_time <= 1:
+        stats["status"] = "NOT_APPLICABLE"
+        return None, stats
+    horizon = source.completion_time
+    counts: list[dict[int, int]] = [dict() for _ in range(M)]
+    first_seen: list[list[int]] = [[] for _ in range(M)]
+    for slot in sorted(source.slots, key=lambda item: (item.time, item.crane)):
+        if slot.state != "work" or slot.work_bay is None:
+            continue
+        q, bay = slot.crane - 1, int(slot.work_bay)
+        counts[q][bay] = counts[q].get(bay, 0) + 1
+        if bay not in first_seen[q]:
+            first_seen[q].append(bay)
+    if task_counts is not None:
+        counts = [
+            {int(bay): int(amount) for bay, amount in crane.items() if amount > 0}
+            for crane in task_counts
+        ]
+        for q in range(M):
+            first_seen[q] = [
+                bay for bay in first_seen[q] if bay in counts[q]
+            ] + [
+                bay for bay in sorted(counts[q]) if bay not in first_seen[q]
+            ]
+    if any(int(starts[q]) not in counts[q] for q in range(M)):
+        stats["status"] = "NOT_APPLICABLE"
+        return None, stats
+
+    def profile(kinds: Sequence[str]) -> tuple[tuple[tuple[int, int], ...], ...]:
+        result = []
+        for q in range(M):
+            kind = kinds[q]
+            start = int(starts[q])
+            rest = [bay for bay in counts[q] if bay != start]
+            if kind == "source":
+                order = [bay for bay in first_seen[q] if bay != start]
+            elif kind == "ascending":
+                order = sorted(rest)
+            else:
+                order = sorted(rest, reverse=True)
+            result.append(tuple(
+                (bay, int(counts[q][bay])) for bay in (start, *order)
+            ))
+        return tuple(result)
+
+    legal = _legal_configurations(len(W), M)
+    best: _CandidateSchedule | None = None
+    # Descending paths move edge cranes inward without returning; source and
+    # ascending profiles remain bounded fallbacks for asymmetric instances.
+    profiles = list(profile_vectors or (
+        ("descending",) * M,
+        ("source",) * M,
+        ("ascending",) * M,
+    ))
+    for profile_kinds in profiles:
+        if time.perf_counter() >= deadline:
+            stats["status"] = "UNKNOWN_DEADLINE"
+            break
+        phases = profile(profile_kinds)
+        profile_name = "/".join(profile_kinds)
+        stats["profiles"] += 1
+        match_cache: dict[tuple[int | None, ...], list[tuple[int, ...]]] = {}
+        near_cache: dict[tuple[Any, ...], list[tuple[int, ...]]] = {}
+
+        def near_configs(
+            work: tuple[int | None, ...], positions: tuple[int, ...],
+        ) -> list[tuple[int, ...]]:
+            if work not in match_cache:
+                match_cache[work] = [
+                    config for config in legal
+                    if all(
+                        bay is None or config[q] == bay
+                        for q, bay in enumerate(work)
+                    )
+                ]
+            key = (work, positions)
+            if key not in near_cache:
+                near_cache[key] = sorted(
+                    match_cache[work],
+                    key=lambda config: (
+                        sum(a != b for a, b in zip(positions, config)),
+                        sum(abs(a - b) for a, b in zip(positions, config)),
+                        config,
+                    ),
+                )[:4]
+            return near_cache[key]
+
+        # indices, remaining-in-phase, positions, directions, was-idle,
+        # moves, reversals, idle-starts, row path, work path
+        initial_remaining = tuple(phases[q][0][1] - 1 for q in range(M))
+        opening = tuple(int(value) for value in starts)
+        states: list[tuple[Any, ...]] = [(
+            (0,) * M, initial_remaining, opening, (0,) * M,
+            (False,) * M, 0, 0, 0, (opening,), (opening,),
+        )]
+        completed = True
+        for time_index in range(1, horizon):
+            if time.perf_counter() >= deadline:
+                stats["status"] = "UNKNOWN_DEADLINE"
+                completed = False
+                break
+            rows_left = horizon - time_index
+            next_states: dict[tuple[Any, ...], tuple[Any, ...]] = {}
+            for state in states:
+                (indices, remaining, positions, directions, was_idle,
+                 moves, reversals, idle_starts, row_path, work_path) = state
+                choices: list[tuple[tuple[int, int, int | None], ...]] = []
+                feasible = True
+                for q in range(M):
+                    if remaining[q] > 0:
+                        choices.append(((
+                            indices[q], remaining[q] - 1,
+                            phases[q][indices[q]][0],
+                        ),))
+                        continue
+                    next_index = indices[q] + 1
+                    if next_index >= len(phases[q]):
+                        choices.append(((indices[q], 0, None),))
+                        continue
+                    pending = sum(length for _, length in phases[q][next_index:])
+                    if pending > rows_left:
+                        feasible = False
+                        break
+                    start_phase = (
+                        next_index, phases[q][next_index][1] - 1,
+                        phases[q][next_index][0],
+                    )
+                    choices.append(
+                        (start_phase,) if pending == rows_left
+                        else (start_phase, (indices[q], 0, None))
+                    )
+                if not feasible:
+                    continue
+                for combination in itertools.product(*choices):
+                    work = tuple(item[2] for item in combination)
+                    for config in near_configs(work, positions):
+                        step_directions = tuple(
+                            0 if before == after else (1 if after > before else -1)
+                            for before, after in zip(positions, config)
+                        )
+                        new_directions = tuple(
+                            step or old for step, old
+                            in zip(step_directions, directions)
+                        )
+                        new_moves = moves + sum(step != 0 for step in step_directions)
+                        new_reversals = reversals + sum(
+                            step != 0 and old != 0 and step != old
+                            for step, old in zip(step_directions, directions)
+                        )
+                        now_idle = tuple(bay is None for bay in work)
+                        new_idle_starts = idle_starts + sum(
+                            not was_idle[q] and now_idle[q] for q in range(M)
+                        )
+                        new_indices = tuple(item[0] for item in combination)
+                        new_remaining = tuple(item[1] for item in combination)
+                        key = (
+                            new_indices, new_remaining, config,
+                            new_directions, now_idle,
+                        )
+                        item = (
+                            new_indices, new_remaining, config, new_directions,
+                            now_idle, new_moves, new_reversals,
+                            new_idle_starts, row_path + (config,),
+                            work_path + (work,),
+                        )
+                        old = next_states.get(key)
+                        if old is None or (
+                            new_reversals, new_moves, new_idle_starts
+                        ) < (old[6], old[5], old[7]):
+                            next_states[key] = item
+            stats["states"] += len(next_states)
+            if not next_states:
+                completed = False
+                break
+            states = sorted(
+                next_states.values(),
+                # With identical route cost, retain states that have not
+                # prematurely consumed their final phase.  The per-crane
+                # pending-work guard above will force a start at the latest
+                # feasible row, reducing long completed suffixes without
+                # fragmenting work.
+                key=lambda item: (item[6], item[5], item[7], -sum(item[1])),
+            )[:beam_width]
+        if not completed:
+            continue
+        finals = [
+            state for state in states
+            if all(
+                state[0][q] == len(phases[q]) - 1 and state[1][q] == 0
+                for q in range(M)
+            )
+        ]
+        for state in sorted(finals, key=lambda item: (item[6], item[5], item[7]))[:8]:
+            history = list(state[8])
+            history.append(history[-1])
+            work_plan = {
+                (t, q): state[9][t][q]
+                for t in range(horizon) for q in range(M)
+            }
+            try:
+                candidate = _candidate_from_rows_and_work_plan(
+                    W, M, history, work_plan
+                )
+            except (RuntimeError, ValueError):
+                continue
+            stats["decoded"] += 1
+            if not _candidate_passes_independent_verifier(W, M, starts, candidate):
+                continue
+            stats["verified"] += 1
+            if _continuity_diagnostics(candidate, M)["work_revisit_count"] != 0:
+                continue
+            if best is None or _recommended_schedule_rank(candidate, M) < _recommended_schedule_rank(best, M):
+                best = candidate
+        if best is not None:
+            stats.update({
+                "status": "FOUND", "profile": profile_name,
+                "objective": list(best.objective_key),
+            })
+            return best, stats
+    if stats["status"] == "NOT_RUN":
+        stats["status"] = "NO_CANDIDATE"
+    return best, stats
+
+
+def _contiguous_phase_handoff_search(
+    W: Sequence[int], M: int, starts: Sequence[int],
+    source: _CandidateSchedule, deadline: float,
+) -> tuple[_CandidateSchedule | None, dict[str, Any]]:
+    """Transfer small boundary workloads, then enforce indivisible phases.
+
+    A revisited task is offered to the adjacent crane on the inward/right
+    side.  If that crane already owns the bay, its existing chunk determines
+    the first transfer size; otherwise its unused horizon capacity does.  The
+    resulting ownership ledger is searched as complete phases and independently
+    verified, so the heuristic cannot leak or duplicate work.
+    """
+    counts: list[dict[int, int]] = [dict() for _ in range(M)]
+    for slot in source.slots:
+        if slot.state == "work" and slot.work_bay is not None:
+            q, bay = slot.crane - 1, int(slot.work_bay)
+            counts[q][bay] = counts[q].get(bay, 0) + 1
+    loads = [sum(item.values()) for item in counts]
+    transfers: list[dict[str, int]] = []
+    revisits = _continuity_diagnostics(source, M)["crane_work_revisits"]
+    used: set[tuple[int, int]] = set()
+    for revisit in revisits:
+        donor = int(revisit["crane"]) - 1
+        receiver = donor + 1
+        bay = int(revisit["bay"])
+        if receiver >= M or (donor, bay) in used:
+            continue
+        available = counts[donor].get(bay, 0)
+        if available <= 1:
+            continue
+        receiver_owned = counts[receiver].get(bay, 0)
+        receiver_slack = max(0, source.completion_time - loads[receiver])
+        amount = min(
+            available - 1,
+            receiver_owned if receiver_owned > 0 else receiver_slack,
+        )
+        if amount <= 0:
+            continue
+        counts[donor][bay] -= amount
+        counts[receiver][bay] = receiver_owned + amount
+        loads[donor] -= amount
+        loads[receiver] += amount
+        used.add((donor, bay))
+        transfers.append({
+            "donor": donor + 1, "receiver": receiver + 1,
+            "bay": bay, "amount": amount,
+        })
+    stats: dict[str, Any] = {
+        "status": "NOT_APPLICABLE", "transfers": transfers,
+        "loads": loads,
+    }
+    if not transfers:
+        return None, stats
+    # Outer cranes benefit from a monotone inward path.  The central cranes
+    # retain their observed phase order because they mediate both tight bay
+    # pairs and often need one controlled direction change.
+    kinds = tuple(
+        "source" if 2 <= q < M - 1 else "descending"
+        for q in range(M)
+    )
+    candidate, phase_stats = _contiguous_phase_schedule_search(
+        W, M, starts, source, deadline, beam_width=12_000,
+        task_counts=counts, profile_vectors=(kinds,),
+    )
+    if candidate is not None:
+        candidate = _right_shift_terminal_work_blocks(
+            W, M, starts, candidate
+        )
+    stats.update(phase_stats)
+    stats["transfers"] = transfers
+    stats["loads"] = loads
+    return candidate, stats
+
+
+def _right_shift_terminal_work_blocks(
+    W: Sequence[int], M: int, starts: Sequence[int],
+    source: _CandidateSchedule,
+) -> _CandidateSchedule:
+    """Move a final work block right inside its unchanged position run.
+
+    Only work labels move; crane positions and therefore safety, movements and
+    reversals remain unchanged.  This turns avoidable completed suffixes into
+    inter-phase waiting without reopening any crane/bay task.
+    """
+    horizon = source.completion_time
+    rows, work = _transaction_rows_work_map(source, M)
+    current = source
+    for q in range(M):
+        work_times = [
+            t for t in range(horizon) if work.get((t, q)) is not None
+        ]
+        if not work_times or work_times[-1] >= horizon - 1:
+            continue
+        end = work_times[-1] + 1
+        bay = int(work[(work_times[-1], q)])
+        start = work_times[-1]
+        while start > 0 and work.get((start - 1, q)) == bay:
+            start -= 1
+        length = end - start
+        previous_work = max((t for t in work_times if t < start), default=-1)
+        trial_work = dict(work)
+        for t in range(start, end):
+            trial_work[(t, q)] = None
+        latest_start = None
+        for proposed in range(horizon - length, previous_work, -1):
+            interval = range(proposed, proposed + length)
+            if not all(rows[t][q] == bay for t in interval):
+                continue
+            if any(trial_work.get((t, q)) is not None for t in interval):
+                continue
+            if any(
+                trial_work.get((t, other)) == bay
+                for t in interval for other in range(M) if other != q
+            ):
+                continue
+            latest_start = proposed
+            break
+        if latest_start is None or latest_start <= start:
+            continue
+        for t in range(latest_start, latest_start + length):
+            trial_work[(t, q)] = bay
+        try:
+            proposed_candidate = _candidate_from_rows_and_work_plan(
+                W, M, rows, trial_work
+            )
+        except (RuntimeError, ValueError):
+            continue
+        if not _candidate_passes_independent_verifier(
+            W, M, starts, proposed_candidate
+        ):
+            continue
+        if _continuity_diagnostics(
+            proposed_candidate, M
+        )["work_revisit_count"] > _continuity_diagnostics(
+            current, M
+        )["work_revisit_count"]:
+            continue
+        work = trial_work
+        current = proposed_candidate
+    return current
+
+
+def _global_safe_pattern_search(
+    W: Sequence[int], M: int, starts: Sequence[int],
+    source: _CandidateSchedule, deadline: float, *,
+    max_attempts_per_horizon: int = 1,
+) -> tuple[_CandidateSchedule | None, dict[str, Any]]:
+    """Cover work with safe row patterns, then recover crane identities.
+
+    This search is not restricted to one monotone bay segment per crane.
+    Sparse rows are extended to complete safe crane configurations while idle
+    identities are balanced.  Rows are then ordered to reduce moves, with a
+    full-work terminal row so all cranes finish together when capacity allows.
+    """
+    total = sum(int(value) for value in W)
+    lower_bound = _congestion_workload_lower_bound(W, M)
+    stats: dict[str, Any] = {
+        "status": "NOT_RUN",
+        "congestion_lower_bound": lower_bound,
+        "target_horizons": [],
+        "attempts": 0,
+        "patterns_generated": 0,
+        "rows_selected": 0,
+        "configuration_extensions": 0,
+        "decoded": 0,
+        "verified": 0,
+        "best_objective": None,
+        "best_loads": None,
+        "best_balance": None,
+        "stop_reason": None,
+    }
+    if source.move_time != 0:
+        stats.update({"status": "UNSUPPORTED", "stop_reason": "nonzero_move_time"})
+        return None, stats
+    if not W or M <= 0 or source.completion_time <= lower_bound:
+        stats.update({"status": "NOT_APPLICABLE", "stop_reason": "at_lower_bound"})
+        return None, stats
+
+    N = len(W)
+    positive = tuple(index for index, amount in enumerate(W) if amount > 0)
+    legal_configurations = _legal_configurations(N, M)
+    initial_row = tuple(_candidate_position_rows(source, M)[0])
+    required = set(int(bay) for bay in starts)
+    if not required.issubset(initial_row):
+        stats.update({"status": "NO_CANDIDATE", "stop_reason": "required_start_missing"})
+        return None, stats
+
+    patterns_by_size: dict[int, list[tuple[int, ...]]] = {
+        size: [] for size in range(1, M + 1)
+    }
+    for size in range(1, M + 1):
+        for pattern in itertools.combinations(positive, size):
+            if all(right - left > 1 for left, right in zip(pattern, pattern[1:])):
+                patterns_by_size[size].append(pattern)
+    stats["patterns_generated"] = sum(map(len, patterns_by_size.values()))
+
+    intervals = [
+        (left, right, min(M, (right - left + 2) // 2))
+        for left in range(N)
+        for right in range(left, N)
+    ]
+
+    def remaining_is_possible(remaining: Sequence[int], rows: int) -> bool:
+        if rows < 0 or any(value < 0 or value > rows for value in remaining):
+            return False
+        if sum(remaining) > rows * M:
+            return False
+        prefix = [0]
+        for value in remaining:
+            prefix.append(prefix[-1] + int(value))
+        return all(
+            prefix[right + 1] - prefix[left] <= rows * capacity
+            for left, right, capacity in intervals
+        )
+
+    def compact_work_patterns_for_horizon(
+        horizon: int, variant: int,
+    ) -> list[tuple[int, ...]] | None:
+        """Search event blocks before falling back to row-wise colouring."""
+        opening = tuple(
+            bay - 1 for bay in initial_row if int(W[bay - 1]) > 0
+        )
+        remaining = [int(value) for value in W]
+        for index in opening:
+            remaining[index] -= 1
+        rows_left = horizon - 1
+        if not remaining_is_possible(remaining, rows_left):
+            return None
+
+        # State: transition burden, remaining work, rows, previous pattern,
+        # and the compact (duration, pattern) event list.
+        states: list[
+            tuple[int, tuple[int, ...], int, tuple[int, ...], list[tuple[int, tuple[int, ...]]]]
+        ] = [(0, tuple(remaining), rows_left, opening, [])]
+        max_blocks = max(12, 2 * len(positive) + 8)
+        for _depth in range(max_blocks):
+            expanded: list[
+                tuple[int, tuple[int, ...], int, tuple[int, ...], list[tuple[int, tuple[int, ...]]]]
+            ] = []
+            seen_states: set[tuple[Any, ...]] = set()
+            for burden, values, rows, previous, blocks in states:
+                if rows == 0:
+                    if not any(values):
+                        result = [opening]
+                        for duration, pattern in blocks:
+                            result.extend([pattern] * duration)
+                        return result
+                    continue
+                prefix = [0]
+                for value in values:
+                    prefix.append(prefix[-1] + int(value))
+                tight_intervals = [
+                    (left, right, capacity)
+                    for left, right, capacity in intervals
+                    if prefix[right + 1] - prefix[left] == rows * capacity
+                ]
+                idle_capacity = rows * M - sum(values)
+                choices: list[tuple[Any, ...]] = []
+                # When at most one idle cell per remaining row is sufficient,
+                # forbid needlessly sparse rows.  Concentrating two or more
+                # idle cranes in one row makes both load balancing and later
+                # movement consolidation strictly harder for this compact
+                # construction.
+                minimum_pattern_size = (
+                    M - 1 if idle_capacity <= rows else 1
+                )
+                for size in range(max(1, minimum_pattern_size), M + 1):
+                    for pattern in patterns_by_size.get(size, []):
+                        if any(values[index] <= 0 for index in pattern):
+                            continue
+                        if any(
+                            sum(left <= index <= right for index in pattern)
+                            != capacity
+                            for left, right, capacity in tight_intervals
+                        ):
+                            continue
+                        selected = set(pattern)
+                        duration = min(int(values[index]) for index in pattern)
+                        if size < M:
+                            duration = min(
+                                duration,
+                                idle_capacity // max(1, M - size),
+                            )
+                        for index, value in enumerate(values):
+                            if index not in selected:
+                                duration = min(duration, rows - int(value))
+                        for left, right, capacity in intervals:
+                            selected_count = sum(
+                                left <= index <= right for index in pattern
+                            )
+                            if selected_count < capacity:
+                                slack = (
+                                    rows * capacity
+                                    - (prefix[right + 1] - prefix[left])
+                                )
+                                duration = min(
+                                    duration,
+                                    slack // (capacity - selected_count),
+                                )
+                        if duration <= 0:
+                            continue
+                        proposed = list(values)
+                        for index in pattern:
+                            proposed[index] -= duration
+                        if not remaining_is_possible(proposed, rows - duration):
+                            continue
+                        transition = len(set(previous) ^ set(pattern))
+                        choices.append((
+                            transition, -duration, pattern, duration,
+                            tuple(proposed), rows - duration,
+                        ))
+                choices.sort(key=lambda item: (
+                    item[0], item[1],
+                    sum(
+                        (position + 1 + variant) * (index + 3)
+                        for position, index in enumerate(item[2])
+                    ) % 1009,
+                    item[2],
+                ))
+                for transition, _negative_duration, pattern, duration, proposed, new_rows in choices[:50]:
+                    state_key = (proposed, new_rows, pattern)
+                    if state_key in seen_states:
+                        continue
+                    seen_states.add(state_key)
+                    expanded.append((
+                        burden + transition,
+                        proposed,
+                        new_rows,
+                        pattern,
+                        blocks + [(duration, pattern)],
+                    ))
+            expanded.sort(key=lambda item: (
+                item[0], len(item[4]),
+                -sum(duration * duration for duration, _pattern in item[4]),
+            ))
+            states = expanded[:120]
+            if not states or time.perf_counter() >= deadline:
+                break
+        return None
+
+    def work_patterns_for_horizon(
+        horizon: int, attempt: int,
+    ) -> list[tuple[int, ...]] | None:
+        compact = compact_work_patterns_for_horizon(horizon, attempt)
+        if compact is not None:
+            return compact
+        opening = tuple(
+            bay - 1 for bay in initial_row if int(W[bay - 1]) > 0
+        )
+        if not required.issubset({index + 1 for index in opening}):
+            return None
+        remaining = [int(value) for value in W]
+        for index in opening:
+            remaining[index] -= 1
+        if not remaining_is_possible(remaining, horizon - 1):
+            return None
+
+        rows: list[tuple[int, ...]] = [opening]
+        previous = opening
+        opening_idle = M - len(opening)
+        remaining_idle = horizon * M - total - opening_idle
+        if remaining_idle < 0:
+            return None
+        idle_plan: list[int] = []
+        for offset in range(horizon - 1):
+            before = (offset * remaining_idle) // max(1, horizon - 1)
+            after = ((offset + 1) * remaining_idle) // max(1, horizon - 1)
+            idle_plan.append(after - before)
+        if attempt:
+            shift = attempt % max(1, horizon - 1)
+            idle_plan = idle_plan[shift:] + idle_plan[:shift]
+
+        for time_index in range(1, horizon):
+            if time.perf_counter() >= deadline:
+                return None
+            rows_left = horizon - time_index
+            desired_size = M - idle_plan[time_index - 1]
+            minimum_size = max(1, sum(remaining) - M * (rows_left - 1))
+            candidate_sizes = sorted(
+                range(max(1, minimum_size), M + 1),
+                key=lambda size: (abs(size - desired_size), -size),
+            )
+            choices: list[tuple[tuple[Any, ...], tuple[int, ...], list[int]]] = []
+            for size in candidate_sizes:
+                for pattern in patterns_by_size.get(size, []):
+                    if any(remaining[index] <= 0 for index in pattern):
+                        continue
+                    proposed = list(remaining)
+                    for index in pattern:
+                        proposed[index] -= 1
+                    if not remaining_is_possible(proposed, rows_left - 1):
+                        continue
+                    proportional_error = sum(
+                        (proposed[index] * horizon
+                         - (rows_left - 1) * int(W[index])) ** 2
+                        for index in positive
+                    )
+                    switch_cost = len(set(pattern) ^ set(previous))
+                    rotated = (
+                        positive[attempt % len(positive):]
+                        + positive[:attempt % len(positive)]
+                        if positive else ()
+                    )
+                    tie = tuple(-proposed[index] for index in rotated)
+                    rank = (
+                        abs(size - desired_size), proportional_error,
+                        switch_cost, tie, pattern,
+                    )
+                    choices.append((rank, pattern, proposed))
+                if choices and size == desired_size:
+                    break
+            if not choices:
+                return None
+            choices.sort(key=lambda item: item[0])
+            _rank, selected, remaining = choices[0]
+            rows.append(selected)
+            previous = selected
+        return rows if not any(remaining) else None
+
+    extension_cache: dict[tuple[int, ...], list[tuple[int, ...]]] = {}
+
+    def extensions(pattern: tuple[int, ...]) -> list[tuple[int, ...]]:
+        bays = tuple(index + 1 for index in pattern)
+        if bays not in extension_cache:
+            required_bays = set(bays)
+            extension_cache[bays] = [
+                config for config in legal_configurations
+                if required_bays.issubset(config)
+            ]
+        return extension_cache[bays]
+
+    def decode(pattern_rows: list[tuple[int, ...]]) -> _CandidateSchedule | None:
+        records: list[dict[str, Any] | None] = [None] * len(pattern_rows)
+        idle_counts = [0] * M
+        configuration_frequency: dict[tuple[int, ...], int] = {}
+        option_rows: list[
+            tuple[int, tuple[int, ...], list[tuple[int, ...]], int]
+        ] = []
+        for row_index, pattern in enumerate(pattern_rows):
+            options = list(extensions(pattern))
+            if row_index == 0:
+                options = [config for config in options if config == initial_row]
+            if not options:
+                return None
+            work_bays = {index + 1 for index in pattern}
+            idle_variants = {
+                tuple(q for q, bay in enumerate(config) if bay not in work_bays)
+                for config in options
+            }
+            option_rows.append((row_index, pattern, options, len(idle_variants)))
+
+        # Constrained work patterns must claim their feasible idle identities
+        # first.  A chronological greedy pass lets flexible early rows consume
+        # capacity that a later pattern cannot use, producing avoidable load
+        # imbalance.
+        option_rows.sort(key=lambda item: (
+            0 if item[0] == 0 else 1,
+            item[3], len(item[2]), item[1], item[0],
+        ))
+        for row_index, pattern, options, _variant_count in option_rows:
+            ranked: list[tuple[tuple[Any, ...], tuple[int, ...], tuple[int, ...]]] = []
+            work_bays = {index + 1 for index in pattern}
+            for config in options:
+                idle_cranes = tuple(
+                    q for q, bay in enumerate(config) if bay not in work_bays
+                )
+                projected = list(idle_counts)
+                for q in idle_cranes:
+                    projected[q] += 1
+                rank = (
+                    max(projected, default=0),
+                    sum(value * value for value in projected),
+                    -configuration_frequency.get(config, 0),
+                    config,
+                )
+                ranked.append((rank, config, idle_cranes))
+            ranked.sort(key=lambda item: item[0])
+            _rank, config, idle_cranes = ranked[0]
+            for q in idle_cranes:
+                idle_counts[q] += 1
+            configuration_frequency[config] = configuration_frequency.get(config, 0) + 1
+            records[row_index] = {
+                "config": config,
+                "work": tuple(index + 1 for index in pattern),
+                "idle_cranes": idle_cranes,
+            }
+            stats["configuration_extensions"] += 1
+
+        if any(record is None for record in records):
+            return None
+        completed_records = [record for record in records if record is not None]
+        opening = completed_records[0]
+        remaining_records = list(completed_records[1:])
+        full_indices = [
+            index for index, record in enumerate(remaining_records)
+            if len(record["work"]) == M
+        ]
+        terminal = None
+        if full_indices:
+            terminal_index = min(
+                full_indices,
+                key=lambda index: sum(
+                    before != after
+                    for before, after in zip(
+                        remaining_records[index]["config"], opening["config"]
+                    )
+                ),
+            )
+            terminal = remaining_records.pop(terminal_index)
+
+        movement_ordered = [opening]
+        current = opening["config"]
+        last_idle: tuple[int, ...] = ()
+        while remaining_records:
+            best_index = min(
+                range(len(remaining_records)),
+                key=lambda index: (
+                    sum(
+                        before != after
+                        for before, after in zip(
+                            current, remaining_records[index]["config"]
+                        )
+                    ),
+                    int(
+                        bool(last_idle)
+                        and remaining_records[index]["idle_cranes"] == last_idle
+                    ),
+                    -configuration_frequency.get(
+                        remaining_records[index]["config"], 0
+                    ),
+                    remaining_records[index]["config"],
+                    remaining_records[index]["work"],
+                ),
+            )
+            record = remaining_records.pop(best_index)
+            movement_ordered.append(record)
+            current = record["config"]
+            last_idle = record["idle_cranes"]
+        if terminal is not None:
+            movement_ordered.append(terminal)
+
+        # A second ordering preserves each compact work-pattern run.  Within a
+        # run, equal configurations are grouped and configuration changes are
+        # monotone, so a crane does not leave a bay merely to return to it a
+        # few rows later because of the global nearest-neighbour tour.
+        continuity_ordered = [opening]
+        index = 1
+        current = opening["config"]
+        while index < len(completed_records):
+            end = index + 1
+            work = completed_records[index]["work"]
+            while (
+                end < len(completed_records)
+                and completed_records[end]["work"] == work
+            ):
+                end += 1
+            run = list(completed_records[index:end])
+            while run:
+                next_config = min(
+                    {record["config"] for record in run},
+                    key=lambda config: (
+                        sum(
+                            before != after
+                            for before, after in zip(current, config)
+                        ),
+                        config,
+                    ),
+                )
+                same = [record for record in run if record["config"] == next_config]
+                continuity_ordered.extend(same)
+                run = [record for record in run if record["config"] != next_config]
+                current = next_config
+            index = end
+        if len(continuity_ordered[-1]["work"]) < M:
+            full_index = next(
+                (
+                    index for index in range(len(continuity_ordered) - 2, 0, -1)
+                    if len(continuity_ordered[index]["work"]) == M
+                ),
+                None,
+            )
+            if full_index is not None:
+                continuity_ordered.append(continuity_ordered.pop(full_index))
+
+        def continuity_beam_order() -> list[dict[str, Any]] | None:
+            """Order compressed row groups while penalizing reopened work."""
+            opening_key = (
+                opening["config"], opening["work"], opening["idle_cranes"]
+            )
+            grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+            for record in completed_records[1:]:
+                key = (
+                    record["config"], record["work"], record["idle_cranes"]
+                )
+                grouped.setdefault(key, []).append(record)
+            # If the opening row occurs again, keep its remaining copies as a
+            # normal block that the beam can place immediately after t=0.
+            groups = [
+                {
+                    "records": values,
+                    "config": key[0],
+                    "work": key[1],
+                    "active": frozenset(
+                        (q, bay)
+                        for q, bay in enumerate(key[0])
+                        if bay in set(key[1])
+                    ),
+                }
+                for key, values in grouped.items()
+            ]
+            if not groups or len(groups) > 22:
+                return None
+            opening_active = frozenset(
+                (q, bay)
+                for q, bay in enumerate(opening["config"])
+                if bay in set(opening["work"])
+            )
+            full_mask = (1 << len(groups)) - 1
+            # (reopens, moves, mask, last, closed, path)
+            states: list[tuple[Any, ...]] = [
+                (0, 0, 0, -1, frozenset(), tuple())
+            ]
+            beam_width = 6000
+            for depth in range(len(groups)):
+                next_states: dict[tuple[Any, ...], tuple[Any, ...]] = {}
+                for reopens, moves, mask, last, closed, path in states:
+                    previous_config = (
+                        opening["config"] if last < 0
+                        else groups[last]["config"]
+                    )
+                    previous_active = (
+                        opening_active if last < 0
+                        else groups[last]["active"]
+                    )
+                    for index, group in enumerate(groups):
+                        bit = 1 << index
+                        if mask & bit:
+                            continue
+                        if depth == len(groups) - 1 and len(group["work"]) < M:
+                            continue
+                        active = group["active"]
+                        new_reopens = reopens + len(active & closed)
+                        new_moves = moves + sum(
+                            before != after
+                            for before, after in zip(
+                                previous_config, group["config"]
+                            )
+                        )
+                        new_closed = closed | (previous_active - active)
+                        new_mask = mask | bit
+                        new_path = path + (index,)
+                        key = (new_mask, index, new_closed)
+                        item = (
+                            new_reopens, new_moves, new_mask, index,
+                            new_closed, new_path,
+                        )
+                        old = next_states.get(key)
+                        if old is None or item[:2] < old[:2]:
+                            next_states[key] = item
+                states = sorted(
+                    next_states.values(),
+                    key=lambda item: (
+                        item[0], item[1],
+                        -len(groups[item[3]]["active"] & item[4]),
+                        item[5],
+                    ),
+                )[:beam_width]
+                if not states or time.perf_counter() >= deadline:
+                    return None
+            complete = [state for state in states if state[2] == full_mask]
+            if not complete:
+                return None
+            best_state = min(complete, key=lambda item: item[:2])
+            ordered = [opening]
+            for group_index in best_state[5]:
+                ordered.extend(groups[group_index]["records"])
+            return ordered
+
+        beam_ordered = continuity_beam_order()
+
+        def build_candidate(
+            ordered: Sequence[dict[str, Any]],
+        ) -> _CandidateSchedule | None:
+            history = [tuple(record["config"]) for record in ordered]
+            history.append(history[-1])
+            work_plan: dict[tuple[int, int], int | None] = {}
+            for time_index, record in enumerate(ordered):
+                work_bays = set(record["work"])
+                for q, bay in enumerate(record["config"]):
+                    work_plan[(time_index, q)] = (
+                        bay if bay in work_bays else None
+                    )
+            try:
+                candidate = _candidate_from_rows_and_work_plan(
+                    W, M, history, work_plan
+                )
+            except (RuntimeError, ValueError):
+                return None
+            stats["decoded"] += 1
+            candidate = _normalize_completed_candidate(candidate)
+            if not _candidate_passes_independent_verifier(
+                W, M, starts, candidate
+            ):
+                return None
+            stats["verified"] += 1
+            return candidate
+
+        candidates = [
+            candidate
+            for candidate in (
+                build_candidate(movement_ordered),
+                build_candidate(continuity_ordered),
+                build_candidate(beam_ordered) if beam_ordered is not None else None,
+            )
+            if candidate is not None
+        ]
+        # Feed the lowest-move skeleton into the existing fixed-horizon polish;
+        # continuity-aware synchronization is applied after that polish.  An
+        # early continuity choice can trap the later search at a worse K.
+        return min(candidates, key=lambda item: item.objective_key) if candidates else None
+
+    best: _CandidateSchedule | None = None
+    for horizon in range(lower_bound, source.completion_time):
+        stats["target_horizons"].append(horizon)
+        for attempt in range(max_attempts_per_horizon):
+            if time.perf_counter() >= deadline:
+                stats.update({"status": "UNKNOWN_DEADLINE", "stop_reason": "deadline"})
+                return best, stats
+            stats["attempts"] += 1
+            pattern_rows = work_patterns_for_horizon(horizon, attempt)
+            if pattern_rows is None:
+                continue
+            stats["rows_selected"] += len(pattern_rows)
+            candidate = decode(pattern_rows)
+            if candidate is None or candidate.objective_key >= source.objective_key:
+                continue
+            if best is None or _recommended_schedule_rank(
+                candidate, M
+            ) < _recommended_schedule_rank(best, M):
+                best = candidate
+        if best is not None and best.completion_time == horizon:
+            stats.update({
+                "status": "FOUND",
+                "best_objective": list(best.objective_key),
+                "best_loads": list(best.loads),
+                "best_balance": _balanced_schedule_metrics(best, M),
+                "stop_reason": "lower_horizon_verified",
+            })
+            return best, stats
+    if best is None and stats["status"] == "NOT_RUN":
+        stats.update({"status": "NO_CANDIDATE", "stop_reason": "bounded_search_exhausted"})
+    return best, stats
+
+
+def _global_balanced_assignment_search(
+    W: Sequence[int],
+    M: int,
+    starts: Sequence[int],
+    source: _CandidateSchedule,
+    deadline: float,
+    *,
+    max_partitions: int = 48,
+    max_timing_variants: int = 96,
+) -> tuple[_CandidateSchedule | None, dict[str, Any]]:
+    """Build globally rebalanced, monotone work plans and schedule their phases.
+
+    Work is viewed as one ordered sequence of bay-work units.  Candidate crane
+    assignments cut that sequence into contiguous segments, so a bay can be
+    shared only by adjacent cranes and at most two cranes.  A small beam
+    explores balanced cut positions; a second bounded search tries leading
+    waits that can resolve event-time safety conflicts.  Complete schedules
+    are independently verified before they are returned.
+
+    This operator is independent of source revisits and source work blocks.
+    It is intended to supply a new global skeleton when local repair has no
+    useful defect to focus on.
+    """
+    total = sum(int(value) for value in W)
+    workload_lower_bound = max(
+        max(W, default=0),
+        math.ceil(total / max(1, M)),
+    )
+    stats: dict[str, Any] = {
+        "status": "NOT_RUN",
+        "workload_lower_bound": workload_lower_bound,
+        "target_horizons": [],
+        "partition_states": 0,
+        "partitions_tested": 0,
+        "timing_variants_tested": 0,
+        "schedules_decoded": 0,
+        "schedules_verified": 0,
+        "best_objective": None,
+        "best_loads": None,
+        "stop_reason": None,
+    }
+    if source.move_time != 0:
+        stats.update({"status": "UNSUPPORTED", "stop_reason": "nonzero_move_time"})
+        return None, stats
+    if M <= 0 or total <= 0 or not source.slots:
+        stats.update({"status": "NO_CANDIDATE", "stop_reason": "empty_instance"})
+        return None, stats
+    if max_partitions <= 0 or max_timing_variants <= 0:
+        stats.update({"status": "UNKNOWN_STATE_LIMIT", "stop_reason": "zero_search_limit"})
+        return None, stats
+
+    N = len(W)
+    source_rows = _candidate_position_rows(source, M)
+    initial_row = tuple(source_rows[0])
+    eligibility = _bay_eligibility(N, M, [])
+    mandatory_start_by_crane: dict[int, int] = {}
+    for bay in starts:
+        if bay not in initial_row:
+            stats.update({
+                "status": "NO_CANDIDATE",
+                "stop_reason": f"required_start_missing_from_source:{bay}",
+            })
+            return None, stats
+        crane = initial_row.index(bay)
+        if W[bay - 1] <= 0 or crane in mandatory_start_by_crane:
+            stats.update({
+                "status": "NO_CANDIDATE",
+                "stop_reason": f"invalid_required_start:{bay}",
+            })
+            return None, stats
+        mandatory_start_by_crane[crane] = int(bay)
+
+    # Reserve the source schedule's mandatory first work slot at each start bay,
+    # then rebalance all remaining work globally.
+    mandatory_work_by_bay = {bay: crane for crane, bay in mandatory_start_by_crane.items()}
+    remaining_work = [
+        int(amount) - int(index + 1 in mandatory_work_by_bay)
+        for index, amount in enumerate(W)
+    ]
+    if any(amount < 0 for amount in remaining_work):
+        stats.update({"status": "NO_CANDIDATE", "stop_reason": "invalid_required_start_work"})
+        return None, stats
+    residual_total = sum(remaining_work)
+    mandatory_loads = [int(crane in mandatory_start_by_crane) for crane in range(M)]
+    prefix = [0]
+    for amount in remaining_work:
+        prefix.append(prefix[-1] + amount)
+
+    def bay_for_unit(unit: int) -> int:
+        index = bisect.bisect_right(prefix, unit) - 1
+        while index < N and remaining_work[index] <= 0:
+            index += 1
+        if not 0 <= index < N:
+            raise ValueError(f"作业单位索引越界：{unit}")
+        return index + 1
+
+    def split_bay(cut: int) -> int | None:
+        if cut <= 0 or cut >= residual_total:
+            return None
+        index = bisect.bisect_right(prefix, cut) - 1
+        if 0 <= index < N and prefix[index] < cut < prefix[index + 1]:
+            return index + 1
+        return None
+
+    def segment_is_eligible(crane: int, left: int, right: int) -> bool:
+        if right <= left:
+            return True
+        first_bay = bay_for_unit(left)
+        last_bay = bay_for_unit(right - 1)
+        return all(
+            remaining_work[index] <= 0 or crane in eligibility[index]
+            for index in range(first_bay - 1, last_bay)
+        )
+
+    def candidate_cuts(left: int, low: int, high: int, ideal: int) -> list[int]:
+        if high - low <= 256:
+            return list(range(low, high + 1))
+        values = {low, high, min(high, max(low, ideal))}
+        for delta in (1, 2, 4, 8, 16, 32, 64, 128, 256):
+            values.add(min(high, max(low, ideal - delta)))
+            values.add(min(high, max(low, ideal + delta)))
+        for boundary in prefix[1:-1]:
+            if low <= boundary <= high:
+                values.add(boundary)
+            for neighbor in (boundary - 1, boundary + 1):
+                if low <= neighbor <= high:
+                    values.add(neighbor)
+        return sorted(values)
+
+    def partition_candidates(horizon: int) -> list[tuple[int, ...]]:
+        # State: end cuts (the previous crane's cumulative work boundary),
+        # interior bay cuts already used, and their score.
+        beam: list[tuple[tuple[int, ...], frozenset[int]]] = [((), frozenset())]
+        for crane in range(M):
+            remaining_cranes = M - crane - 1
+            expanded: list[tuple[tuple[int, ...], frozenset[int], tuple[Any, ...]]] = []
+            for cuts, split_bays in beam:
+                left = cuts[-1] if cuts else 0
+                next_capacity = sum(
+                    max(0, horizon - mandatory_loads[index])
+                    for index in range(crane + 1, M)
+                )
+                crane_capacity = max(0, horizon - mandatory_loads[crane])
+                low = max(left, residual_total - next_capacity)
+                high = min(residual_total, left + crane_capacity)
+                if crane == M - 1:
+                    low = high = residual_total
+                if low > high:
+                    continue
+                ideal = round(total * (crane + 1) / M) - sum(mandatory_loads[:crane + 1])
+                ideal = min(residual_total, max(0, ideal))
+                for right in candidate_cuts(left, low, high, ideal):
+                    stats["partition_states"] += 1
+                    if right - left > crane_capacity or not segment_is_eligible(crane, left, right):
+                        continue
+                    split = split_bay(right)
+                    if split is not None and split in split_bays:
+                        continue
+                    new_splits = split_bays | ({split} if split is not None else set())
+                    new_cuts = cuts + (right,)
+                    loads = [
+                        new_cuts[index] - (new_cuts[index - 1] if index else 0)
+                        for index in range(len(new_cuts))
+                    ]
+                    full_loads = [
+                        load + mandatory_loads[index]
+                        for index, load in enumerate(loads)
+                    ]
+                    balance = sum((M * load - total) ** 2 for load in full_loads)
+                    ideal_deviation = sum(
+                        abs(
+                            new_cuts[index] + sum(mandatory_loads[:index + 1])
+                            - round(total * (index + 1) / M)
+                        )
+                        for index in range(len(new_cuts))
+                    )
+                    rank = (
+                        max(full_loads, default=0), balance, len(new_splits),
+                        ideal_deviation, new_cuts,
+                    )
+                    expanded.append((new_cuts, frozenset(new_splits), rank))
+            if not expanded:
+                return []
+            expanded.sort(key=lambda item: item[2])
+            kept: list[tuple[tuple[int, ...], frozenset[int]]] = []
+            seen: set[tuple[int, ...]] = set()
+            for cuts, splits, _rank in expanded:
+                if cuts in seen:
+                    continue
+                seen.add(cuts)
+                kept.append((cuts, splits))
+                if len(kept) >= max_partitions:
+                    break
+            beam = kept
+        if residual_total == 0:
+            return [tuple(0 for _ in range(M))]
+        return [cuts for cuts, _splits in beam if cuts and cuts[-1] == residual_total]
+
+    def phases_for_cuts(cuts: tuple[int, ...]) -> list[list[tuple[int, int]]]:
+        phases: list[list[tuple[int, int]]] = []
+        left = 0
+        for crane, right in enumerate(cuts):
+            crane_phases: list[tuple[int, int]] = []
+            for index, amount in enumerate(remaining_work):
+                if amount <= 0:
+                    continue
+                overlap = min(right, prefix[index + 1]) - max(left, prefix[index])
+                if overlap > 0:
+                    crane_phases.append((index + 1, overlap))
+            phases.append(crane_phases)
+            left = right
+        owners_by_bay: dict[int, set[int]] = {}
+        for bay, crane in mandatory_work_by_bay.items():
+            owners_by_bay.setdefault(bay, set()).add(crane)
+        for crane, crane_phases in enumerate(phases):
+            for bay, _amount in crane_phases:
+                owners_by_bay.setdefault(bay, set()).add(crane)
+        if any(len(owners) > 2 for owners in owners_by_bay.values()):
+            return []
+        return phases
+
+    def offset_vectors(
+        phases: list[list[tuple[int, int]]], horizon: int,
+    ) -> list[tuple[int, ...]]:
+        choices_by_crane: list[list[int]] = []
+        for crane, crane_phases in enumerate(phases):
+            load = sum(amount for _bay, amount in crane_phases)
+            if not crane_phases:
+                choices_by_crane.append([0])
+                continue
+            first_bay = crane_phases[0][0]
+            earliest_start = 1 if crane in mandatory_start_by_crane else (
+                0 if first_bay == initial_row[crane] else 1
+            )
+            latest_start = horizon - load
+            if latest_start < earliest_start:
+                return []
+            slack = latest_start - earliest_start
+            if slack <= 8:
+                delays = list(range(slack + 1))
+            else:
+                delays = sorted({0, 1, 2, 4, 8, slack})
+            choices_by_crane.append([earliest_start + delay for delay in delays])
+
+        vectors: list[tuple[int, ...]] = [()]
+        for choices in choices_by_crane:
+            expanded = [vector + (value,) for vector in vectors for value in choices]
+            expanded.sort(key=lambda vector: (sum(vector), vector))
+            vectors = expanded[:max_timing_variants]
+        return vectors
+
+    lower_targets = [workload_lower_bound]
+    gap = max(0, source.completion_time - workload_lower_bound)
+    if gap:
+        for delta in (1, 2, 4, 8, 16, 32, max(1, gap // 4),
+                      max(1, gap // 2), gap - 1):
+            target = workload_lower_bound + delta
+            if target < source.completion_time:
+                lower_targets.append(target)
+    targets = sorted(set(lower_targets))
+    stats["target_horizons"] = targets
+
+    best: _CandidateSchedule | None = None
+    for horizon in targets:
+        if time.perf_counter() >= deadline:
+            stats.update({"status": "UNKNOWN_DEADLINE", "stop_reason": "deadline"})
+            break
+        partitions = partition_candidates(horizon)
+        if not partitions:
+            continue
+        candidates_for_horizon: list[_CandidateSchedule] = []
+        for cuts in partitions:
+            if time.perf_counter() >= deadline:
+                stats.update({"status": "UNKNOWN_DEADLINE", "stop_reason": "deadline"})
+                break
+            stats["partitions_tested"] += 1
+            phases = phases_for_cuts(cuts)
+            if not phases:
+                continue
+            for offsets in offset_vectors(phases, horizon):
+                if time.perf_counter() >= deadline:
+                    stats.update({"status": "UNKNOWN_DEADLINE", "stop_reason": "deadline"})
+                    break
+                stats["timing_variants_tested"] += 1
+                rows: list[tuple[int, ...]] = []
+                work_plan: dict[tuple[int, int], int | None] = {}
+                for time_index in range(horizon):
+                    row: list[int] = []
+                    for crane, crane_phases in enumerate(phases):
+                        phase_start = offsets[crane]
+                        if time_index == 0 and crane in mandatory_start_by_crane:
+                            position = initial_row[crane]
+                            bay = mandatory_start_by_crane[crane]
+                        elif time_index < phase_start or not crane_phases:
+                            position = initial_row[crane]
+                            bay = None
+                        else:
+                            elapsed = time_index - phase_start
+                            phase_end = 0
+                            position = crane_phases[-1][0]
+                            bay = None
+                            for phase_bay, amount in crane_phases:
+                                phase_end += amount
+                                if elapsed < phase_end:
+                                    position = phase_bay
+                                    bay = phase_bay
+                                    break
+                        row.append(position)
+                        work_plan[(time_index, crane)] = bay
+                    rows.append(tuple(row))
+                if not rows or rows[0] != initial_row:
+                    continue
+                first_work = {
+                    bay for (time_index, _crane), bay in work_plan.items()
+                    if time_index == 0 and bay is not None
+                }
+                if not set(starts).issubset(first_work):
+                    continue
+                if any(
+                    any(right - left < 2 for left, right in zip(row, row[1:]))
+                    for row in rows
+                ):
+                    continue
+                rows.append(rows[-1])
+                try:
+                    candidate = _candidate_from_rows_and_work_plan(
+                        W, M, rows, work_plan
+                    )
+                except (RuntimeError, ValueError):
+                    continue
+                stats["schedules_decoded"] += 1
+                candidate = _normalize_completed_candidate(candidate)
+                if not _candidate_passes_independent_verifier(W, M, starts, candidate):
+                    continue
+                stats["schedules_verified"] += 1
+                if candidate.objective_key >= source.objective_key:
+                    continue
+                candidates_for_horizon.append(candidate)
+                if len(candidates_for_horizon) >= 16:
+                    break
+            if stats["status"] == "UNKNOWN_DEADLINE" or len(candidates_for_horizon) >= 16:
+                break
+        if candidates_for_horizon:
+            candidates_for_horizon.sort(key=lambda item: (
+                item.objective_key,
+                _execution_rank(item, M),
+            ))
+            best = candidates_for_horizon[0]
+            stats.update({
+                "status": "FOUND",
+                "best_objective": list(best.objective_key),
+                "best_loads": list(best.loads),
+                "stop_reason": "target_feasible",
+            })
+            break
+        if stats["status"] == "UNKNOWN_DEADLINE":
+            break
+
+    if best is None and stats["status"] not in {"UNKNOWN_DEADLINE", "UNSUPPORTED"}:
+        stats.update({"status": "NO_CANDIDATE", "stop_reason": "bounded_search_exhausted"})
+    return best, stats
+
+
 def _cumulative_local_trajectory_repair_iterative(
     W: Sequence[int],
     M: int,
@@ -4590,11 +10708,22 @@ def _cumulative_local_trajectory_repair_iterative(
     enable_operational_repairs: bool = True,
     preserve_horizon: bool = False,
     enable_work_transfer: bool = False,
+    enable_fragmentation_repair: bool = False,
+    enable_cyclic_exchange: bool = True,
+    enable_phase_resequence: bool = True,
+    enable_phase_closure: bool = True,
+    enable_cross_crane_phase_relay: bool = False,
+    enable_idle_capacity_rebalance: bool = False,
+    enable_forced_prefix_consolidation: bool = True,
+    local_state_limit: int = 256,
     protect_source_continuity: bool = False,
     strict_local_transactions: bool = False,
     source_hash: str | None = None,
     use_legacy_seed: bool = False,
     enable_multi_relay: bool = True,
+    execution_pool_sort: bool = True,
+    enable_global_rebalance: bool = True,
+    local_windows_only: bool = False,
 ) -> tuple[
     _CandidateSchedule | None, int, _CandidateSchedule, _CandidateSchedule | None
 ]:
@@ -4607,6 +10736,11 @@ def _cumulative_local_trajectory_repair_iterative(
     budget.  No call changes the declared local-window contract.
     """
     started = time.perf_counter()
+    if local_windows_only:
+        # Strict local mode keeps every mutation inside the critical-window
+        # and adjacent-crane transaction families.  In particular it disables
+        # global pattern reconstruction and the full-horizon post-processes.
+        enable_global_rebalance = False
     if move_time != 0:
         if continuity_output is not None:
             continuity_output.update({
@@ -4617,10 +10751,8 @@ def _cumulative_local_trajectory_repair_iterative(
             })
         return None, 0, incumbent, None
 
-    safe_lower_bound = max(
-        max(W, default=0),
-        math.ceil(sum(W) / max(1, M)),
-    )
+    incumbent = _normalize_completed_candidate(incumbent)
+    safe_lower_bound = _congestion_workload_lower_bound(W, M)
     current = incumbent
     prepared = incumbent
     evaluated_total = 0
@@ -4629,17 +10761,22 @@ def _cumulative_local_trajectory_repair_iterative(
     formal_best = incumbent
     continuity_best = incumbent
     operational_best = incumbent
+    execution_best = incumbent
+    balanced_best = incumbent
+    recommended_best = incumbent
+    compression_best = incumbent
     candidate_pool: list[_CandidateSchedule] = [incumbent]
     descent_history: list[dict[str, Any]] = []
     round_index = 0
     stale_rounds = 0
     stop_reason = "deadline"
+    descent_fraction = (
+        0.55 if local_windows_only
+        else (0.85 if enable_phase_closure else 0.90)
+    )
     descent_phase_deadline = min(
         deadline,
-        # Borrow the quality reserve when no shorter horizon has been found;
-        # a difficult H-1 target should receive enough complete window rounds
-        # to be comparable with the former one-shot trajectory search.
-        started + 0.90 * max(0.0, deadline - started),
+        started + descent_fraction * max(0.0, deadline - started),
     )
 
     def add_pool(item: _CandidateSchedule) -> None:
@@ -4651,49 +10788,90 @@ def _cumulative_local_trajectory_repair_iterative(
                     candidate_pool[index] = item
                 return
         candidate_pool.append(item)
-        candidate_pool.sort(key=lambda value: (
-            value.makespan, value.objective_key, _operational_rank(value, M),
+        ranked = sorted(candidate_pool, key=lambda value: (
+            (
+                _execution_rank(value, M)
+                if execution_pool_sort else
+                (value.completion_time, value.objective_key, _operational_rank(value, M))
+            ),
+            value.objective_key,
         ))
-        candidate_pool = candidate_pool[:16]
+        if execution_pool_sort:
+            protected = [
+                formal_best, execution_best, balanced_best,
+                recommended_best, compression_best,
+            ]
+            kept: dict[tuple[Any, ...], _CandidateSchedule] = {}
+            for champion in protected:
+                signature = _trajectory_signature(champion)
+                kept[signature] = champion
+            for value in ranked:
+                if len(kept) >= 16:
+                    break
+                kept.setdefault(_trajectory_signature(value), value)
+            candidate_pool = sorted(kept.values(), key=lambda value: (
+                _execution_rank(value, M), value.objective_key,
+            ))
+        else:
+            candidate_pool = ranked[:16]
 
     def preparation_score(item: _CandidateSchedule) -> tuple[int, ...]:
         """Score a same-H state by its ability to lose the next row."""
         return tuple(_shortening_potential(W, M, item)[0])
 
     def register(item: _CandidateSchedule, phase: str) -> None:
-        nonlocal formal_best, continuity_best, operational_best, first_feasible
-        if item.makespan not in first_by_h:
-            first_by_h[item.makespan] = item
-            if item.makespan < incumbent.makespan and first_feasible is None:
+        nonlocal formal_best, continuity_best, operational_best, execution_best, balanced_best, recommended_best, compression_best, first_feasible
+        workload = [0] * len(W)
+        for slot in item.slots:
+            if slot.state == "work" and slot.work_bay is not None:
+                workload[int(slot.work_bay) - 1] += 1
+        if workload != list(W):
+            return
+        completion = item.completion_time
+        if completion not in first_by_h:
+            first_by_h[completion] = item
+            if completion < incumbent.completion_time and first_feasible is None:
                 first_feasible = item
             if attempt_trace is not None:
                 attempt_trace.append({
-                    "phase": "first_feasible_by_h",
-                    "horizon": item.makespan,
+                    "phase": "first_feasible_by_completion_time",
+                    "completion_time": completion,
+                    "schedule_horizon": item.schedule_horizon,
                     "source_phase": phase,
                     "time_from_start": round(time.perf_counter() - started, 6),
                     "objective": list(item.objective_key),
                 })
         if item.objective_key < formal_best.objective_key:
             formal_best = item
-        if (
-            item.makespan < continuity_best.makespan
-            or item.makespan == continuity_best.makespan
-            and _continuity_rank(item, M) < _continuity_rank(continuity_best, M)
-        ):
+        if _continuity_rank(item, M) < _continuity_rank(continuity_best, M):
             continuity_best = item
-        if (
-            item.makespan < operational_best.makespan
-            or item.makespan == operational_best.makespan
-            and _operational_rank(item, M) < _operational_rank(operational_best, M)
-        ):
+        if _operational_rank(item, M) < _operational_rank(operational_best, M):
             operational_best = item
+        if _execution_rank(item, M) < _execution_rank(execution_best, M):
+            execution_best = item
+        if _balanced_schedule_metrics(item, M)["key"] < _balanced_schedule_metrics(
+            balanced_best, M
+        )["key"]:
+            balanced_best = item
+        if _recommended_schedule_rank(item, M) < _recommended_schedule_rank(
+            recommended_best, M
+        ):
+            recommended_best = item
+        item_compression_rank = (
+            tuple(_shortening_potential(W, M, item)[0]), item.completion_time,
+        )
+        champion_compression_rank = (
+            tuple(_shortening_potential(W, M, compression_best)[0]),
+            compression_best.completion_time,
+        )
+        if item_compression_rank < champion_compression_rank:
+            compression_best = item
         add_pool(item)
 
     def polish(item: _CandidateSchedule, seconds: float) -> _CandidateSchedule:
         nonlocal evaluated_total, first_feasible
         if not enable_operational_repairs or seconds <= 0.05:
-            return item
+            return _normalize_completed_candidate(item)
         details: dict[str, Any] = {}
         local_deadline = min(deadline, time.perf_counter() + seconds)
         polished, evaluated = _refine_same_horizon_trajectory(
@@ -4704,6 +10882,18 @@ def _cumulative_local_trajectory_repair_iterative(
             continuity=True,
             result_box=details,
             enable_work_transfer=enable_work_transfer,
+            enable_fragmentation_repair=enable_fragmentation_repair,
+            enable_cyclic_exchange=enable_cyclic_exchange,
+            enable_phase_resequence=(
+                enable_phase_resequence and not local_windows_only
+            ),
+            enable_phase_closure=(enable_phase_closure and not local_windows_only),
+            enable_cross_crane_phase_relay=(
+                enable_cross_crane_phase_relay and not local_windows_only
+            ),
+            enable_idle_capacity_rebalance=enable_idle_capacity_rebalance,
+            enable_forced_prefix_consolidation=enable_forced_prefix_consolidation,
+            local_state_limit=local_state_limit,
             protect_source_continuity=protect_source_continuity,
             strict_local_transactions=strict_local_transactions,
             source_hash=source_hash,
@@ -4713,22 +10903,44 @@ def _cumulative_local_trajectory_repair_iterative(
         formal = details.get("formal_best", polished)
         continuity = details.get("continuity_best", polished)
         operational = details.get("operational_best", polished)
+        execution = details.get("execution_best", operational)
+        balanced = details.get("balanced_best", execution)
         for value, phase in (
             (formal, "polish_formal"),
             (continuity, "polish_continuity"),
             (operational, "polish_operational"),
+            (execution, "polish_execution"),
+            (balanced, "polish_balanced"),
         ):
             register(value, phase)
-        if first_feasible is None and item.makespan < incumbent.makespan:
+        if (
+            first_feasible is None
+            and item.completion_time < incumbent.completion_time
+        ):
             first_feasible = item
         if continuity_output is not None:
             continuity_output.setdefault("polish_runs", []).append({
-                "horizon": item.makespan,
+                "completion_time": item.completion_time,
+                "schedule_horizon": item.schedule_horizon,
                 "evaluated": evaluated,
                 "stats": details.get("stats"),
+                "paired_transactions": details.get("paired_transactions", []),
+                "phase_transactions": details.get("phase_transactions", []),
+                "phase_closure_transactions": details.get(
+                    "phase_closure_transactions", []
+                ),
+                "cross_crane_phase_transactions": details.get(
+                    "cross_crane_phase_transactions", []
+                ),
+                "idle_capacity_transactions": details.get(
+                    "idle_capacity_transactions", []
+                ),
+                "forced_prefix_transactions": details.get(
+                    "forced_prefix_transactions", []
+                ),
                 "stop_reason": details.get("stop_reason"),
             })
-        return formal
+        return _normalize_completed_candidate(formal)
 
     def attempt_source(
         source: _CandidateSchedule,
@@ -4801,6 +11013,80 @@ def _cumulative_local_trajectory_repair_iterative(
                     return shortened, best_prepared, evaluated, "window_shorten"
         return None, best_prepared, evaluated, "timeout_or_no_improvement"
 
+    global_rebalance_stats: dict[str, Any] = {
+        "status": "NOT_RUN",
+        "workload_lower_bound": safe_lower_bound,
+        "target_horizons": [],
+        "partition_states": 0,
+        "partitions_tested": 0,
+        "timing_variants_tested": 0,
+        "schedules_decoded": 0,
+        "schedules_verified": 0,
+        "best_objective": None,
+        "best_loads": None,
+        "stop_reason": "disabled_or_not_applicable",
+    }
+    global_gap = current.completion_time - safe_lower_bound
+    if (
+        enable_global_rebalance
+        and move_time == 0
+        and not preserve_horizon
+        and global_gap >= 3
+        and time.perf_counter() < deadline
+    ):
+        global_deadline = min(
+            deadline,
+            started + 0.55 * max(0.0, deadline - started),
+        )
+        pattern_candidate, pattern_stats = _global_safe_pattern_search(
+            W, M, starts, current, global_deadline,
+        )
+        global_candidate = pattern_candidate
+        global_rebalance_stats = {
+            **global_rebalance_stats,
+            "safe_pattern_search": pattern_stats,
+            "status": pattern_stats.get("status", "NOT_RUN"),
+            "workload_lower_bound": safe_lower_bound,
+            "target_horizons": pattern_stats.get("target_horizons", []),
+            "schedules_decoded": pattern_stats.get("decoded", 0),
+            "schedules_verified": pattern_stats.get("verified", 0),
+            "best_objective": pattern_stats.get("best_objective"),
+            "best_loads": pattern_stats.get("best_loads"),
+            "stop_reason": pattern_stats.get("stop_reason"),
+        }
+        if global_candidate is None and time.perf_counter() < global_deadline:
+            global_candidate, legacy_global_stats = _global_balanced_assignment_search(
+                W, M, starts, current, global_deadline,
+            )
+            global_rebalance_stats["monotone_partition_search"] = legacy_global_stats
+            if global_candidate is not None:
+                global_rebalance_stats.update({
+                    "status": legacy_global_stats.get("status"),
+                    "target_horizons": legacy_global_stats.get("target_horizons", []),
+                    "best_objective": legacy_global_stats.get("best_objective"),
+                    "best_loads": legacy_global_stats.get("best_loads"),
+                    "stop_reason": legacy_global_stats.get("stop_reason"),
+                })
+        if global_candidate is not None:
+            register(global_candidate, "global_rebalance")
+            if global_candidate.completion_time < incumbent.completion_time:
+                if first_feasible is None or (
+                    global_candidate.completion_time < first_feasible.completion_time
+                ):
+                    first_feasible = global_candidate
+            if global_candidate.objective_key < current.objective_key:
+                current = global_candidate
+                prepared = global_candidate
+                first_by_h[global_candidate.completion_time] = global_candidate
+            if attempt_trace is not None:
+                attempt_trace.append({
+                    "phase": "global_rebalance",
+                    "time_from_start": round(time.perf_counter() - started, 6),
+                    "objective": list(global_candidate.objective_key),
+                    "loads": list(global_candidate.loads),
+                    "status": global_rebalance_stats.get("status"),
+                })
+
     legacy_seed_used = False
     if (
         use_legacy_seed
@@ -4832,8 +11118,14 @@ def _cumulative_local_trajectory_repair_iterative(
                 "round": round_index,
                 "source_horizons": [incumbent.makespan],
                 "target_horizon": incumbent.makespan - 1,
+                "source_completion_times": [incumbent.completion_time],
+                "source_schedule_horizons": [incumbent.schedule_horizon],
+                "source_normalization_trimmed_slots": incumbent.normalization_trimmed_slots,
+                "target_completion_time": incumbent.completion_time - 1,
                 "result": "FOUND_LEGACY_SEED",
                 "horizon": legacy_shortened.makespan,
+                "result_completion_time": legacy_shortened.completion_time,
+                "movement_count": legacy_shortened.completion_movement_count,
                 "objective": list(legacy_shortened.objective_key),
                 "evaluated": legacy_evaluated,
                 "elapsed_seconds": round(time.perf_counter() - started, 6),
@@ -4854,7 +11146,8 @@ def _cumulative_local_trajectory_repair_iterative(
             and current.makespan > safe_lower_bound
         ):
             source_pool = sorted(
-                candidate_pool,
+                [item for item in candidate_pool
+                 if item.completion_time == current.completion_time],
                 key=lambda item: (
                     item.makespan,
                     item.objective_key,
@@ -4864,9 +11157,7 @@ def _cumulative_local_trajectory_repair_iterative(
             # One source gets a complete round.  Dividing a 20-second round
             # across all elite alternatives made each of the 48 bounded
             # windows too short to reproduce the old trajectory search.
-            sources = [
-                source_pool[round_index % len(source_pool)]
-            ] if source_pool else [current]
+            sources = [source_pool[round_index % len(source_pool)]] if source_pool else [current]
             remaining = descent_phase_deadline - time.perf_counter()
             round_deadline = min(
                 descent_phase_deadline,
@@ -4887,7 +11178,10 @@ def _cumulative_local_trajectory_repair_iterative(
                 round_evaluated += evaluated
                 if preparation_score(prepared_candidate) < preparation_score(best_prepared):
                     best_prepared = prepared_candidate
-                if proposed is not None and proposed.makespan < source.makespan:
+                if (
+                    proposed is not None
+                    and proposed.completion_time < current.completion_time
+                ):
                     found = proposed
                     break
             evaluated_total += round_evaluated
@@ -4905,7 +11199,18 @@ def _cumulative_local_trajectory_repair_iterative(
                     "round": round_index,
                     "source_horizons": [item.makespan for item in sources],
                     "target_horizon": min((item.makespan for item in sources), default=current.makespan) - 1,
+                    "source_completion_times": [item.completion_time for item in sources],
+                    "source_schedule_horizons": [item.schedule_horizon for item in sources],
+                    "source_normalization_trimmed_slots": [
+                        item.normalization_trimmed_slots for item in sources
+                    ],
+                    "target_completion_time": min(
+                        (item.completion_time for item in sources),
+                        default=current.completion_time,
+                    ) - 1,
                     "result": "PREPARED_NO_SHORTENING" if preparation_progress else "NO_IMPROVEMENT",
+                    "result_completion_time": formal_best.completion_time,
+                    "movement_count": formal_best.completion_movement_count,
                     "reason": reason,
                     "evaluated": round_evaluated,
                     "elapsed_seconds": round(time.perf_counter() - started, 6),
@@ -4938,8 +11243,17 @@ def _cumulative_local_trajectory_repair_iterative(
                 "round": round_index,
                 "source_horizons": [item.makespan for item in sources],
                 "target_horizon": previous_h - 1,
+                "source_completion_times": [item.completion_time for item in sources],
+                "source_schedule_horizons": [item.schedule_horizon for item in sources],
+                "source_normalization_trimmed_slots": [
+                    item.normalization_trimmed_slots for item in sources
+                ],
+                "source_completion_time": previous_h,
+                "target_completion_time": previous_h - 1,
                 "result": "FOUND",
                 "horizon": current.makespan,
+                "result_completion_time": current.completion_time,
+                "movement_count": current.completion_movement_count,
                 "objective": list(current.objective_key),
                 "evaluated": round_evaluated,
                 "elapsed_seconds": round(time.perf_counter() - started, 6),
@@ -4955,7 +11269,11 @@ def _cumulative_local_trajectory_repair_iterative(
         shortest_h = min(item.makespan for item in candidate_pool)
         quality_source = min(
             (item for item in candidate_pool if item.makespan == shortest_h),
-            key=lambda item: (_operational_rank(item, M), item.objective_key),
+            key=(
+                (lambda item: (_execution_rank(item, M), item.objective_key))
+                if execution_pool_sort else
+                (lambda item: (_operational_rank(item, M), item.objective_key))
+            ),
             default=current,
         )
         quality = polish(quality_source, max(0.05, deadline - time.perf_counter()))
@@ -4990,8 +11308,12 @@ def _cumulative_local_trajectory_repair_iterative(
         "accepted": 0,
         "formal_improvements": 0,
         "operational_improvements": 0,
+        "execution_improvements": 0,
+        "balanced_improvements": 0,
+        "pure_sync_delay_rejected": 0,
         "operator": {},
         "continuity_rejected": 0,
+        "continuity_component_rejected": 0,
         "work_transfer": {
             "rounds": 0,
             "generated": 0,
@@ -5003,12 +11325,162 @@ def _cumulative_local_trajectory_repair_iterative(
             "accepted": 0,
             "operators": {},
         },
+        "paired_window_cyclic": {
+            "status": "NOT_RUN",
+            "rounds": 0,
+            "generated": 0,
+            "unique": 0,
+            "expanded_states": 0,
+            "early_window_states": 0,
+            "late_window_states": 0,
+            "capacity_rejected": 0,
+            "safety_rejected": 0,
+            "boundary_rejected": 0,
+            "ledger_rejected": 0,
+            "verified": 0,
+            "accepted": 0,
+            "timeout": 0,
+            "state_limit": 0,
+            "operators": {},
+            "status_counts": {},
+        },
+        "phase_block_resequence": {
+            "status": "NOT_RUN",
+            "rounds": 0,
+            "focus_revisits": 0,
+            "multi_slot_revisits": 0,
+            "active_bands_generated": 0,
+            "phase_permutations_generated": 0,
+            "phase_combinations_tested": 0,
+            "states_expanded": 0,
+            "states_pruned_horizon": 0,
+            "states_pruned_safety": 0,
+            "states_pruned_split": 0,
+            "states_pruned_movement": 0,
+            "complete_phase_plans": 0,
+            "decoded": 0,
+            "verified": 0,
+            "accepted": 0,
+            "rejected_burden_migration": 0,
+            "timeout": 0,
+            "state_limit": 0,
+            "operators": {},
+            "status_counts": {},
+        },
+        "phase_closure_relay": {
+            "status": "NOT_RUN",
+            "rounds": 0,
+            "focus_revisits": 0,
+            "activity_bands_tested": 0,
+            "phase_orders_generated": 0,
+            "event_schedules_generated": 0,
+            "states_expanded": 0,
+            "complete_phase_plans": 0,
+            "ledger_closed": 0,
+            "decoded": 0,
+            "verified": 0,
+            "accepted": 0,
+            "rejected_safety": 0,
+            "rejected_horizon": 0,
+            "rejected_ledger": 0,
+            "timeout": 0,
+            "state_limit": 0,
+            "max_activity_width": 0,
+            "activity_chain_expansions": [],
+            "status_counts": {},
+        },
+        "cross_crane_phase_relay": {
+            "status": "NOT_RUN",
+            "rounds": 0,
+            "focus_revisits": 0,
+            "activity_bands_tested": 0,
+            "assignment_variants_generated": 0,
+            "retimed_plans_generated": 0,
+            "retimed_plans_solved": 0,
+            "owner_change_branches": 0,
+            "two_hop_relay_branches": 0,
+            "complete_phase_plans": 0,
+            "ledger_closed": 0,
+            "states_expanded": 0,
+            "decoded": 0,
+            "verified": 0,
+            "accepted": 0,
+            "rejected_overlap": 0,
+            "rejected_eligibility": 0,
+            "rejected_safety": 0,
+            "rejected_ledger": 0,
+            "rejected_horizon": 0,
+            "timeout": 0,
+            "state_limit": 0,
+            "max_activity_width": 0,
+            "activity_chain_expansions": [],
+            "status_counts": {},
+        },
+        "idle_capacity_rebalance": {
+            "status": "NOT_RUN",
+            "rounds": 0,
+            "focus_revisits": 0,
+            "idle_capacity_focuses": 0,
+            "idle_capacity_chain_focuses": 0,
+            "partial_transfer_focuses": 0,
+            "focuses_without_revisits": 0,
+            "activity_bands_tested": 0,
+            "assignment_variants_generated": 0,
+            "retimed_plans_generated": 0,
+            "retimed_plans_solved": 0,
+            "owner_change_branches": 0,
+            "two_hop_relay_branches": 0,
+            "complete_phase_plans": 0,
+            "ledger_closed": 0,
+            "states_expanded": 0,
+            "decoded": 0,
+            "verified": 0,
+            "accepted": 0,
+            "rejected_overlap": 0,
+            "rejected_eligibility": 0,
+            "rejected_safety": 0,
+            "rejected_ledger": 0,
+            "rejected_horizon": 0,
+            "timeout": 0,
+            "state_limit": 0,
+            "max_activity_width": 0,
+            "activity_chain_expansions": [],
+            "status_counts": {},
+        },
+        "forced_prefix_consolidation": {
+            "status": "NOT_RUN",
+            "rounds": 0,
+            "focus_interruptions": 0,
+            "focuses_started": 0,
+            "focuses_completed": 0,
+            "neighbor_bands_generated": 0,
+            "focus_phase_orders": 0,
+            "neighbor_phase_orders": 0,
+            "idle_placements_tested": 0,
+            "states_expanded": 0,
+            "ledger_closed": 0,
+            "decoded": 0,
+            "verified": 0,
+            "accepted": 0,
+            "rejected_safety": 0,
+            "rejected_ledger": 0,
+            "rejected_burden_migration": 0,
+            "timeout": 0,
+            "state_limit": 0,
+            "status_counts": {},
+        },
     }
     if continuity_output is not None:
         for run in continuity_output.get("polish_runs", []):
             stats = run.get("stats") or {}
             for key in aggregate_stats:
-                if key in {"operator", "work_transfer"}:
+                if key in {
+                    "operator", "work_transfer", "paired_window_cyclic",
+                    "phase_block_resequence", "phase_closure_relay",
+                    "cross_crane_phase_relay",
+                    "idle_capacity_rebalance",
+                    "forced_prefix_consolidation",
+                }:
                     continue
                 if isinstance(stats.get(key), int):
                     aggregate_stats[key] += stats[key]
@@ -5030,12 +11502,354 @@ def _cumulative_local_trajectory_repair_iterative(
                 target_work_stats["operators"][name] = (
                     target_work_stats["operators"].get(name, 0) + int(value)
                 )
+            source_pair_stats = stats.get("paired_window_cyclic") or {}
+            target_pair_stats = aggregate_stats["paired_window_cyclic"]
+            if source_pair_stats.get("status") not in (None, "NOT_RUN"):
+                target_pair_stats["status"] = source_pair_stats["status"]
+            for key in (
+                "rounds", "generated", "unique", "expanded_states",
+                "early_window_states", "late_window_states",
+                "capacity_rejected", "safety_rejected", "boundary_rejected",
+                "ledger_rejected", "verified", "accepted", "timeout",
+                "state_limit",
+            ):
+                if isinstance(source_pair_stats.get(key), int):
+                    target_pair_stats[key] += source_pair_stats[key]
+            for name, value in (source_pair_stats.get("operators") or {}).items():
+                target_pair_stats["operators"][name] = (
+                    target_pair_stats["operators"].get(name, 0) + int(value)
+                )
+            status = source_pair_stats.get("status")
+            if status is not None:
+                target_pair_stats["status_counts"][status] = (
+                    target_pair_stats["status_counts"].get(status, 0) + 1
+                )
+            source_phase_stats = stats.get("phase_block_resequence") or {}
+            target_phase_stats = aggregate_stats["phase_block_resequence"]
+            if source_phase_stats.get("status") not in (None, "NOT_RUN"):
+                target_phase_stats["status"] = source_phase_stats["status"]
+            for key in (
+                "rounds", "focus_revisits", "multi_slot_revisits",
+                "active_bands_generated", "phase_permutations_generated",
+                "phase_combinations_tested", "states_expanded",
+                "states_pruned_horizon", "states_pruned_safety",
+                "states_pruned_split", "states_pruned_movement",
+                "complete_phase_plans", "decoded", "verified", "accepted",
+                "rejected_burden_migration", "timeout", "state_limit",
+            ):
+                if isinstance(source_phase_stats.get(key), int):
+                    target_phase_stats[key] += source_phase_stats[key]
+            for name, value in (source_phase_stats.get("operators") or {}).items():
+                target_phase_stats["operators"][name] = (
+                    target_phase_stats["operators"].get(name, 0) + int(value)
+                )
+            phase_status = source_phase_stats.get("status")
+            if phase_status is not None:
+                target_phase_stats["status_counts"][phase_status] = (
+                    target_phase_stats["status_counts"].get(phase_status, 0) + 1
+                )
+            source_closure_stats = stats.get("phase_closure_relay") or {}
+            target_closure_stats = aggregate_stats["phase_closure_relay"]
+            if source_closure_stats.get("status") not in (None, "NOT_RUN"):
+                target_closure_stats["status"] = source_closure_stats["status"]
+            for key in (
+                "rounds", "focus_revisits", "activity_bands_tested",
+                "phase_orders_generated", "event_schedules_generated",
+                "states_expanded", "complete_phase_plans", "ledger_closed",
+                "decoded", "verified", "accepted", "rejected_safety",
+                "rejected_horizon", "rejected_ledger", "timeout",
+                "state_limit", "max_activity_width",
+            ):
+                if isinstance(source_closure_stats.get(key), int):
+                    if key == "max_activity_width":
+                        target_closure_stats[key] = max(
+                            target_closure_stats[key],
+                            source_closure_stats[key],
+                        )
+                    else:
+                        target_closure_stats[key] += source_closure_stats[key]
+            target_closure_stats["activity_chain_expansions"].extend(
+                source_closure_stats.get("activity_chain_expansions", [])
+            )
+            closure_status = source_closure_stats.get("status")
+            if closure_status is not None:
+                target_closure_stats["status_counts"][closure_status] = (
+                    target_closure_stats["status_counts"].get(closure_status, 0) + 1
+                )
+            source_relay_stats = stats.get("cross_crane_phase_relay") or {}
+            target_relay_stats = aggregate_stats["cross_crane_phase_relay"]
+            if source_relay_stats.get("status") not in (None, "NOT_RUN"):
+                target_relay_stats["status"] = source_relay_stats["status"]
+            for key in (
+                "rounds", "focus_revisits", "activity_bands_tested",
+                "assignment_variants_generated", "retimed_plans_generated",
+                "retimed_plans_solved", "owner_change_branches",
+                "two_hop_relay_branches", "complete_phase_plans",
+                "ledger_closed", "states_expanded", "decoded", "verified",
+                "accepted", "rejected_overlap", "rejected_eligibility",
+                "rejected_safety", "rejected_ledger", "rejected_horizon",
+                "timeout", "state_limit",
+            ):
+                if isinstance(source_relay_stats.get(key), int):
+                    target_relay_stats[key] += source_relay_stats[key]
+            target_relay_stats["max_activity_width"] = max(
+                target_relay_stats["max_activity_width"],
+                int(source_relay_stats.get("max_activity_width", 0)),
+            )
+            target_relay_stats["activity_chain_expansions"].extend(
+                source_relay_stats.get("activity_chain_expansions", [])
+            )
+            relay_status = source_relay_stats.get("status")
+            if relay_status is not None:
+                target_relay_stats["status_counts"][relay_status] = (
+                    target_relay_stats["status_counts"].get(relay_status, 0) + 1
+                )
+            source_balance_stats = stats.get("idle_capacity_rebalance") or {}
+            target_balance_stats = aggregate_stats["idle_capacity_rebalance"]
+            if source_balance_stats.get("status") not in (None, "NOT_RUN"):
+                target_balance_stats["status"] = source_balance_stats["status"]
+            for key in (
+                "rounds", "focus_revisits", "idle_capacity_focuses",
+                "idle_capacity_chain_focuses", "partial_transfer_focuses",
+                "focuses_without_revisits", "activity_bands_tested",
+                "assignment_variants_generated", "retimed_plans_generated",
+                "retimed_plans_solved",
+                "owner_change_branches", "two_hop_relay_branches",
+                "complete_phase_plans", "ledger_closed", "states_expanded",
+                "decoded", "verified", "accepted", "rejected_overlap",
+                "rejected_eligibility", "rejected_safety", "rejected_ledger",
+                "rejected_horizon", "timeout", "state_limit",
+            ):
+                if isinstance(source_balance_stats.get(key), int):
+                    target_balance_stats[key] += source_balance_stats[key]
+            target_balance_stats["max_activity_width"] = max(
+                target_balance_stats["max_activity_width"],
+                int(source_balance_stats.get("max_activity_width", 0)),
+            )
+            target_balance_stats["activity_chain_expansions"].extend(
+                source_balance_stats.get("activity_chain_expansions", [])
+            )
+            balance_status = source_balance_stats.get("status")
+            if balance_status is not None:
+                target_balance_stats["status_counts"][balance_status] = (
+                    target_balance_stats["status_counts"].get(balance_status, 0) + 1
+                )
+            source_prefix_stats = stats.get("forced_prefix_consolidation") or {}
+            target_prefix_stats = aggregate_stats["forced_prefix_consolidation"]
+            if source_prefix_stats.get("status") not in (None, "NOT_RUN"):
+                target_prefix_stats["status"] = source_prefix_stats["status"]
+            for key in (
+                "rounds", "focus_interruptions", "focuses_started",
+                "focuses_completed", "neighbor_bands_generated",
+                "focus_phase_orders", "neighbor_phase_orders",
+                "idle_placements_tested", "states_expanded", "ledger_closed",
+                "decoded", "verified", "accepted", "rejected_safety",
+                "rejected_ledger", "rejected_burden_migration", "timeout",
+                "state_limit",
+            ):
+                if isinstance(source_prefix_stats.get(key), int):
+                    target_prefix_stats[key] += source_prefix_stats[key]
+            prefix_status = source_prefix_stats.get("status")
+            if prefix_status is not None:
+                target_prefix_stats["status_counts"][prefix_status] = (
+                    target_prefix_stats["status_counts"].get(prefix_status, 0) + 1
+                )
         aggregate_stats["polish_runs"] = len(continuity_output.get("polish_runs", []))
+        paired_transactions = [
+            transaction
+            for run in continuity_output.get("polish_runs", [])
+            for transaction in run.get("paired_transactions", [])
+        ]
+        phase_transactions = [
+            transaction
+            for run in continuity_output.get("polish_runs", [])
+            for transaction in run.get("phase_transactions", [])
+        ]
+        phase_closure_transactions = [
+            transaction
+            for run in continuity_output.get("polish_runs", [])
+            for transaction in run.get("phase_closure_transactions", [])
+        ]
+        cross_crane_phase_transactions = [
+            transaction
+            for run in continuity_output.get("polish_runs", [])
+            for transaction in run.get("cross_crane_phase_transactions", [])
+        ]
+        idle_capacity_transactions = [
+            transaction
+            for run in continuity_output.get("polish_runs", [])
+            for transaction in run.get("idle_capacity_transactions", [])
+        ]
+        forced_prefix_transactions = [
+            transaction
+            for run in continuity_output.get("polish_runs", [])
+            for transaction in run.get("forced_prefix_transactions", [])
+        ]
+    else:
+        paired_transactions = []
+        phase_transactions = []
+        phase_closure_transactions = []
+        cross_crane_phase_transactions = []
+        idle_capacity_transactions = []
+        forced_prefix_transactions = []
+    synchronization_candidate = None
+    synchronization_stats: dict[str, Any] = {
+        "status": "NOT_RUN", "runs": [],
+    }
+    if (
+        not local_windows_only
+        and
+        first_feasible is not None
+        and any(
+            _balanced_schedule_metrics(item, M)["max_trailing_idle"] > 0
+            or _balanced_schedule_metrics(item, M)["max_internal_idle_blocks"] > 1
+            for item in (formal_best, balanced_best)
+        )
+    ):
+        # Balance search may improve the amount of work assigned to an idle
+        # crane while introducing several short gaps.  Synchronize both that
+        # candidate and the formal low-move incumbent under one bounded tail
+        # budget, prioritising the balanced candidate that can actually remove
+        # under-loading rather than merely relocating trailing idle.
+        synchronization_deadline = time.perf_counter() + 8.0
+        synchronization_sources = sorted(
+            {id(item): item for item in (balanced_best, formal_best)}.values(),
+            key=lambda item: _recommended_schedule_rank(item, M),
+        )
+        synchronized: list[_CandidateSchedule] = []
+        run_stats: list[dict[str, Any]] = []
+        for sync_source in synchronization_sources:
+            if time.perf_counter() >= synchronization_deadline:
+                break
+            sync_candidate, sync_stats = _synchronize_by_compressed_row_groups(
+                W, M, starts, sync_source, synchronization_deadline,
+            )
+            run_stats.append({
+                "source_objective": list(sync_source.objective_key),
+                "source_loads": list(sync_source.loads),
+                **sync_stats,
+            })
+            if sync_candidate is not None:
+                synchronized.append(sync_candidate)
+        if synchronized:
+            synchronization_candidate = min(
+                synchronized,
+                key=lambda item: _recommended_schedule_rank(item, M),
+            )
+            recommended_best = min(
+                (recommended_best, *synchronized),
+                key=lambda item: _recommended_schedule_rank(item, M),
+            )
+        synchronization_stats = {
+            "status": "FOUND" if synchronized else (
+                run_stats[-1]["status"] if run_stats else "NOT_RUN"
+            ),
+            "runs": run_stats,
+            "selected_objective": (
+                list(synchronization_candidate.objective_key)
+                if synchronization_candidate is not None else None
+            ),
+        }
+    contiguous_phase_candidate = None
+    contiguous_phase_stats: dict[str, Any] = {"status": "NOT_RUN"}
+    if first_feasible is not None and not local_windows_only:
+        contiguous_phase_candidate, contiguous_phase_stats = (
+            _contiguous_phase_handoff_search(
+                W, M, starts, formal_best,
+                time.perf_counter() + 15.0,
+            )
+        )
+        if contiguous_phase_candidate is not None:
+            recommended_best = min(
+                (recommended_best, contiguous_phase_candidate),
+                key=lambda item: _recommended_schedule_rank(item, M),
+            )
+    local_terminal_alignment_stats: dict[str, Any] = {
+        "status": "NOT_RUN", "attempted": 0, "improved": 0,
+        "runs": [],
+    }
+    local_terminal_candidates: list[_CandidateSchedule] = []
+    if local_windows_only and first_feasible is not None:
+        # This is a time-local cleanup, not a global reschedule: only the
+        # final contiguous work block may move, and only inside a position run
+        # where the crane was already stationary.  Work ownership, movement,
+        # reversals and the actual completion time are invariant.
+        unique_sources = {
+            id(item): item
+            for item in (
+                recommended_best, formal_best, execution_best, balanced_best,
+            )
+        }.values()
+        for align_source in unique_sources:
+            local_terminal_alignment_stats["attempted"] += 1
+            before_balance = _balanced_schedule_metrics(align_source, M)
+            aligned = _right_shift_terminal_work_blocks(
+                W, M, starts, align_source
+            )
+            after_balance = _balanced_schedule_metrics(aligned, M)
+            improved = (
+                aligned.objective_key == align_source.objective_key
+                and after_balance["max_trailing_idle"]
+                < before_balance["max_trailing_idle"]
+            )
+            local_terminal_alignment_stats["improved"] += int(improved)
+            local_terminal_alignment_stats["runs"].append({
+                "objective": list(align_source.objective_key),
+                "before_finish_times": before_balance["finish_times"],
+                "after_finish_times": after_balance["finish_times"],
+                "before_max_trailing_idle": before_balance[
+                    "max_trailing_idle"
+                ],
+                "after_max_trailing_idle": after_balance[
+                    "max_trailing_idle"
+                ],
+                "changed": aligned is not align_source,
+            })
+            local_terminal_candidates.append(aligned)
+        local_terminal_alignment_stats["status"] = (
+            "IMPROVED"
+            if local_terminal_alignment_stats["improved"]
+            else "NO_CHANGE"
+        )
+        aligned_balanced = min(
+            local_terminal_candidates,
+            key=lambda item: _balanced_schedule_metrics(item, M)["key"],
+        )
+        if _balanced_schedule_metrics(
+            aligned_balanced, M
+        )["key"] < _balanced_schedule_metrics(balanced_best, M)["key"]:
+            balanced_best = aligned_balanced
+    recommended_best = min(
+        (
+            recommended_best, formal_best, execution_best, balanced_best,
+            *local_terminal_candidates,
+        ),
+        key=lambda item: _recommended_schedule_rank(item, M),
+    )
     if continuity_output is not None:
         continuity_output.update({
             "formal_best": formal_best,
             "continuity_best": continuity_best,
             "operational_best": operational_best,
+            "execution_best": execution_best,
+            "balanced_best": balanced_best,
+            "balanced_best_metrics": _balanced_schedule_metrics(balanced_best, M),
+            "recommended_best": recommended_best,
+            "recommended_best_metrics": _balanced_schedule_metrics(
+                recommended_best, M
+            ),
+            "synchronization_candidate": synchronization_candidate,
+            "synchronization_stats": synchronization_stats,
+            "contiguous_phase_candidate": contiguous_phase_candidate,
+            "contiguous_phase_stats": contiguous_phase_stats,
+            "local_terminal_alignment": local_terminal_alignment_stats,
+            "compression_best": compression_best,
+            "paired_transactions": paired_transactions,
+            "phase_transactions": phase_transactions,
+            "phase_closure_transactions": phase_closure_transactions,
+            "cross_crane_phase_transactions": cross_crane_phase_transactions,
+            "idle_capacity_transactions": idle_capacity_transactions,
+            "forced_prefix_transactions": forced_prefix_transactions,
             "pool_size": len(candidate_pool),
             "stop_reason": stop_reason,
             "descent_history": descent_history,
@@ -5044,11 +11858,13 @@ def _cumulative_local_trajectory_repair_iterative(
                 for horizon, item in sorted(first_by_h.items(), reverse=True)
             ],
             "safe_workload_lower_bound": safe_lower_bound,
+            "global_rebalance": global_rebalance_stats,
+            "local_windows_only": local_windows_only,
             "descent_rounds": len(descent_history),
             "stats": aggregate_stats,
         })
     return (
-        formal_best if first_feasible is not None else None,
+        recommended_best if first_feasible is not None else None,
         evaluated_total,
         prepared,
         first_feasible,
@@ -5524,7 +12340,7 @@ def solve_cwp(
     time_limit: float = 270.0,
     seed: int = 20260910,
     patience: int = 2_000,
-    critical_mode: str = "both",
+    critical_mode: str = "local_only",
     checkpoint: _CandidateSchedule | None = None,
     skip_general_repair: bool = False,
     stop_before_critical: bool = False,
@@ -5539,8 +12355,14 @@ def solve_cwp(
         raise ValueError("time_limit 必须大于 0。")
     if isinstance(patience, bool) or not isinstance(patience, int) or patience <= 0:
         raise ValueError("patience 必须是正整数。")
-    if critical_mode not in {"off_reallocate", "off_reserved", "beam", "trajectory", "both"}:
-        raise ValueError("critical_mode 必须是 off_reallocate、off_reserved、beam、trajectory 或 both。")
+    if critical_mode not in {
+        "off_reallocate", "off_reserved", "beam", "trajectory", "both",
+        "local_only",
+    }:
+        raise ValueError(
+            "critical_mode 必须是 off_reallocate、off_reserved、beam、"
+            "trajectory、both 或 local_only。"
+        )
     effective_time_limit = min(float(time_limit), 270.0)
     deadline = search_start + effective_time_limit
     _, starts, configurations = _validate_input(W, M, S, move_time)
@@ -5619,7 +12441,11 @@ def solve_cwp(
         objective, it must replace the old pool member instead of being
         silently discarded.
         """
-        if best is not None and candidate.makespan > best.makespan + 2 and candidate is not best:
+        if (
+            best is not None
+            and candidate.completion_time > best.completion_time + 2
+            and candidate is not best
+        ):
             return
         signature = schedule_signature(candidate)
         for index, old in enumerate(elite_pool):
@@ -5645,7 +12471,10 @@ def solve_cwp(
         remember_elite(best)
         if len(elite_pool) <= 1:
             return
-        kept = [item for item in elite_pool if item is best or item.makespan <= best.makespan + 2]
+        kept = [
+            item for item in elite_pool
+            if item is best or item.completion_time <= best.completion_time + 2
+        ]
         elite_pool[:] = sorted(kept, key=lambda item: item.objective_key)[:16]
         elite_signatures.clear()
         elite_signatures.update(schedule_signature(item) for item in elite_pool)
@@ -5656,17 +12485,23 @@ def solve_cwp(
             return
         if published_key is not None and candidate.objective_key >= published_key:
             return
-        timed_candidate = _retime_candidate(W, M, candidate, move_time)
-        optimal = move_time == 1 and timed_candidate.makespan == lower_bound
+        timed_candidate = _normalize_completed_candidate(
+            _retime_candidate(W, M, candidate, move_time)
+        )
+        optimal = timed_candidate.completion_time == lower_bound
         snapshot = Solution(
-            status="MAKESPAN_OPTIMAL_BY_LOWER_BOUND" if optimal else "HEURISTIC_FEASIBLE",
+            status="COMPLETION_TIME_OPTIMAL_BY_LOWER_BOUND" if optimal else "HEURISTIC_FEASIBLE",
             method="dp_dispatch_priority_evolution_trajectory_repair_mcts_exact_no_solver",
-            makespan=timed_candidate.makespan, makespan_lower_bound=lower_bound,
+            makespan=timed_candidate.completion_time,
+            schedule_horizon=timed_candidate.schedule_horizon,
+            schedule_movement_count=timed_candidate.movement_count,
+            makespan_lower_bound=lower_bound,
             lower_bound_components=lower_bound_components,
             makespan_proven_optimal=optimal, proven_lexicographic_optimal=False,
             assignment_count=timed_candidate.assignment_count, split_bay_count=timed_candidate.split_bay_count,
             load_deviation=timed_candidate.load_deviation, reversal_count=timed_candidate.reversal_count,
-            movement_count=timed_candidate.movement_count, crane_loads=timed_candidate.loads,
+            movement_count=timed_candidate.completion_movement_count,
+            crane_loads=timed_candidate.loads,
             target_weights=target_weights,
             bay_cranes={i + 1: [q + 1 for q in sorted(owners)]
                         for i, owners in enumerate(timed_candidate.owners) if owners},
@@ -5685,13 +12520,14 @@ def solve_cwp(
         )
         verify_solution(W, M, starts, snapshot)
         on_incumbent(snapshot)
-        published_key = candidate.objective_key
+        published_key = timed_candidate.objective_key
 
     # Experimental checkpoint entry: resume exactly at the boundary before
     # the critical-window phase.  The checkpoint is an already validated
     # complete candidate and is intentionally kept private to the ablation
     # harness; normal construction remains unchanged when it is absent.
     if checkpoint is not None:
+        checkpoint = _normalize_completed_candidate(checkpoint)
         best = checkpoint
         remember_elite(checkpoint)
         published_key = checkpoint.objective_key
@@ -5737,7 +12573,7 @@ def solve_cwp(
 
     for round_index in range(0 if checkpoint is not None else restarts):
         if M <= 3 and round_index == 300:
-            if best is not None and best.makespan == lower_bound:
+            if best is not None and best.completion_time == lower_bound:
                 break
             # Restart the original random stream and rule portfolio too.
             # Merely swapping decoders midway lets the first decoder's UCB
@@ -5754,7 +12590,7 @@ def solve_cwp(
             break
         if (
             best is not None
-            and best.makespan == lower_bound
+            and best.completion_time == lower_bound
             and restart - last_improvement >= min(patience, 64)
         ):
             break
@@ -5839,7 +12675,7 @@ def solve_cwp(
                     trial_priorities[i] = max(0.0, trial_priorities[i] + rng.uniform(-3.0, 3.0))
             if restart % 4 == 3:
                 trial_priorities = [rng.uniform(0.0, 8.0) for _ in W]
-        previous_best_makespan = best.makespan if best is not None else max_steps
+        previous_best_completion = best.completion_time if best is not None else max_steps
         # With <= 3 cranes the old focused product is already small and its
         # joint random noise supplies useful diversity. Retain that decoder;
         # DP removes the expensive product for larger crane fleets.
@@ -5861,16 +12697,15 @@ def solve_cwp(
             # Some randomized fixed-owner plans can trap the greedy decoder.
             # They are discarded; unrestricted decoders remain in the portfolio.
             continue
+        candidate = _normalize_completed_candidate(candidate)
         completed += 1
         operator_calls["construction"] += 1
         remember_elite(candidate)
-        gap = max(0, candidate.makespan - lower_bound)
+        gap = max(0, candidate.completion_time - lower_bound)
         reward = (
             1.0 / (1 + gap)
-            + 0.25 * max(0, previous_best_makespan - candidate.makespan)
-            + 0.05 / (1 + candidate.split_bay_count)
-            + 0.01 / (1 + candidate.load_deviation)
-            + 0.002 / (1 + candidate.movement_count)
+            + 0.25 * max(0, previous_best_completion - candidate.completion_time)
+            + 0.002 / (1 + candidate.completion_movement_count)
         )
         strategy_rewards[strategy_index] += reward
         if best is None or candidate.objective_key < best.objective_key:
@@ -5882,7 +12717,7 @@ def solve_cwp(
             publish(best)
 
     if dp_incumbent is not None and (best is None or dp_incumbent.objective_key < best.objective_key):
-        best = dp_incumbent
+        best = _normalize_completed_candidate(dp_incumbent)
     assert best is not None
     phase_seconds["construction"] = round(time.perf_counter() - search_start, 6)
     repair_iterations = repair_improvements = 0
@@ -5899,7 +12734,7 @@ def solve_cwp(
     )
     repair_round = 0
     general_repair_started = time.perf_counter()
-    while best.makespan > lower_bound and time.perf_counter() < general_repair_deadline:
+    while best.completion_time > lower_bound and time.perf_counter() < general_repair_deadline:
         if not elite_pool:
             elite_pool.append(best)
         source = elite_pool[repair_round % len(elite_pool)]
@@ -5916,6 +12751,8 @@ def solve_cwp(
             repair_state=repair_states.get(source_key), return_state=True,
         )
         operator_calls["trajectory"] += 1
+        if improved is not None:
+            improved = _normalize_completed_candidate(improved)
         if continuation is None:
             repair_states.pop(source_key, None)
         else:
@@ -5949,8 +12786,8 @@ def solve_cwp(
     if (
         not stop_before_critical
         and move_time == 0
-        and critical_mode in {"trajectory", "both"}
-        and best.makespan > lower_bound
+        and critical_mode in {"trajectory", "both", "local_only"}
+        and best.completion_time > lower_bound
         and time.perf_counter() < repair_phase_deadline
     ):
         cumulative_deadline = repair_phase_deadline
@@ -5962,12 +12799,16 @@ def solve_cwp(
         cumulative, evaluated, prepared, first_feasible = _cumulative_local_trajectory_repair_iterative(
             W, M, starts, best, cumulative_deadline, seed,
             move_time=move_time,
+            enable_cross_crane_phase_relay=True,
+            enable_idle_capacity_rebalance=True,
+            local_windows_only=(critical_mode == "local_only"),
         )
         critical_repair_iterations += evaluated
         if prepared is not best:
             elite_repairs += 1
             remember_elite(prepared)
         if cumulative is not None:
+            cumulative = _normalize_completed_candidate(cumulative)
             elite_repairs += 1
             remember_elite(cumulative)
             if cumulative.objective_key < best.objective_key:
@@ -5977,9 +12818,9 @@ def solve_cwp(
                 publish(best)
     while (
         not stop_before_critical
-        and critical_mode in {"beam", "trajectory", "both"}
+        and critical_mode in {"beam", "trajectory", "both", "local_only"}
         and
-        best.makespan > lower_bound
+        best.completion_time > lower_bound
         and critical_index < critical_limit
         and time.perf_counter() < repair_phase_deadline
     ):
@@ -5995,7 +12836,7 @@ def solve_cwp(
             repair_phase_deadline,
             time.perf_counter() + max(0.20, min(7.0, remaining_budget / 3.0)),
         )
-        if critical_mode == "beam" or (
+        if critical_mode in {"beam", "local_only"} or (
             critical_mode == "both" and critical_index % 2 == 1
         ):
             operator_calls["critical_beam"] += 1
@@ -6025,6 +12866,8 @@ def solve_cwp(
                 repair_states[source_key] = continuation
         critical_repair_iterations += evaluated
         if improved is not None:
+            improved = _normalize_completed_candidate(improved)
+        if improved is not None:
             elite_repairs += 1
             remember_elite(improved)
             if improved.objective_key < best.objective_key:
@@ -6046,7 +12889,7 @@ def solve_cwp(
     if critical_mode == "off_reserved" or stop_before_critical:
         layered_deadline = min(layered_deadline, improvement_deadline)
     improvement_remaining = max(0.0, improvement_deadline - time.perf_counter())
-    gap_after_construction = best.makespan - lower_bound
+    gap_after_construction = best.completion_time - lower_bound
     mcts_share = (
         0.55 if M >= 5 or gap_after_construction <= 1
         else 0.35
@@ -6057,7 +12900,7 @@ def solve_cwp(
     mcts_improvements = 0
     if (
         use_exact_search
-        and best.makespan > lower_bound
+        and best.completion_time > lower_bound
         and time.perf_counter() < mcts_deadline
     ):
         operator_calls["mcts"] += 1
@@ -6066,6 +12909,8 @@ def solve_cwp(
             mcts_deadline, seed + 97,
         )
         mcts_iterations += evaluated
+        if improved is not None:
+            improved = _normalize_completed_candidate(improved)
         if improved is not None and improved.objective_key < best.objective_key:
             best = improved
             mcts_improvements += 1
@@ -6079,7 +12924,7 @@ def solve_cwp(
     for layered_variant in range(4):
         if (
             not use_exact_search
-            or best.makespan <= lower_bound
+            or best.completion_time <= lower_bound
             or time.perf_counter() >= layered_deadline
         ):
             break
@@ -6098,6 +12943,8 @@ def solve_cwp(
         )
         operator_calls["layered"] += 1
         layered_search_states += evaluated
+        if improved is not None:
+            improved = _normalize_completed_candidate(improved)
         if improved is not None and improved.objective_key < best.objective_key:
             best = improved
             layered_search_improvements += 1
@@ -6111,7 +12958,7 @@ def solve_cwp(
     # For a wide gap on a large state space, spend the budget on diverse
     # improvement passes instead of a proof attempt that cannot finish.
     exact_is_promising = (
-        best.makespan - lower_bound <= 1
+        best.completion_time - lower_bound <= 1
         and len(configurations) <= 20_000
         and math.comb(len(W) - M + 1, M) <= 20_000
     )
@@ -6119,7 +12966,7 @@ def solve_cwp(
     while (
         use_exact_search
         and exact_is_promising
-        and best.makespan > lower_bound
+        and best.completion_time > lower_bound
         and time.perf_counter() < improvement_deadline
     ):
         operator_calls["exact"] += 1
@@ -6128,6 +12975,8 @@ def solve_cwp(
             bay_criticality, best, improvement_deadline,
         )
         exact_search_nodes += evaluated
+        if improved is not None:
+            improved = _normalize_completed_candidate(improved)
         if improved is not None and improved.objective_key < best.objective_key:
             best = improved
             exact_search_improvements += 1
@@ -6139,9 +12988,11 @@ def solve_cwp(
     phase_seconds["exact"] = round(time.perf_counter() - exact_started, 6)
 
     elapsed = time.perf_counter() - search_start
-    best = _retime_candidate(W, M, best, move_time)
-    makespan_optimal = move_time == 1 and (
-        best.makespan == lower_bound or exact_search_proved_optimal
+    best = _normalize_completed_candidate(
+        _retime_candidate(W, M, best, move_time)
+    )
+    makespan_optimal = (
+        best.completion_time == lower_bound or exact_search_proved_optimal
     )
     bay_cranes = {
         i + 1: [q + 1 for q in sorted(bay_owners)]
@@ -6150,9 +13001,9 @@ def solve_cwp(
     }
     return Solution(
         status=(
-            "MAKESPAN_OPTIMAL_BY_LOWER_BOUND"
-            if makespan_optimal and best.makespan == lower_bound
-            else "MAKESPAN_OPTIMAL_BY_EXACT_SEARCH"
+            "COMPLETION_TIME_OPTIMAL_BY_LOWER_BOUND"
+            if makespan_optimal and best.completion_time == lower_bound
+            else "COMPLETION_TIME_OPTIMAL_BY_EXACT_SEARCH"
             if exact_search_proved_optimal
             else "HEURISTIC_FEASIBLE"
         ),
@@ -6161,7 +13012,9 @@ def solve_cwp(
             if stop_before_critical
             else "dp_dispatch_priority_evolution_trajectory_repair_mcts_exact_no_solver"
         ),
-        makespan=best.makespan,
+        makespan=best.completion_time,
+        schedule_horizon=best.schedule_horizon,
+        schedule_movement_count=best.movement_count,
         makespan_lower_bound=lower_bound,
         lower_bound_components=lower_bound_components,
         makespan_proven_optimal=makespan_optimal,
@@ -6170,7 +13023,7 @@ def solve_cwp(
         split_bay_count=best.split_bay_count,
         load_deviation=best.load_deviation,
         reversal_count=best.reversal_count,
-        movement_count=best.movement_count,
+        movement_count=best.completion_movement_count,
         crane_loads=best.loads,
         target_weights=target_weights,
         bay_cranes=bay_cranes,
@@ -6207,6 +13060,9 @@ def verify_solution(W: Sequence[int], M: int, S: Iterable[int], solution: Soluti
     work_done = [0] * len(W)
     load_done = [0] * M
     required = set(S)
+    schedule_horizon = getattr(solution, "schedule_horizon", None)
+    if schedule_horizon is None:
+        schedule_horizon = solution.makespan
 
     for slot in solution.slots:
         by_time.setdefault(slot.time, []).append(slot)
@@ -6240,10 +13096,15 @@ def verify_solution(W: Sequence[int], M: int, S: Iterable[int], solution: Soluti
         raise AssertionError(f"作业量不守恒：得到 {work_done}，要求 {list(W)}。")
     if load_done != solution.crane_loads:
         raise AssertionError("桥吊负荷汇总不一致。")
-    if len(by_time) != solution.makespan:
-        raise AssertionError("时间槽数量与完工时间不一致。")
+    actual_completion = _work_completion_time(solution.slots)
+    if actual_completion != solution.makespan:
+        raise AssertionError(
+            f"报告完工时间 {solution.makespan} 与最后工作边界 {actual_completion} 不一致。"
+        )
+    if len(by_time) != schedule_horizon:
+        raise AssertionError("时间槽数量与保存的排程时域不一致。")
 
-    for t in range(solution.makespan):
+    for t in range(schedule_horizon):
         rows = sorted(by_time[t], key=lambda row: row.crane)
         if len(rows) != M:
             raise AssertionError(f"t={t} 的桥吊状态数量不是 M。")
@@ -6266,24 +13127,40 @@ def verify_solution(W: Sequence[int], M: int, S: Iterable[int], solution: Soluti
     if move_time == 0:
         directions: list[list[int]] = [[] for _ in range(M)]
         visible_moves = 0
-        for t in range(1, solution.makespan):
+        completed_moves = 0
+        for t in range(1, schedule_horizon):
             previous = sorted(by_time[t - 1], key=lambda row: row.crane)
             current = sorted(by_time[t], key=lambda row: row.crane)
             for q, (before, after) in enumerate(zip(previous, current)):
                 if before.end_bay != after.start_bay:
                     visible_moves += 1
                     directions[q].append(1 if after.start_bay > before.end_bay else -1)
+                    if t < solution.makespan:
+                        completed_moves += 1
         reversals = sum(
             a != b
             for crane_directions in directions
             for a, b in zip(crane_directions, crane_directions[1:])
         )
-        if visible_moves != solution.movement_count:
-            raise AssertionError("瞬时移动次数汇总不一致。")
+        if completed_moves != solution.movement_count:
+            raise AssertionError("完工前瞬时移动次数汇总不一致。")
+        expected_schedule_moves = getattr(
+            solution, "schedule_movement_count", None
+        )
+        if expected_schedule_moves is None:
+            expected_schedule_moves = solution.movement_count
+        if visible_moves != expected_schedule_moves:
+            raise AssertionError("完整排程时域的瞬时移动次数汇总不一致。")
     else:
         reversals = _count_reversals(solution.slots, M)
         if move_time == 1:
-            movement_count = sum(slot.state == "move" for slot in solution.slots)
+            movement_count = sum(
+                slot.state == "move" and slot.time < solution.makespan
+                for slot in solution.slots
+            )
+            schedule_movement_count = sum(
+                slot.state == "move" for slot in solution.slots
+            )
         else:
             groups: dict[tuple[int, int], list[Slot]] = {}
             for slot in solution.slots:
@@ -6298,9 +13175,18 @@ def verify_solution(W: Sequence[int], M: int, S: Iterable[int], solution: Soluti
                     raise AssertionError("移动持续时间与 move_time 不一致。")
                 if any(slot.move_steps != move_time for slot in group):
                     raise AssertionError("move_steps 与 move_time 不一致。")
-            movement_count = len(groups)
+            movement_count = sum(
+                min(slot.time for slot in group) < solution.makespan
+                for group in groups.values()
+            )
+            schedule_movement_count = len(groups)
         if movement_count != solution.movement_count:
-            raise AssertionError("移动次数汇总不一致。")
+            raise AssertionError("完工前移动事件汇总不一致。")
+        expected_schedule_moves = getattr(
+            solution, "schedule_movement_count", None
+        )
+        if expected_schedule_moves is not None and schedule_movement_count != expected_schedule_moves:
+            raise AssertionError("完整排程时域的移动事件汇总不一致。")
     if reversals != solution.reversal_count:
         raise AssertionError("桥吊折返次数汇总不一致。")
 
@@ -6424,7 +13310,7 @@ def plot_schedule(
         ax.set_yticks(range(0, solution.makespan + 1, step))
     ax.set_xlabel("贝位序号 / Bay index (1-based)")
     ax.set_ylabel("Time")
-    proof_text = "makespan optimal" if solution.makespan_proven_optimal else "heuristic"
+    proof_text = "completion-time optimal" if solution.makespan_proven_optimal else "heuristic"
     title = (
         f"CWP schedule — {proof_text}, makespan {solution.makespan}, "
         f"reversals {solution.reversal_count}, moves {solution.movement_count}, "
@@ -6474,24 +13360,32 @@ def _show_saved_schedule(output_path: Path) -> None:
 
 
 def _print_summary(solution: Solution) -> None:
-    if solution.status == "MAKESPAN_OPTIMAL_BY_LOWER_BOUND":
-        proof = "达到理论下界，完工时间已证明最优"
-    elif solution.status == "MAKESPAN_OPTIMAL_BY_EXACT_SEARCH":
-        proof = "精确分支定界已排除所有更短工期，完工时间已证明最优"
+    if solution.status == "COMPLETION_TIME_OPTIMAL_BY_LOWER_BOUND":
+        proof = "达到有效下界，完工时间已证明最优；移动次数未证明最优"
+    elif solution.status == "COMPLETION_TIME_OPTIMAL_BY_EXACT_SEARCH":
+        proof = "精确搜索已排除更短完工时间；移动次数未证明最优"
     else:
         proof = "当前最好可行解，未证明全局最优"
     print(f"状态: {solution.status}（{proof}）")
     print(f"方法: {solution.method}")
-    print(f"完工时间: {solution.makespan}；理论下界: {solution.makespan_lower_bound}")
+    horizon = solution.schedule_horizon or solution.makespan
+    print(
+        f"实际完工时间 C: {solution.makespan}；保存时域 H: {horizon}；"
+        f"完工后空槽: {max(0, horizon - solution.makespan)}；"
+        f"完工时间下界: {solution.makespan_lower_bound}"
+    )
     print(f"下界组成: {solution.lower_bound_components}")
-    print("目标优先级: 完工时间 → 拆分贝位数 → 移动次数 → 中间重载偏差")
+    print("正式目标: (实际完工时间 C, 完工前移动次数 K)，严格词典序最小化")
     print(f"桥吊-贝位分配数（统计）: {solution.assignment_count}")
     print(f"被多吊拆分的贝位数: {solution.split_bay_count}")
     print(f"各桥吊作业负荷: {solution.crane_loads}")
     print(f"中间重载目标权重: {solution.target_weights}")
     print(f"中间重载偏差: {solution.load_deviation}")
     print(f"折返次数（统计）: {solution.reversal_count}")
-    print(f"移动次数: {solution.movement_count}")
+    print(
+        f"完工前移动次数 K: {solution.movement_count}；"
+        f"完整保存时域移动次数: {solution.schedule_movement_count}"
+    )
     print(f"完成搜索轮数: {solution.restarts_completed}；耗时: {solution.search_seconds:.3f}s")
     print(f"各优先规则评估次数: {solution.strategy_evaluations}")
     print(
@@ -6589,8 +13483,11 @@ def main() -> None:
     parser.add_argument("--patience", type=int, default=2_000, help="Stop after this many non-improving trials once the makespan lower bound is reached")
     parser.add_argument(
         "--critical-mode",
-        choices=("off_reallocate", "off_reserved", "beam", "trajectory", "both"),
-        default="both",
+        choices=(
+            "off_reallocate", "off_reserved", "beam", "trajectory", "both",
+            "local_only",
+        ),
+        default="local_only",
         help="Critical-window ablation mode",
     )
     parser.add_argument(

@@ -1,9 +1,10 @@
-"""Reproducible ablation harness for the original critical-window step.
+"""Reproducible experiment harness for Step 8 local repair operators.
 
 The harness treats a complete source schedule as an immutable artifact.  The
-direct experiment calls only the two legacy operators; the full experiment
-uses the solver's critical_mode switch.  It never turns a timeout into an
-infeasibility claim and writes one JSON record per run.
+direct experiment can run the bounded legacy operators together with the
+atomic cross-crane phase-relay operator; the full experiment uses the solver's
+critical_mode switch.  It never turns a timeout into an infeasibility claim
+and writes one JSON record per run.
 """
 
 from __future__ import annotations
@@ -51,9 +52,10 @@ def source_candidate(W, M, S, path: Path, move_time=1, allow_edge_exit=False):
             "请用相同移动时间生成固定源。"
         )
     slots = [solver.Slot(**item) for item in data["slots"]]
+    schedule_horizon = int(data.get("schedule_horizon", data["makespan"]))
     if allow_edge_exit:
         slots = solver.apply_completed_edge_exits(
-            slots, M, len(W), int(data["makespan"]), move_time
+            slots, M, len(W), schedule_horizon, move_time
         )
     owners = [set() for _ in W]
     loads = [0] * M
@@ -61,7 +63,7 @@ def source_candidate(W, M, S, path: Path, move_time=1, allow_edge_exit=False):
         if slot.state == "work":
             owners[slot.work_bay - 1].add(slot.crane - 1)
             loads[slot.crane - 1] += 1
-    makespan = int(data["makespan"])
+    makespan = schedule_horizon
     if move_time == 0:
         by_time = {
             t: sorted((slot for slot in slots if slot.time == t), key=lambda slot: slot.crane)
@@ -93,10 +95,15 @@ def source_candidate(W, M, S, path: Path, move_time=1, allow_edge_exit=False):
     assignment_count = sum(len(item) for item in owners)
     split_bay_count = sum(len(item) > 1 for item in owners)
     load_deviation = solver._load_deviation(loads, weights, sum(W))
+    completion_time = solver._work_completion_time(slots)
+    objective_movement_count = solver._movement_count_until_completion(
+        slots, M, move_time, completion_time
+    )
     check = SimpleNamespace(
-        slots=slots, makespan=makespan, crane_loads=loads,
-        reversal_count=reversal_count, movement_count=movement_count,
-        move_time=move_time,
+        slots=slots, makespan=completion_time, schedule_horizon=makespan,
+        crane_loads=loads, reversal_count=reversal_count,
+        movement_count=objective_movement_count,
+        schedule_movement_count=movement_count, move_time=move_time,
     )
     solver.verify_solution(W, M, S, check)
     candidate = solver._CandidateSchedule(
@@ -108,25 +115,71 @@ def source_candidate(W, M, S, path: Path, move_time=1, allow_edge_exit=False):
         movement_count=movement_count,
         loads=loads, owners=owners, move_time=move_time,
     )
-    return candidate
+    normalized = solver._normalize_completed_candidate(candidate)
+    normalized.normalization_source_horizon = makespan
+    normalized.normalization_trimmed_slots = max(
+        0, makespan - normalized.schedule_horizon
+    )
+    return normalized
 
 
-def summarize(candidate):
+def summarize(candidate, starts=None):
+    continuity = solver._continuity_diagnostics(
+        candidate, len(candidate.loads), starts
+    )
+    long_revisit_threshold = 8
+    fragmentation_details = [
+        {
+            "bay": int(bay),
+            "blocks": continuity["work_blocks_by_bay"].get(bay, []),
+            "gaps": gaps,
+        }
+        for bay, gaps in continuity["bay_gaps_by_bay"].items()
+        if gaps
+    ]
     return {
         "objective": objective(candidate),
-        "makespan": candidate.makespan,
+        "makespan": candidate.completion_time,
+        "schedule_horizon": candidate.schedule_horizon,
+        "normalization_source_horizon": (
+            candidate.normalization_source_horizon
+            if candidate.normalization_source_horizon is not None
+            else candidate.schedule_horizon
+        ),
+        "normalization_trimmed_slots": candidate.normalization_trimmed_slots,
+        "trailing_idle_after_work": max(
+            0, candidate.schedule_horizon - candidate.completion_time
+        ),
+        "source_trailing_idle_after_work": max(
+            0,
+            (candidate.normalization_source_horizon
+             if candidate.normalization_source_horizon is not None
+             else candidate.schedule_horizon) - candidate.completion_time,
+        ),
         "move_time": candidate.move_time,
         "split_bay_count": candidate.split_bay_count,
         "load_deviation": candidate.load_deviation,
-        "movement_count": candidate.movement_count,
+        "movement_count": candidate.completion_movement_count,
+        "schedule_movement_count": candidate.movement_count,
         "smoothness": list(solver._trajectory_smoothness(
             candidate, len(candidate.loads)
         )),
         "assignment_count": candidate.assignment_count,
         "reversal_count": candidate.reversal_count,
-        "continuity": solver._continuity_diagnostics(
+        "continuity": continuity,
+        "execution_key": list(solver._execution_rank(
             candidate, len(candidate.loads)
+        )),
+        "execution_warning": (
+            continuity["max_work_revisit_gap"] >= long_revisit_threshold
         ),
+        "execution_warning_reason": (
+            f"max_work_revisit_gap>={long_revisit_threshold}"
+            if continuity["max_work_revisit_gap"] >= long_revisit_threshold
+            else None
+        ),
+        "work_revisit_details": continuity["crane_work_revisits"],
+        "fragmentation_details": fragmentation_details,
         "idle": solver._idle_diagnostics(candidate, len(candidate.loads)),
         "operational_rank": list(solver._operational_rank(
             candidate, len(candidate.loads)
@@ -149,11 +202,14 @@ def verify_candidate(W, M, S, candidate, move_time=1):
     owners = {bay: sorted(q + 1 for q in cranes)
               for bay, cranes in enumerate(candidate.owners, 1) if cranes}
     check = SimpleNamespace(
-        slots=candidate.slots, makespan=candidate.makespan,
+        slots=candidate.slots, makespan=candidate.completion_time,
+        schedule_horizon=candidate.schedule_horizon,
         crane_loads=candidate.loads, reversal_count=candidate.reversal_count,
         assignment_count=candidate.assignment_count,
         split_bay_count=candidate.split_bay_count, bay_cranes=owners,
-        movement_count=candidate.movement_count, move_time=move_time,
+        movement_count=candidate.completion_movement_count,
+        schedule_movement_count=candidate.movement_count,
+        move_time=move_time,
     )
     solver.verify_solution(W, M, S, check)
 
@@ -162,10 +218,10 @@ def plot_view(candidate):
     """Minimal solution-shaped view accepted by the project plotter."""
     return SimpleNamespace(
         slots=candidate.slots,
-        makespan=candidate.makespan,
+        makespan=candidate.completion_time,
         makespan_proven_optimal=False,
         reversal_count=candidate.reversal_count,
-        movement_count=candidate.movement_count,
+        movement_count=candidate.completion_movement_count,
         split_bay_count=candidate.split_bay_count,
         crane_loads=candidate.loads,
         move_time=candidate.move_time,
@@ -175,13 +231,23 @@ def plot_view(candidate):
 def direct_run(
     W, M, S, source, mode, budget, seed, *, move_time=1,
     verbose_windows=False, plot_dir: Path | None = None,
+    artifact_dir: Path | None = None,
     preserve_horizon=False, cumulative_local=True,
     enable_descent=True, enable_operational_repairs=True,
     enable_work_transfer=False, protect_source_continuity=False,
+    enable_fragmentation_repair=False, enable_cyclic_exchange=True,
+    enable_phase_resequence=True,
+    enable_phase_closure=True,
+    enable_cross_crane_phase_relay=True,
+    enable_idle_capacity_rebalance=True,
+    enable_forced_prefix_consolidation=True,
+    enable_global_rebalance=True,
+    execution_output=True, local_state_limit=256, execution_pool_sort=True,
     strict_local_transactions=False,
     source_hash=None,
     use_legacy_seed=False,
     enable_multi_relay=True,
+    local_windows_only=False,
 ):
     start = time.perf_counter()
     deadline = start + budget
@@ -199,6 +265,8 @@ def direct_run(
     attempts = 0
     updates = []
     window_results = []
+    phase_closure_transaction_paths = []
+    cross_crane_phase_transaction_paths = []
     source_key = tuple(source.objective_key)
     if (
         cumulative_local and mode == "trajectory"
@@ -214,30 +282,60 @@ def direct_run(
             enable_operational_repairs=enable_operational_repairs,
             preserve_horizon=preserve_horizon,
             enable_work_transfer=enable_work_transfer,
+            enable_fragmentation_repair=enable_fragmentation_repair,
+            enable_cyclic_exchange=enable_cyclic_exchange,
+            enable_phase_resequence=enable_phase_resequence,
+            enable_phase_closure=enable_phase_closure,
+            enable_cross_crane_phase_relay=enable_cross_crane_phase_relay,
+            enable_idle_capacity_rebalance=enable_idle_capacity_rebalance,
+            enable_forced_prefix_consolidation=enable_forced_prefix_consolidation,
+            local_state_limit=local_state_limit,
+            execution_pool_sort=execution_pool_sort,
             protect_source_continuity=protect_source_continuity,
             strict_local_transactions=strict_local_transactions,
             source_hash=source_hash,
             use_legacy_seed=use_legacy_seed,
             enable_multi_relay=enable_multi_relay,
+            enable_global_rebalance=enable_global_rebalance,
+            local_windows_only=local_windows_only,
         )
         formal_best = continuity_output.get("formal_best", candidate)
         continuity_best = continuity_output.get("continuity_best", candidate)
         operational_best = continuity_output.get("operational_best", candidate)
+        execution_best = continuity_output.get("execution_best", operational_best)
+        balanced_best = continuity_output.get("balanced_best", execution_best)
+        recommended_best = continuity_output.get("recommended_best", balanced_best)
         if formal_best is None:
             formal_best = source
         if continuity_best is None:
             continuity_best = formal_best
         if operational_best is None:
             operational_best = continuity_best
-        reported_best = formal_best if candidate is None else candidate
+        if execution_best is None:
+            execution_best = operational_best
+        formal_best = solver._normalize_completed_candidate(formal_best)
+        continuity_best = solver._normalize_completed_candidate(continuity_best)
+        operational_best = solver._normalize_completed_candidate(operational_best)
+        execution_best = solver._normalize_completed_candidate(execution_best)
+        balanced_best = solver._normalize_completed_candidate(balanced_best)
+        recommended_best = solver._normalize_completed_candidate(recommended_best)
+        reported_best = (
+            formal_best if candidate is None
+            else solver._normalize_completed_candidate(candidate)
+        )
         if candidate is not None:
             run_status = "FOUND"
+        elif solver._execution_rank(execution_best, M) < solver._execution_rank(source, M):
+            run_status = "EXECUTION_IMPROVED"
         elif formal_best.objective_key < source.objective_key:
             run_status = "NO_SHORTENING_SAME_H_IMPROVEMENT"
         else:
             run_status = "TIMEOUT"
         verify_candidate(W, M, S, prepared, move_time)
-        for polished_candidate in (candidate, formal_best, continuity_best, operational_best):
+        for polished_candidate in (
+            candidate, formal_best, continuity_best, operational_best,
+            execution_best, balanced_best, recommended_best,
+        ):
             if polished_candidate is not None:
                 verify_candidate(W, M, S, polished_candidate, move_time)
         first_event = next(
@@ -257,6 +355,13 @@ def direct_run(
         formal_best_path = None
         continuity_best_path = None
         operational_best_path = None
+        execution_best_path = None
+        balanced_best_path = None
+        recommended_best_path = None
+        paired_transaction_paths = []
+        phase_transaction_paths = []
+        cross_crane_phase_transaction_paths = []
+        forced_prefix_transaction_paths = []
         # Beam is measured as a 300-second search and gets one final artifact
         # below.  Rendering all 48 intermediate beam windows during the search
         # makes plotting part of the algorithm and can consume the reserve.
@@ -354,6 +459,204 @@ def direct_run(
                     ),
                 )
                 operational_best_path = str(operational_best_path)
+            if execution_output and execution_best is not None:
+                execution_best_path = plot_dir / "execution_best.json"
+                execution_best_path.write_text(json.dumps({
+                    **summarize(execution_best),
+                    "slots": slot_dicts(execution_best),
+                }, indent=2), encoding="utf-8")
+                execution_best_plot = plot_dir / "execution_best.png"
+                solver.plot_schedule(
+                    plot_view(execution_best), len(W), execution_best_plot,
+                    show=False,
+                    diagnostic_title=(
+                        "Step 8 trajectory — execution best schedule"
+                    ),
+                )
+                execution_best_path = str(execution_best_path)
+                plot_path = execution_best_plot
+            if balanced_best is not None:
+                balanced_best_path = plot_dir / "balanced_best.json"
+                balanced_best_path.write_text(json.dumps({
+                    **summarize(balanced_best),
+                    "balance": solver._balanced_schedule_metrics(balanced_best, M),
+                    "slots": slot_dicts(balanced_best),
+                }, indent=2), encoding="utf-8")
+                balanced_best_plot = plot_dir / "balanced_best.png"
+                solver.plot_schedule(
+                    plot_view(balanced_best), len(W), balanced_best_plot,
+                    show=False,
+                    diagnostic_title=(
+                        "Step 8 trajectory — balanced idle-capacity alternative"
+                    ),
+                )
+                balanced_best_path = str(balanced_best_path)
+            if recommended_best is not None:
+                recommended_best_path = artifact_dir / "recommended_best.json"
+                recommended_best_path.write_text(json.dumps({
+                    **summarize(recommended_best, S),
+                    "balance": solver._balanced_schedule_metrics(
+                        recommended_best, M
+                    ),
+                    "recommended_rank": list(
+                        solver._recommended_schedule_rank(recommended_best, M)
+                    ),
+                    "slots": slot_dicts(recommended_best),
+                }, indent=2), encoding="utf-8")
+                recommended_best_path = str(recommended_best_path)
+            for transaction_index, transaction in enumerate(
+                continuity_output.get("paired_transactions", []), start=1
+            ):
+                transaction_dir = plot_dir / "paired_transactions"
+                transaction_dir.mkdir(parents=True, exist_ok=True)
+                before = transaction["before"]
+                after = transaction["after"]
+                details = transaction.get("details", {})
+                stem = f"paired_{transaction_index:02d}"
+                before_json = transaction_dir / f"{stem}_before.json"
+                after_json = transaction_dir / f"{stem}_after.json"
+                before_json.write_text(json.dumps({
+                    **summarize(before),
+                    "transaction": details,
+                    "regions": transaction.get("regions", []),
+                    "slots": slot_dicts(before),
+                }, indent=2), encoding="utf-8")
+                after_json.write_text(json.dumps({
+                    **summarize(after),
+                    "transaction": details,
+                    "regions": transaction.get("regions", []),
+                    "slots": slot_dicts(after),
+                }, indent=2), encoding="utf-8")
+                before_png = transaction_dir / f"{stem}_before.png"
+                after_png = transaction_dir / f"{stem}_after.png"
+                interval_text = ", ".join(
+                    f"Q{region['crane']}:[{region['start']},{region['end_exclusive']})"
+                    for region in transaction.get("regions", [])
+                )
+                solver.plot_schedule(
+                    plot_view(before), len(W), before_png, show=False,
+                    diagnostic_title=(
+                        f"Step 8 paired exchange {transaction_index} — before; "
+                        f"{interval_text}"
+                    ),
+                )
+                solver.plot_schedule(
+                    plot_view(after), len(W), after_png, show=False,
+                    diagnostic_title=(
+                        f"Step 8 paired exchange {transaction_index} — after; "
+                        f"{interval_text}"
+                    ),
+                )
+                paired_transaction_paths.append({
+                    "details": details,
+                    "regions": transaction.get("regions", []),
+                    "before_json": str(before_json),
+                    "before_png": str(before_png),
+                    "after_json": str(after_json),
+                    "after_png": str(after_png),
+                })
+            for transaction_index, transaction in enumerate(
+                continuity_output.get("phase_transactions", []), start=1
+            ):
+                transaction_dir = plot_dir / "phase_transactions"
+                transaction_dir.mkdir(parents=True, exist_ok=True)
+                before = transaction["before"]
+                after = transaction["after"]
+                details = transaction.get("details", {})
+                stem = f"phase_{transaction_index:02d}"
+                before_json = transaction_dir / f"{stem}_before.json"
+                after_json = transaction_dir / f"{stem}_after.json"
+                before_json.write_text(json.dumps({
+                    **summarize(before),
+                    "transaction": details,
+                    "regions": transaction.get("regions", []),
+                    "slots": slot_dicts(before),
+                }, indent=2), encoding="utf-8")
+                after_json.write_text(json.dumps({
+                    **summarize(after),
+                    "transaction": details,
+                    "regions": transaction.get("regions", []),
+                    "slots": slot_dicts(after),
+                }, indent=2), encoding="utf-8")
+                before_png = transaction_dir / f"{stem}_before.png"
+                after_png = transaction_dir / f"{stem}_after.png"
+                interval_text = ", ".join(
+                    f"Q{region['crane']}:[{region['start']},{region['end_exclusive']})"
+                    for region in transaction.get("regions", [])
+                )
+                solver.plot_schedule(
+                    plot_view(before), len(W), before_png, show=False,
+                    diagnostic_title=(
+                        f"Step 8 phase resequence {transaction_index} — before; "
+                        f"{interval_text}"
+                    ),
+                )
+                solver.plot_schedule(
+                    plot_view(after), len(W), after_png, show=False,
+                    diagnostic_title=(
+                        f"Step 8 phase resequence {transaction_index} — after; "
+                        f"{interval_text}"
+                    ),
+                )
+                phase_transaction_paths.append({
+                    "details": details,
+                    "regions": transaction.get("regions", []),
+                    "before_json": str(before_json),
+                    "before_png": str(before_png),
+                    "after_json": str(after_json),
+                    "after_png": str(after_png),
+                })
+            for transaction_index, transaction in enumerate(
+                continuity_output.get("cross_crane_phase_transactions", []), start=1
+            ):
+                transaction_dir = plot_dir / "cross_crane_phase_transactions"
+                transaction_dir.mkdir(parents=True, exist_ok=True)
+                before = transaction["before"]
+                after = transaction["after"]
+                details = transaction.get("details", {})
+                stem = f"cross_relay_{transaction_index:02d}"
+                before_json = transaction_dir / f"{stem}_before.json"
+                after_json = transaction_dir / f"{stem}_after.json"
+                before_json.write_text(json.dumps({
+                    **summarize(before),
+                    "transaction": details,
+                    "regions": transaction.get("regions", []),
+                    "slots": slot_dicts(before),
+                }, indent=2), encoding="utf-8")
+                after_json.write_text(json.dumps({
+                    **summarize(after),
+                    "transaction": details,
+                    "regions": transaction.get("regions", []),
+                    "slots": slot_dicts(after),
+                }, indent=2), encoding="utf-8")
+                before_png = transaction_dir / f"{stem}_before.png"
+                after_png = transaction_dir / f"{stem}_after.png"
+                interval_text = ", ".join(
+                    f"Q{region['crane']}:[{region['start']},{region['end_exclusive']})"
+                    for region in transaction.get("regions", [])
+                )
+                solver.plot_schedule(
+                    plot_view(before), len(W), before_png, show=False,
+                    diagnostic_title=(
+                        f"Step 8 cross-crane phase relay {transaction_index} — before; "
+                        f"{interval_text}"
+                    ),
+                )
+                solver.plot_schedule(
+                    plot_view(after), len(W), after_png, show=False,
+                    diagnostic_title=(
+                        f"Step 8 cross-crane phase relay {transaction_index} — after; "
+                        f"{interval_text}"
+                    ),
+                )
+                cross_crane_phase_transaction_paths.append({
+                    "details": details,
+                    "regions": transaction.get("regions", []),
+                    "before_json": str(before_json),
+                    "before_png": str(before_png),
+                    "after_json": str(after_json),
+                    "after_png": str(after_png),
+                })
             if candidate is None:
                 plot_path = plot_dir / "cumulative_prepared.png"
                 solver.plot_schedule(
@@ -364,6 +667,177 @@ def direct_run(
                     ),
                 )
                 plot_path = str(plot_path)
+        elif artifact_dir is not None and execution_output:
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            source_path = artifact_dir / "source.json"
+            source_path.write_text(json.dumps({
+                **summarize(source, S), "slots": slot_dicts(source),
+            }, indent=2), encoding="utf-8")
+            source_path = str(source_path)
+            if formal_best is not None:
+                formal_best_path = artifact_dir / "formal_best.json"
+                formal_best_path.write_text(json.dumps({
+                    **summarize(formal_best, S), "slots": slot_dicts(formal_best),
+                }, indent=2), encoding="utf-8")
+                formal_best_path = str(formal_best_path)
+            if execution_best is not None:
+                execution_best_path = artifact_dir / "execution_best.json"
+                execution_best_path.write_text(json.dumps({
+                    **summarize(execution_best, S), "slots": slot_dicts(execution_best),
+                }, indent=2), encoding="utf-8")
+                execution_best_path = str(execution_best_path)
+            if balanced_best is not None:
+                balanced_best_path = artifact_dir / "balanced_best.json"
+                balanced_best_path.write_text(json.dumps({
+                    **summarize(balanced_best, S),
+                    "balance": solver._balanced_schedule_metrics(balanced_best, M),
+                    "slots": slot_dicts(balanced_best),
+                }, indent=2), encoding="utf-8")
+                balanced_best_path = str(balanced_best_path)
+            if recommended_best is not None:
+                recommended_best_path = artifact_dir / "recommended_best.json"
+                recommended_best_path.write_text(json.dumps({
+                    **summarize(recommended_best, S),
+                    "balance": solver._balanced_schedule_metrics(
+                        recommended_best, M
+                    ),
+                    "recommended_rank": list(
+                        solver._recommended_schedule_rank(recommended_best, M)
+                    ),
+                    "slots": slot_dicts(recommended_best),
+                }, indent=2), encoding="utf-8")
+                recommended_best_path = str(recommended_best_path)
+            for transaction_index, transaction in enumerate(
+                continuity_output.get("paired_transactions", []), start=1
+            ):
+                transaction_dir = artifact_dir / "paired_transactions"
+                transaction_dir.mkdir(parents=True, exist_ok=True)
+                details = transaction.get("details", {})
+                stem = f"paired_{transaction_index:02d}"
+                before_json = transaction_dir / f"{stem}_before.json"
+                after_json = transaction_dir / f"{stem}_after.json"
+                before_json.write_text(json.dumps({
+                    **summarize(transaction["before"]),
+                    "transaction": details,
+                    "regions": transaction.get("regions", []),
+                    "slots": slot_dicts(transaction["before"]),
+                }, indent=2), encoding="utf-8")
+                after_json.write_text(json.dumps({
+                    **summarize(transaction["after"]),
+                    "transaction": details,
+                    "regions": transaction.get("regions", []),
+                    "slots": slot_dicts(transaction["after"]),
+                }, indent=2), encoding="utf-8")
+                paired_transaction_paths.append({
+                    "details": details,
+                    "regions": transaction.get("regions", []),
+                    "before_json": str(before_json),
+                    "after_json": str(after_json),
+                })
+            for transaction_index, transaction in enumerate(
+                continuity_output.get("phase_transactions", []), start=1
+            ):
+                transaction_dir = artifact_dir / "phase_transactions"
+                transaction_dir.mkdir(parents=True, exist_ok=True)
+                details = transaction.get("details", {})
+                stem = f"phase_{transaction_index:02d}"
+                before_json = transaction_dir / f"{stem}_before.json"
+                after_json = transaction_dir / f"{stem}_after.json"
+                before_json.write_text(json.dumps({
+                    **summarize(transaction["before"]),
+                    "transaction": details,
+                    "regions": transaction.get("regions", []),
+                    "slots": slot_dicts(transaction["before"]),
+                }, indent=2), encoding="utf-8")
+                after_json.write_text(json.dumps({
+                    **summarize(transaction["after"]),
+                    "transaction": details,
+                    "regions": transaction.get("regions", []),
+                    "slots": slot_dicts(transaction["after"]),
+                }, indent=2), encoding="utf-8")
+                phase_transaction_paths.append({
+                    "details": details,
+                    "regions": transaction.get("regions", []),
+                    "before_json": str(before_json),
+                    "after_json": str(after_json),
+                })
+            for transaction_index, transaction in enumerate(
+                continuity_output.get("cross_crane_phase_transactions", []), start=1
+            ):
+                transaction_dir = artifact_dir / "cross_crane_phase_transactions"
+                transaction_dir.mkdir(parents=True, exist_ok=True)
+                details = transaction.get("details", {})
+                stem = f"cross_relay_{transaction_index:02d}"
+                before_json = transaction_dir / f"{stem}_before.json"
+                after_json = transaction_dir / f"{stem}_after.json"
+                before_json.write_text(json.dumps({
+                    **summarize(transaction["before"], S),
+                    "transaction": details,
+                    "regions": transaction.get("regions", []),
+                    "slots": slot_dicts(transaction["before"]),
+                }, indent=2), encoding="utf-8")
+                after_json.write_text(json.dumps({
+                    **summarize(transaction["after"], S),
+                    "transaction": details,
+                    "regions": transaction.get("regions", []),
+                    "slots": slot_dicts(transaction["after"]),
+                }, indent=2), encoding="utf-8")
+                cross_crane_phase_transaction_paths.append({
+                    "details": details,
+                    "regions": transaction.get("regions", []),
+                    "before_json": str(before_json),
+                    "after_json": str(after_json),
+                })
+            for transaction_index, transaction in enumerate(
+                continuity_output.get("phase_closure_transactions", []), start=1
+            ):
+                transaction_dir = artifact_dir / "phase_closure_transactions"
+                transaction_dir.mkdir(parents=True, exist_ok=True)
+                details = transaction.get("details", {})
+                stem = f"closure_{transaction_index:02d}"
+                before_json = transaction_dir / f"{stem}_before.json"
+                after_json = transaction_dir / f"{stem}_after.json"
+                for state_name, path in (("before", before_json), ("after", after_json)):
+                    candidate_state = transaction[state_name]
+                    path.write_text(json.dumps({
+                        **summarize(candidate_state, S),
+                        "transaction": details,
+                        "regions": transaction.get("regions", []),
+                        "slots": slot_dicts(candidate_state),
+                    }, indent=2), encoding="utf-8")
+                phase_closure_transaction_paths.append({
+                    "details": details,
+                    "regions": transaction.get("regions", []),
+                    "before_json": str(before_json),
+                    "after_json": str(after_json),
+                })
+            for transaction_index, transaction in enumerate(
+                continuity_output.get("forced_prefix_transactions", []), start=1
+            ):
+                transaction_dir = artifact_dir / "forced_prefix_transactions"
+                transaction_dir.mkdir(parents=True, exist_ok=True)
+                details = transaction.get("details", {})
+                stem = f"forced_prefix_{transaction_index:02d}"
+                before_json = transaction_dir / f"{stem}_before.json"
+                after_json = transaction_dir / f"{stem}_after.json"
+                before_json.write_text(json.dumps({
+                    **summarize(transaction["before"], S),
+                    "transaction": details,
+                    "regions": transaction.get("regions", []),
+                    "slots": slot_dicts(transaction["before"]),
+                }, indent=2), encoding="utf-8")
+                after_json.write_text(json.dumps({
+                    **summarize(transaction["after"], S),
+                    "transaction": details,
+                    "regions": transaction.get("regions", []),
+                    "slots": slot_dicts(transaction["after"]),
+                }, indent=2), encoding="utf-8")
+                forced_prefix_transaction_paths.append({
+                    "details": details,
+                    "regions": transaction.get("regions", []),
+                    "before_json": str(before_json),
+                    "after_json": str(after_json),
+                })
         prepared_potential, remove_at, deficits = solver._shortening_potential(
             W, M, prepared
         )
@@ -394,7 +868,7 @@ def direct_run(
             "budget_seconds": budget, "seed": seed,
             "search_budget_seconds": round(deadline - start, 6),
             "plot_reserve_seconds": round(plot_reserve, 6),
-            "source": summarize(source), "source_objective": list(source_key),
+            "source": summarize(source, S), "source_objective": list(source_key),
             "calls": len(trace), "evaluated": evaluated,
             "status": run_status,
             "best": summarize(reported_best) if reported_best is not None else None,
@@ -405,14 +879,46 @@ def direct_run(
                 list(solver._trajectory_smoothness(candidate, M))
                 if candidate is not None else None
             ),
-            "formal_best": summarize(formal_best) if formal_best is not None else None,
-            "continuity_best": summarize(continuity_best) if continuity_best is not None else None,
-            "operational_best": summarize(operational_best) if operational_best is not None else None,
+            "formal_best": summarize(formal_best, S) if formal_best is not None else None,
+            "continuity_best": summarize(continuity_best, S) if continuity_best is not None else None,
+            "operational_best": summarize(operational_best, S) if operational_best is not None else None,
+            "execution_best": summarize(execution_best, S) if execution_best is not None else None,
+            "balanced_best": summarize(balanced_best, S) if balanced_best is not None else None,
+            "balanced_best_metrics": continuity_output.get("balanced_best_metrics"),
+            "recommended_best": (
+                summarize(recommended_best, S)
+                if recommended_best is not None else None
+            ),
+            "recommended_best_metrics": continuity_output.get(
+                "recommended_best_metrics"
+            ),
+            "synchronization_stats": continuity_output.get(
+                "synchronization_stats"
+            ),
+            "contiguous_phase_stats": continuity_output.get(
+                "contiguous_phase_stats"
+            ),
+            "local_terminal_alignment": continuity_output.get(
+                "local_terminal_alignment"
+            ),
+            "compression_best": (
+                summarize(continuity_output["compression_best"])
+                if continuity_output.get("compression_best") is not None else None
+            ),
+            "execution_warning": (
+                summarize(execution_best, S)["execution_warning"]
+                if execution_best is not None else True
+            ),
             "continuity_operator_stats": continuity_output.get("stats"),
+            "idle_capacity_rebalance": (
+                (continuity_output.get("stats") or {}).get("idle_capacity_rebalance")
+            ),
+            "global_rebalance": continuity_output.get("global_rebalance"),
             "continuity_stop_reason": continuity_output.get("stop_reason"),
             "descent_history": continuity_output.get("descent_history", []),
             "first_feasible_by_h": [
                 {
+                    "completion_time": item["horizon"],
                     "horizon": item["horizon"],
                     "candidate": summarize(item["candidate"]),
                 }
@@ -423,6 +929,18 @@ def direct_run(
             "enable_descent": enable_descent,
             "enable_operational_repairs": enable_operational_repairs,
             "enable_work_transfer": enable_work_transfer,
+            "enable_fragmentation_repair": enable_fragmentation_repair,
+            "enable_cyclic_exchange": enable_cyclic_exchange,
+            "enable_phase_resequence": enable_phase_resequence,
+            "enable_phase_closure": enable_phase_closure,
+            "enable_cross_crane_phase_relay": enable_cross_crane_phase_relay,
+            "enable_idle_capacity_rebalance": enable_idle_capacity_rebalance,
+            "enable_forced_prefix_consolidation": enable_forced_prefix_consolidation,
+            "enable_global_rebalance": enable_global_rebalance,
+            "local_windows_only": local_windows_only,
+            "execution_output": execution_output,
+            "local_state_limit": local_state_limit,
+            "execution_pool_sort": execution_pool_sort,
             "protect_source_continuity": protect_source_continuity,
             "strict_local_transactions": strict_local_transactions,
             "source_hash": source_hash,
@@ -474,12 +992,39 @@ def direct_run(
             "formal_best_path": formal_best_path,
             "continuity_best_path": continuity_best_path,
             "operational_best_path": operational_best_path,
+            "execution_best_path": execution_best_path,
+            "balanced_best_path": balanced_best_path,
+            "recommended_best_path": recommended_best_path,
+            "paired_transactions": paired_transaction_paths,
+            "phase_transactions": phase_transaction_paths,
+            "cross_crane_phase_transactions": cross_crane_phase_transaction_paths,
+            "idle_capacity_transactions": [
+                {
+                    "details": item.get("details", {}),
+                    "regions": item.get("regions", []),
+                    "before": summarize(item["before"], S),
+                    "after": summarize(item["after"], S),
+                    "balance_before": solver._balanced_schedule_metrics(
+                        item["before"], M
+                    ),
+                    "balance_after": solver._balanced_schedule_metrics(
+                        item["after"], M
+                    ),
+                }
+                for item in continuity_output.get("idle_capacity_transactions", [])
+            ],
+            "forced_prefix_transactions": forced_prefix_transaction_paths,
+            "forced_prefix_consolidation": (
+                (continuity_output.get("stats") or {}).get("forced_prefix_consolidation")
+            ),
             "elapsed_seconds": round(time.perf_counter() - start, 6),
         }
     beam_polish_reserve = 0.0
     beam_search_deadline = deadline
     if (
-        mode == "beam" and enable_work_transfer and move_time == 0
+        mode == "beam"
+        and (enable_work_transfer or enable_fragmentation_repair)
+        and move_time == 0
     ):
         beam_polish_reserve = min(15.0, max(1.0, 0.05 * budget))
         beam_search_deadline = max(start + 0.01, deadline - beam_polish_reserve)
@@ -593,7 +1138,10 @@ def direct_run(
     beam_search_found = best is not None
     beam_polish_details = {}
     if (
-        enable_work_transfer
+        (
+            enable_work_transfer or enable_fragmentation_repair
+            or enable_phase_closure or enable_idle_capacity_rebalance
+        )
         and strict_local_transactions
         and move_time == 0
         and time.perf_counter() < deadline
@@ -602,7 +1150,14 @@ def direct_run(
         polished, polished_evaluated = solver._refine_same_horizon_trajectory(
             W, M, S, polish_source, deadline, seed + 900_001,
             move_time=0, continuity=True, result_box=beam_polish_details,
-            enable_work_transfer=True,
+            enable_work_transfer=enable_work_transfer,
+            enable_fragmentation_repair=enable_fragmentation_repair,
+            enable_cyclic_exchange=enable_cyclic_exchange,
+            enable_phase_resequence=enable_phase_resequence,
+            enable_phase_closure=enable_phase_closure,
+            enable_cross_crane_phase_relay=enable_cross_crane_phase_relay,
+            enable_idle_capacity_rebalance=enable_idle_capacity_rebalance,
+            local_state_limit=local_state_limit,
             protect_source_continuity=protect_source_continuity,
             strict_local_transactions=True,
             source_hash=source_hash,
@@ -623,9 +1178,12 @@ def direct_run(
     formal_best = beam_polish_details.get("formal_best", reported_best)
     continuity_best = beam_polish_details.get("continuity_best", formal_best)
     operational_best = beam_polish_details.get("operational_best", continuity_best)
-    for polished_candidate in (formal_best, continuity_best, operational_best):
+    execution_best = beam_polish_details.get("execution_best", operational_best)
+    for polished_candidate in (formal_best, continuity_best, operational_best, execution_best):
         if polished_candidate is not None:
             verify_candidate(W, M, S, polished_candidate, move_time)
+    execution_best_path = None
+    phase_transaction_paths = []
     if plot_dir is not None and mode == "beam":
         plot_dir.mkdir(parents=True, exist_ok=True)
         source_json = plot_dir / "source.json"
@@ -648,6 +1206,119 @@ def direct_run(
                 "Step 8 beam — no feasible modification; source retained"
             ),
         )
+        if execution_output and execution_best is not None:
+            execution_best_path = plot_dir / "execution_best.json"
+            execution_best_path.write_text(json.dumps({
+                **summarize(execution_best), "slots": slot_dicts(execution_best),
+            }, indent=2), encoding="utf-8")
+            solver.plot_schedule(
+                plot_view(execution_best), len(W),
+                plot_dir / "execution_best.png", show=False,
+                diagnostic_title="Step 8 beam — execution best schedule",
+            )
+            execution_best_path = str(execution_best_path)
+        for transaction_index, transaction in enumerate(
+            beam_polish_details.get("phase_transactions", []), start=1
+        ):
+            transaction_dir = plot_dir / "phase_transactions"
+            transaction_dir.mkdir(parents=True, exist_ok=True)
+            before = transaction["before"]
+            after = transaction["after"]
+            details = transaction.get("details", {})
+            stem = f"phase_{transaction_index:02d}"
+            before_json = transaction_dir / f"{stem}_before.json"
+            after_json = transaction_dir / f"{stem}_after.json"
+            before_json.write_text(json.dumps({
+                **summarize(before),
+                "transaction": details,
+                "regions": transaction.get("regions", []),
+                "slots": slot_dicts(before),
+            }, indent=2), encoding="utf-8")
+            after_json.write_text(json.dumps({
+                **summarize(after),
+                "transaction": details,
+                "regions": transaction.get("regions", []),
+                "slots": slot_dicts(after),
+            }, indent=2), encoding="utf-8")
+            before_png = transaction_dir / f"{stem}_before.png"
+            after_png = transaction_dir / f"{stem}_after.png"
+            interval_text = ", ".join(
+                f"Q{region['crane']}:[{region['start']},{region['end_exclusive']})"
+                for region in transaction.get("regions", [])
+            )
+            solver.plot_schedule(
+                plot_view(before), len(W), before_png, show=False,
+                diagnostic_title=(
+                    f"Step 8 beam phase resequence {transaction_index} — before; "
+                    f"{interval_text}"
+                ),
+            )
+            solver.plot_schedule(
+                plot_view(after), len(W), after_png, show=False,
+                diagnostic_title=(
+                    f"Step 8 beam phase resequence {transaction_index} — after; "
+                    f"{interval_text}"
+                ),
+            )
+            phase_transaction_paths.append({
+                "details": details,
+                "regions": transaction.get("regions", []),
+                "before_json": str(before_json),
+                "before_png": str(before_png),
+                "after_json": str(after_json),
+                "after_png": str(after_png),
+            })
+    elif artifact_dir is not None and execution_output:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        (artifact_dir / "source.json").write_text(json.dumps({
+            **summarize(source), "slots": slot_dicts(source),
+        }, indent=2), encoding="utf-8")
+        if formal_best is not None:
+            (artifact_dir / "formal_best.json").write_text(json.dumps({
+                **summarize(formal_best), "slots": slot_dicts(formal_best),
+            }, indent=2), encoding="utf-8")
+        if execution_best is not None:
+            execution_best_path = artifact_dir / "execution_best.json"
+            execution_best_path.write_text(json.dumps({
+                **summarize(execution_best), "slots": slot_dicts(execution_best),
+            }, indent=2), encoding="utf-8")
+            execution_best_path = str(execution_best_path)
+        for transaction_index, transaction in enumerate(
+            beam_polish_details.get("paired_transactions", []), start=1
+        ):
+            transaction_dir = artifact_dir / "paired_transactions"
+            transaction_dir.mkdir(parents=True, exist_ok=True)
+            stem = f"paired_{transaction_index:02d}"
+            details = transaction.get("details", {})
+            for state_name in ("before", "after"):
+                transaction_path = transaction_dir / f"{stem}_{state_name}.json"
+                transaction_path.write_text(json.dumps({
+                    **summarize(transaction[state_name]),
+                    "transaction": details,
+                    "regions": transaction.get("regions", []),
+                    "slots": slot_dicts(transaction[state_name]),
+                }, indent=2), encoding="utf-8")
+        for transaction_index, transaction in enumerate(
+            beam_polish_details.get("phase_transactions", []), start=1
+        ):
+            transaction_dir = artifact_dir / "phase_transactions"
+            transaction_dir.mkdir(parents=True, exist_ok=True)
+            stem = f"phase_{transaction_index:02d}"
+            details = transaction.get("details", {})
+            for state_name in ("before", "after"):
+                transaction_path = transaction_dir / f"{stem}_{state_name}.json"
+                transaction_path.write_text(json.dumps({
+                    **summarize(transaction[state_name]),
+                    "transaction": details,
+                    "regions": transaction.get("regions", []),
+                    "slots": slot_dicts(transaction[state_name]),
+                }, indent=2), encoding="utf-8")
+            phase_transaction_paths.append({
+                "details": details,
+                "regions": transaction.get("regions", []),
+                "before_json": str(transaction_dir / f"{stem}_before.json"),
+                "after_json": str(transaction_dir / f"{stem}_after.json"),
+            })
     return {
         "experiment": "direct",
         "mode": mode, "move_time": move_time,
@@ -662,6 +1333,11 @@ def direct_run(
         "formal_best": summarize(formal_best),
         "continuity_best": summarize(continuity_best),
         "operational_best": summarize(operational_best),
+        "execution_best": summarize(execution_best) if execution_best is not None else None,
+        "execution_warning": (
+            summarize(execution_best)["execution_warning"]
+            if execution_best is not None else True
+        ),
         "best_is_source": not found_best,
         "beam_search_found": beam_search_found,
         "beam_polish_reserve_seconds": round(beam_polish_reserve, 6),
@@ -675,6 +1351,18 @@ def direct_run(
             ),
         },
         "enable_work_transfer": enable_work_transfer,
+        "enable_fragmentation_repair": enable_fragmentation_repair,
+        "enable_cyclic_exchange": enable_cyclic_exchange,
+        "enable_phase_resequence": enable_phase_resequence,
+        "enable_phase_closure": enable_phase_closure,
+        "enable_cross_crane_phase_relay": enable_cross_crane_phase_relay,
+        "enable_idle_capacity_rebalance": enable_idle_capacity_rebalance,
+        "execution_output": execution_output,
+        "execution_best_path": execution_best_path,
+        "phase_transactions": phase_transaction_paths,
+        "phase_closure_transactions": phase_closure_transaction_paths,
+        "cross_crane_phase_transactions": cross_crane_phase_transaction_paths,
+        "local_state_limit": local_state_limit,
         "protect_source_continuity": protect_source_continuity,
         "strict_local_transactions": strict_local_transactions,
         "source_hash": source_hash,
@@ -729,6 +1417,8 @@ def continuity_run(
         attempt_trace=trace,
         continuity=True,
         result_box=details,
+        enable_phase_resequence=True,
+        enable_idle_capacity_rebalance=True,
     )
     search_finished = time.perf_counter()
     formal_best = details.get("formal_best", result)
@@ -810,13 +1500,17 @@ def full_run(W, M, S, source, mode, budget, seed, move_time=1):
         move_time=move_time,
     )
     solver.verify_solution(W, M, S, solution)
-    key = [solution.makespan, solution.split_bay_count,
-           solution.movement_count, solution.load_deviation]
+    key = [solution.makespan, solution.movement_count]
     return {
         "experiment": "full", "mode": mode, "move_time": move_time,
         "budget_seconds": budget,
         "seed": seed, "validated": True, "objective": key,
         "makespan": solution.makespan,
+        "schedule_horizon": solution.schedule_horizon,
+        "schedule_movement_count": solution.schedule_movement_count,
+        "split_bay_count": solution.split_bay_count,
+        "load_deviation": solution.load_deviation,
+        "reversal_count": solution.reversal_count,
         "makespan_lower_bound": solution.makespan_lower_bound,
         "operator_calls": solution.operator_calls,
         "phase_seconds": solution.phase_seconds,
@@ -862,11 +1556,243 @@ def paired_summary(records):
 
 
 def write_report(out: Path, records):
-    lines = ["# Critical-window ablation", "", "四目标：`(makespan, split_bay_count, movement_count, load_deviation)`", ""]
+    lines = [
+        "# Step 8 local-repair experiment",
+        "",
+        "正式目标：`(actual_completion_time, movement_count)`，按词典序比较。",
+        "正式 `(C,K)` 冠军单独保留；推荐输出在同一最短工期内先消除同桥吊同贝位回访，再要求同步完工并减少位置回访、方向反转和移动，最后比较负载与停工。",
+        "",
+    ]
     direct = [r for r in records if r.get("experiment") == "direct"]
     full = [r for r in records if r.get("experiment") == "full"]
     lines.append(f"Direct records: {len(direct)}; full records: {len(full)}.")
     lines.append("")
+    for item in direct:
+        formal = item.get("formal_best")
+        execution = item.get("execution_best")
+        if formal is None or execution is None:
+            continue
+        lines.extend([
+            f"## {item.get('instance', 'instance')} / {item.get('mode')} / seed {item.get('seed')}",
+            "",
+            f"- status: `{item.get('status')}`; search {item.get('search_budget_seconds')}s / "
+            f"elapsed {item.get('elapsed_seconds')}s",
+            f"- source: `{item.get('source', {}).get('objective')}`; stored H="
+            f"{item.get('source', {}).get('schedule_horizon')}, original H="
+            f"{item.get('source', {}).get('normalization_source_horizon')}, trimmed slots="
+            f"{item.get('source', {}).get('normalization_trimmed_slots')}",
+            f"- formal: `{formal.get('objective')}`, warning={formal.get('execution_warning')}",
+            f"- execution: `{execution.get('objective')}`, key=`{execution.get('execution_key')}`, "
+            f"warning={execution.get('execution_warning')}",
+            f"- execution movement/reversals: {execution.get('movement_count')} / "
+            f"{execution.get('reversal_count')}; revisits={execution.get('continuity', {}).get('work_revisit_count')}; "
+            f"max gap={execution.get('continuity', {}).get('max_work_revisit_gap')}",
+        ])
+        balanced = item.get("balanced_best")
+        balance_metrics = item.get("balanced_best_metrics") or {}
+        recommended = item.get("recommended_best")
+        recommended_metrics = item.get("recommended_best_metrics") or {}
+        if recommended is not None and recommended_metrics:
+            recommended_continuity = recommended.get("continuity", {})
+            lines.append(
+                f"- recommended output: `{recommended.get('objective')}`, loads="
+                f"`{recommended_metrics.get('loads')}`, max trailing idle="
+                f"{recommended_metrics.get('max_trailing_idle')}, finish gap="
+                f"{recommended_metrics.get('finish_gap')}, Umax="
+                f"{recommended_metrics.get('max_nonwork_capacity')}, max internal idle blocks="
+                f"{recommended_metrics.get('max_internal_idle_blocks')}, total internal idle blocks="
+                f"{recommended_metrics.get('total_internal_idle_blocks')}, revisits="
+                f"{recommended_continuity.get('work_revisit_count')}"
+            )
+        balance_transactions = item.get("idle_capacity_transactions") or []
+        balance_before = (
+            balance_transactions[0].get("balance_before", {})
+            if balance_transactions else {}
+        )
+        if balanced is not None and balance_metrics:
+            before_u = balance_before.get("max_nonwork_capacity")
+            before_gap = balance_before.get("finish_gap")
+            before_key = balanced.get("objective")
+            lines.append(
+                f"- balanced alternative: `{before_key}`, loads="
+                f"`{balance_metrics.get('loads')}`, Umax="
+                f"{balance_metrics.get('max_nonwork_capacity')}"
+                + (f" (source {before_u})" if before_u is not None else "")
+                + f", finish gap={balance_metrics.get('finish_gap')}"
+                + (f" (source {before_gap})" if before_gap is not None else "")
+                + f", total non-work capacity={balance_metrics.get('total_nonwork_capacity')}; "
+                "this is also eligible for the synchronized-finish recommended output."
+            )
+            balanced_path = item.get("balanced_best_path")
+            if balanced_path:
+                lines.append(f"- balanced alternative artifact: `{balanced_path}`")
+                balanced_plot = str(Path(balanced_path).with_suffix(".png"))
+                if (ROOT / balanced_plot).exists():
+                    lines.append(f"- balanced schedule plot: `{balanced_plot}`")
+        idle_stats = item.get("idle_capacity_rebalance") or {}
+        if idle_stats:
+            lines.append(
+                f"- idle-capacity rebalance: `{idle_stats.get('status')}`, "
+                f"no-revisit source={bool(idle_stats.get('focuses_without_revisits'))}, "
+                f"focuses={idle_stats.get('idle_capacity_focuses')}, "
+                f"partial-transfer focuses={idle_stats.get('partial_transfer_focuses')}, "
+                f"verified={idle_stats.get('verified')}, "
+                f"state expansions={idle_stats.get('states_expanded')}"
+            )
+            if balance_transactions:
+                sample = balance_transactions[0].get("details", {})
+                focus = sample.get("focus", {})
+                transfers = sample.get("owner_changes", [])
+                lines.append(
+                    f"  - best recorded hand-off: Q{focus.get('crane')} bay "
+                    f"{focus.get('bay')} -> Q{focus.get('target_crane')}, "
+                    f"{focus.get('transfer_length')} units; moves="
+                    f"{sample.get('candidate_movement_count')}; ledger closed="
+                    f"{sample.get('work_ledger', {}).get('closed')}"
+                )
+        q3_blocks = [
+            block
+            for block in execution.get("continuity", {})
+            .get("work_blocks_by_crane_bay", {})
+            .get("3", [])
+            if int(block.get("bay", 0)) == 13
+        ]
+        q3_moves = execution.get("continuity", {}).get(
+            "movement_count_by_crane", {}
+        ).get("3")
+        lines.append(
+            f"- Q3@bay13 blocks: `{q3_blocks}`; Q3 moves={q3_moves}"
+        )
+        artifact = item.get("execution_best_path")
+        if artifact:
+            lines.append(f"- execution artifact: `{artifact}`")
+        pair_stats = (item.get("continuity_operator_stats") or {}).get(
+            "paired_window_cyclic", {}
+        )
+        if pair_stats:
+            lines.append(
+                f"- paired exchange: `{pair_stats.get('status')}`, "
+                f"generated={pair_stats.get('generated')}, "
+                f"verified={pair_stats.get('verified')}, "
+                f"accepted={pair_stats.get('accepted')}, "
+                f"states early/late={pair_stats.get('early_window_states')}/"
+                f"{pair_stats.get('late_window_states')}, "
+                f"state_limit={pair_stats.get('state_limit')}"
+            )
+        phase_stats = (item.get("continuity_operator_stats") or {}).get(
+            "phase_block_resequence", {}
+        )
+        if phase_stats:
+            lines.append(
+                f"- phase resequence: `{phase_stats.get('status')}`, "
+                f"focus={phase_stats.get('focus_revisits')}, "
+                f"multi_slot={phase_stats.get('multi_slot_revisits')}, "
+                f"complete={phase_stats.get('complete_phase_plans')}, "
+                f"verified={phase_stats.get('verified')}, "
+                f"accepted={phase_stats.get('accepted')}, "
+                f"states={phase_stats.get('states_expanded')}, "
+                f"state_limit={phase_stats.get('state_limit')}"
+            )
+        closure_stats = (item.get("continuity_operator_stats") or {}).get(
+            "phase_closure_relay", {}
+        )
+        if closure_stats:
+            observed_max_width = max(
+                (
+                    int(expansion.get("width", 0))
+                    for expansion in closure_stats.get(
+                        "activity_chain_expansions", []
+                    )
+                ),
+                default=int(closure_stats.get("max_activity_width", 0)),
+            )
+            lines.append(
+                f"- phase closure: `{closure_stats.get('status')}`, "
+                f"focus={closure_stats.get('focus_revisits')}, "
+                f"bands={closure_stats.get('activity_bands_tested')}, "
+                f"max_width={observed_max_width}, "
+                f"complete={closure_stats.get('complete_phase_plans')}, "
+                f"ledger_closed={closure_stats.get('ledger_closed')}, "
+                f"verified={closure_stats.get('verified')}, "
+                f"accepted={closure_stats.get('accepted')}, "
+                f"states={closure_stats.get('states_expanded')}, "
+                f"state_limit={closure_stats.get('state_limit')}"
+            )
+            lines.append(
+                "  - scope: preserves source bay ownership; work transfer is "
+                "handled only by the separate explicit-transfer operators."
+            )
+            for expansion in closure_stats.get("activity_chain_expansions", [])[:8]:
+                lines.append(
+                    "  - activity chain: "
+                    f"focus={expansion.get('focus')}, "
+                    f"width={expansion.get('width')}, "
+                    f"active={expansion.get('active_cranes')}, "
+                    f"conflicts={len(expansion.get('resolved_conflicts', []))}"
+                )
+        relay_stats = (item.get("continuity_operator_stats") or {}).get(
+            "cross_crane_phase_relay", {}
+        )
+        if relay_stats:
+            observed_relay_width = max(
+                (
+                    len(expansion.get("active_cranes", []))
+                    for expansion in relay_stats.get(
+                        "activity_chain_expansions", []
+                    )
+                ),
+                default=int(relay_stats.get("max_activity_width", 0)),
+            )
+            lines.append(
+                f"- cross-crane phase relay: `{relay_stats.get('status')}`, "
+                f"focus={relay_stats.get('focus_revisits')}, "
+                f"bands={relay_stats.get('activity_bands_tested')}, "
+                f"max_width={observed_relay_width}, "
+                f"owner_changes={relay_stats.get('owner_change_branches')}, "
+                f"two_hop={relay_stats.get('two_hop_relay_branches')}, "
+                f"complete={relay_stats.get('complete_phase_plans')}, "
+                f"verified={relay_stats.get('verified')}, "
+                f"accepted={relay_stats.get('accepted')}, "
+                f"states={relay_stats.get('states_expanded')}, "
+                f"state_limit={relay_stats.get('state_limit')}"
+            )
+            lines.append(
+                "  - scope: one atomic ledger; phase timing, donor displacement "
+                "and receiver ownership are searched together."
+            )
+            for expansion in relay_stats.get("activity_chain_expansions", [])[:8]:
+                lines.append(
+                    "  - relay band: "
+                    f"focus={expansion.get('focus')}, "
+                    f"active={expansion.get('active_cranes')}, "
+                    f"tasks={expansion.get('task_count')}, "
+                    f"variants={expansion.get('assignment_variants')}, "
+                    f"verified={expansion.get('verified_candidates')}"
+                )
+        prefix_stats = (item.get("continuity_operator_stats") or {}).get(
+            "forced_prefix_consolidation", {}
+        )
+        if prefix_stats:
+            lines.append(
+                f"- forced-prefix consolidation: `{prefix_stats.get('status')}`, "
+                f"focus={prefix_stats.get('focus_interruptions')}, "
+                f"ledger_closed={prefix_stats.get('ledger_closed')}, "
+                f"verified={prefix_stats.get('verified')}, "
+                f"accepted={prefix_stats.get('accepted')}, "
+                f"states={prefix_stats.get('states_expanded')}, "
+                f"state_limit={prefix_stats.get('state_limit')}"
+            )
+        rebalance = item.get("global_rebalance") or {}
+        if rebalance:
+            lines.append(
+                f"- global rebalance: `{rebalance.get('status')}`, "
+                f"LB={rebalance.get('workload_lower_bound')}, "
+                f"targets={rebalance.get('target_horizons')}, "
+                f"verified={rebalance.get('schedules_verified')}, "
+                f"objective={rebalance.get('best_objective')}, "
+                f"loads={rebalance.get('best_loads')}"
+            )
+        lines.append("")
     for item in paired_summary(records):
         if "paired_counts" in item:
             lines.append(f"- {item['instance']} / {item['budget_seconds']}s: {item['paired_counts']}; CI={item['bootstrap_95ci_win_minus_loss_rate']}.")
@@ -901,8 +1827,8 @@ def main():
         "--target-mode", choices=("auto", "shorten", "same_horizon"),
         default="auto",
         help=(
-            "Step 8 target: auto shortens above the lower bound and keeps the "
-            "horizon at the lower bound; same_horizon optimizes secondary objectives."
+            "Step 8 target: shorten actual completion time by default; "
+            "same_horizon is a fixed-horizon diagnostic mode."
         ),
     )
     parser.add_argument(
@@ -947,6 +1873,91 @@ def main():
         help="Enable explicit local work/position transfer transactions.",
     )
     parser.add_argument(
+        "--fragmentation-repair",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable bounded paired-window fragmentation and revisit repair.",
+    )
+    parser.add_argument(
+        "--cyclic-exchange",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable the adjacent-crane cyclic work-exchange proposal family.",
+    )
+    parser.add_argument(
+        "--phase-resequence",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable bounded complete-work-phase resequencing for long revisits.",
+    )
+    parser.add_argument(
+        "--phase-closure",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Enable event-time whole-phase closure with progressively expanded "
+            "adjacent-crane bands."
+        ),
+    )
+    parser.add_argument(
+        "--cross-crane-phase-relay",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Enable the atomic full-band search that jointly changes phase "
+            "order, work ownership, relay path and safety positions."
+        ),
+    )
+    parser.add_argument(
+        "--forced-prefix-consolidation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Consolidate a short interruption after a forced t=0 work prefix.",
+    )
+    parser.add_argument(
+        "--idle-capacity-rebalance",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Search whole and partial work hand-offs from early-finished cranes "
+            "and preserve a separate same-completion balanced alternative."
+        ),
+    )
+    parser.add_argument(
+        "--global-rebalance",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Search balanced bay-work partitions and global event schedules "
+            "before local descent."
+        ),
+    )
+    parser.add_argument(
+        "--local-windows-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Disable global reconstruction and full-horizon post-processing; "
+            "use only cumulative critical-window and adjacent-crane repairs."
+        ),
+    )
+    parser.add_argument(
+        "--execution-output",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save a separate execution_best JSON; plots are included when enabled.",
+    )
+    parser.add_argument(
+        "--local-state-limit", type=int, default=256,
+        help="Maximum cyclic-exchange local states/proposals per fixed-H round.",
+    )
+    parser.add_argument(
+        "--execution-pool-sort",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Protect formal/execution/compression champions in the candidate pool.",
+    )
+    parser.add_argument(
         "--continuity-protection",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -984,6 +1995,8 @@ def main():
         ),
     )
     args = parser.parse_args()
+    if args.local_state_limit < 1:
+        parser.error("--local-state-limit must be a positive integer")
     if (args.fixed_input is None) != (args.fixed_source is None):
         parser.error("--fixed-input and --fixed-source must be supplied together")
     if args.experiment == "prepare" and not args.generate_sources:
@@ -1000,7 +2013,10 @@ def main():
     shutil.copy2(ROOT / "example_input.json", backup / "example_input.json")
     records = []
     manifest = {"git": __import__("subprocess").check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
-                "code_sha256": sha256(ROOT / "cwp_solver.py"), "objective": "(makespan, split_bay_count, movement_count, load_deviation)",
+                "command": list(sys.argv),
+                "code_sha256": sha256(ROOT / "cwp_solver.py"),
+                "harness_sha256": sha256(Path(__file__).resolve()),
+                "objective": "(actual_completion_time, movement_count)",
                 "source_generation": {
                     "budget_seconds": args.source_budget,
                     "restarts": args.source_restarts,
@@ -1008,6 +2024,17 @@ def main():
                 "descent": args.descent,
                 "operational_repairs": args.operational_repairs,
                 "work_transfer": args.work_transfer,
+                "fragmentation_repair": args.fragmentation_repair,
+                "cyclic_exchange": args.cyclic_exchange,
+                "phase_resequence": args.phase_resequence,
+                "phase_closure": args.phase_closure,
+                "cross_crane_phase_relay": args.cross_crane_phase_relay,
+                "idle_capacity_rebalance": args.idle_capacity_rebalance,
+                "forced_prefix_consolidation": args.forced_prefix_consolidation,
+                "global_rebalance": args.global_rebalance,
+                "execution_output": args.execution_output,
+                "local_state_limit": args.local_state_limit,
+                "execution_pool_sort": args.execution_pool_sort,
                 "continuity_protection": args.continuity_protection,
                 "strict_local_transactions": args.strict_local_transactions,
                 "legacy_seed": args.legacy_seed,
@@ -1042,7 +2069,7 @@ def main():
                 selected_source.write_text(json.dumps(generated.to_dict(), indent=2), encoding="utf-8")
                 print(
                     f"[prepare] instance={name} seed={seed} "
-                    f"objective={[generated.makespan, generated.split_bay_count, generated.movement_count, generated.load_deviation]} "
+                    f"objective={[generated.makespan, generated.movement_count]} "
                     f"construction_calls={generated.operator_calls.get('construction', 0)} "
                     f"step7_calls={generated.operator_calls.get('trajectory', 0)} "
                     f"step8_calls={generated.operator_calls.get('critical_beam', 0)} "
@@ -1052,8 +2079,11 @@ def main():
                 manifest["instances"][name]["generated_sources"][str(seed)] = {
                     "path": str(selected_source), "sha256": sha256(selected_source),
                     "method": generated.method,
-                    "objective": [generated.makespan, generated.split_bay_count,
-                                   generated.movement_count, generated.load_deviation],
+                    "objective": [generated.makespan, generated.movement_count],
+                    "schedule_horizon": generated.schedule_horizon,
+                    "schedule_movement_count": generated.schedule_movement_count,
+                    "split_bay_count": generated.split_bay_count,
+                    "load_deviation": generated.load_deviation,
                 }
             source = source_candidate(
                 W, M, S, selected_source, move_time, args.allow_edge_exit
@@ -1095,6 +2125,18 @@ def main():
                                 enable_descent=args.descent,
                                 enable_operational_repairs=args.operational_repairs,
                                 enable_work_transfer=args.work_transfer,
+                                enable_fragmentation_repair=args.fragmentation_repair,
+                                enable_cyclic_exchange=args.cyclic_exchange,
+                                enable_phase_resequence=args.phase_resequence,
+                                enable_phase_closure=args.phase_closure,
+                                enable_cross_crane_phase_relay=args.cross_crane_phase_relay,
+                                enable_idle_capacity_rebalance=args.idle_capacity_rebalance,
+                                enable_forced_prefix_consolidation=args.forced_prefix_consolidation,
+                                enable_global_rebalance=args.global_rebalance,
+                                local_windows_only=args.local_windows_only,
+                                execution_output=args.execution_output,
+                                local_state_limit=args.local_state_limit,
+                                execution_pool_sort=args.execution_pool_sort,
                                 protect_source_continuity=args.continuity_protection,
                                 strict_local_transactions=args.strict_local_transactions,
                                 source_hash=sha256(selected_source),
@@ -1104,6 +2146,12 @@ def main():
                                     args.out / "window_plots" / name
                                     / f"seed_{seed}" / f"budget_{budget:g}s" / mode
                                     if args.plot_windows else None
+                                ),
+                                artifact_dir=(
+                                    args.out / "schedule_artifacts" / name
+                                    / f"seed_{seed}" / f"budget_{budget:g}s" / mode
+                                    if args.execution_output and not args.plot_windows
+                                    else None
                                 ),
                             )
                             item["instance"] = name
